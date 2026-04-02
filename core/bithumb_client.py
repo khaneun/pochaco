@@ -133,13 +133,20 @@ class BithumbClient:
         })
 
     def market_buy(self, symbol: str, krw_amount: float) -> dict:
-        """시장가 매수 (빗썸 market_buy: units 파라미터에 KRW 금액 전달)"""
+        """시장가 매수 (빗썸 market_buy: units = 코인 수량)
+
+        호가창 최우선 매도호가(ask)로 수량을 계산합니다.
+        수수료(0.25%) 안전마진 적용으로 잔고 초과를 방지합니다.
+        """
+        ob = self.get_orderbook(symbol)
+        ask_price = float(ob["data"]["asks"][0]["price"])
+        units = f"{(krw_amount / ask_price) * 0.9975:.8f}"
         params = {
             "order_currency": symbol,
             "payment_currency": "KRW",
-            "units": krw_amount,
+            "units": units,
         }
-        logger.info(f"[매수] {symbol} {krw_amount:,.0f} KRW")
+        logger.info(f"[매수] {symbol} {units}개 ({krw_amount:,.0f} KRW, ask={ask_price:,})")
         result = self._private_post("/trade/market_buy", params)
         logger.info(f"[매수 결과] {result}")
         return result
