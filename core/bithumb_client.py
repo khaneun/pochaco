@@ -31,10 +31,13 @@ class BithumbClient:
     def _sign(self, endpoint: str, params: dict) -> dict:
         """HMAC-SHA512 서명 생성 후 헤더 반환
 
-        params를 변경하지 않고 복사본으로 서명합니다.
+        빗썸 인증 규격:
+          hmac_data = endpoint + "\0" + urlencode({...params, endpoint}) + "\0" + nonce
+          Api-Sign  = Base64(HMAC-SHA512(secret_key, hmac_data))
+        nonce는 밀리초(13자리), endpoint는 query string 마지막에 위치해야 합니다.
         """
-        nonce = str(int(time.time() * 1_000_000))  # 마이크로초 (충돌 방지)
-        sign_params = {"endpoint": endpoint, **params}
+        nonce = str(int(time.time() * 1_000))
+        sign_params = {**params, "endpoint": endpoint}  # endpoint는 마지막
 
         query = urllib.parse.urlencode(sign_params)
         hmac_data = f"{endpoint}\0{query}\0{nonce}"
@@ -95,9 +98,11 @@ class BithumbClient:
     # ------------------------------------------------------------------ #
     def _private_post(self, endpoint: str, params: dict) -> dict:
         """Private API POST 요청 공통 처리"""
+        # POST body에도 endpoint 포함 (빗썸 API 규격)
+        post_params = {**params, "endpoint": endpoint}
         headers = self._sign(endpoint, params)
         resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
+            self.BASE_URL + endpoint, data=post_params, headers=headers, timeout=10
         )
         resp.raise_for_status()
         return resp.json()
