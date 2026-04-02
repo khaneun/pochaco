@@ -31,21 +31,18 @@ class BithumbClient:
     def _sign(self, endpoint: str, params: dict) -> dict:
         """HMAC-SHA512 서명 생성 후 헤더 반환
 
-        빗썸 인증 규격:
-          hmac_data = endpoint + "\0" + urlencode(params) + "\0" + nonce
-          Api-Sign  = Base64(HMAC-SHA512(secret_key, hmac_data))
+        params를 변경하지 않고 복사본으로 서명합니다.
         """
-        nonce = str(int(time.time() * 1_000))
-        params["endpoint"] = endpoint
+        nonce = str(int(time.time() * 1_000_000))  # 마이크로초 (충돌 방지)
+        sign_params = {"endpoint": endpoint, **params}
 
-        query = urllib.parse.urlencode(params)
+        query = urllib.parse.urlencode(sign_params)
         hmac_data = f"{endpoint}\0{query}\0{nonce}"
         raw_sig = hmac.new(
             self._secret_key.encode("utf-8"),
             hmac_data.encode("utf-8"),
             digestmod=hashlib.sha512,
         ).hexdigest()
-        # 빗썸은 hex digest를 UTF-8 바이트로 Base64 인코딩
         signature = base64.b64encode(raw_sig.encode("utf-8")).decode("utf-8")
 
         return {
@@ -96,10 +93,8 @@ class BithumbClient:
     # ------------------------------------------------------------------ #
     #  Private API                                                         #
     # ------------------------------------------------------------------ #
-    def get_balance(self, currency: str = "ALL") -> dict:
-        """잔고 조회"""
-        endpoint = "/info/balance"
-        params = {"currency": currency}
+    def _private_post(self, endpoint: str, params: dict) -> dict:
+        """Private API POST 요청 공통 처리"""
         headers = self._sign(endpoint, params)
         resp = self._session.post(
             self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
@@ -107,9 +102,12 @@ class BithumbClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_balance(self, currency: str = "ALL") -> dict:
+        """잔고 조회"""
+        return self._private_post("/info/balance", {"currency": currency})
+
     def get_orders(self, symbol: str, order_id: str = "", order_type: str = "") -> dict:
         """미체결 주문 조회"""
-        endpoint = "/info/orders"
         params = {
             "order_currency": symbol,
             "payment_currency": "KRW",
@@ -118,124 +116,130 @@ class BithumbClient:
             params["order_id"] = order_id
         if order_type:
             params["type"] = order_type
-        headers = self._sign(endpoint, params)
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        return resp.json()
+        return self._private_post("/info/orders", params)
 
     def get_user_transactions(self, symbol: str, offset: int = 0, count: int = 20) -> dict:
         """거래 내역 조회"""
-        endpoint = "/info/user_transactions"
-        params = {
+        return self._private_post("/info/user_transactions", {
             "order_currency": symbol,
             "payment_currency": "KRW",
             "offset": offset,
             "count": count,
-        }
-        headers = self._sign(endpoint, params)
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        return resp.json()
+        })
 
     def market_buy(self, symbol: str, krw_amount: float) -> dict:
-        """시장가 매수 (KRW 금액 지정)"""
-        endpoint = "/trade/market_buy"
+        """시장가 매수 (KRW 금액 → bid 가격 기반 수량 계산)"""
+        ob = self.get_orderbook(symbol)
+        bid_price = int(float(ob["data"]["bids"][0]["price"]))
+        # 수수료 안전마진(0.15%) 적용 후 수량 계산
+        units = f"{(krw_amount * 0.9985) / bid_price:.8f}"
         params = {
             "order_currency": symbol,
             "payment_currency": "KRW",
-            "units": krw_amount,
+            "units": units,
         }
-        headers = self._sign(endpoint, params)
-        logger.info(f"[매수] {symbol} {krw_amount:,.0f} KRW")
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        result = resp.json()
+        logger.info(f"[매수] {symbol} {units} 개 ({krw_amount:,.0f} KRW, bid={bid_price:,})")
+        result = self._private_post("/trade/market_buy", params)
         logger.info(f"[매수 결과] {result}")
         return result
 
     def market_sell(self, symbol: str, units: float) -> dict:
         """시장가 매도 (코인 수량 지정)"""
-        endpoint = "/trade/market_sell"
         params = {
             "order_currency": symbol,
             "payment_currency": "KRW",
             "units": units,
         }
-        headers = self._sign(endpoint, params)
         logger.info(f"[매도] {symbol} {units} 개")
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        logger.info(f"[매도 결과] {result}")
+        result = self._private_post("/trade/market_sell", params)
+        if result.get("status") == "0000":
+            logger.info(f"[매도 체결] {result}")
+        else:
+            logger.warning(f"[매도 실패] {result}")
         return result
 
     def limit_buy(self, symbol: str, price: float, units: float) -> dict:
         """지정가 매수"""
-        endpoint = "/trade/place"
-        params = {
+        return self._private_post("/trade/place", {
             "order_currency": symbol,
             "payment_currency": "KRW",
             "type": "bid",
             "price": price,
             "units": units,
-        }
-        headers = self._sign(endpoint, params)
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        return resp.json()
+        })
 
     def limit_sell(self, symbol: str, price: float, units: float) -> dict:
         """지정가 매도"""
-        endpoint = "/trade/place"
-        params = {
+        return self._private_post("/trade/place", {
             "order_currency": symbol,
             "payment_currency": "KRW",
             "type": "ask",
             "price": price,
             "units": units,
-        }
-        headers = self._sign(endpoint, params)
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        return resp.json()
+        })
 
     def cancel_order(self, order_type: str, order_id: str, symbol: str) -> dict:
         """주문 취소. order_type: 'bid'(매수) or 'ask'(매도)"""
-        endpoint = "/trade/cancel"
-        params = {
+        return self._private_post("/trade/cancel", {
             "type": order_type,
             "order_id": order_id,
             "order_currency": symbol,
             "payment_currency": "KRW",
-        }
-        headers = self._sign(endpoint, params)
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        return resp.json()
+        })
 
+    def cancel_all_orders(self, symbol: str) -> list[dict]:
+        """미체결 주문 일괄 취소"""
+        try:
+            orders_data = self.get_orders(symbol)
+        except Exception as e:
+            logger.warning(f"[미체결 조회 실패] {symbol}: {e}")
+            return []
+
+        results = []
+        if orders_data.get("status") != "0000":
+            return results
+
+        orders = orders_data.get("data", [])
+        if not orders or isinstance(orders, str):
+            return results
+
+        for order in orders:
+            order_id = order.get("order_id", "")
+            order_type = order.get("type", "")
+            if not order_id:
+                continue
+            try:
+                r = self.cancel_order(order_type, order_id, symbol)
+                results.append(r)
+                logger.info(f"[주문 취소] {symbol} {order_type} {order_id}: {r.get('status')}")
+            except Exception as e:
+                logger.error(f"[주문 취소 실패] {symbol} {order_id}: {e}")
+        return results
+
+    # ------------------------------------------------------------------ #
+    #  잔고 헬퍼                                                            #
+    # ------------------------------------------------------------------ #
     def get_krw_balance(self) -> float:
-        """보유 KRW 가용 잔고 반환
-
-        빗썸은 currency=KRW 단독 조회를 지원하지 않으므로 ALL에서 추출
-        """
+        """보유 KRW 가용 잔고 반환"""
         data = self.get_balance("ALL")
         if data.get("status") != "0000":
             raise RuntimeError(f"잔고 조회 실패: {data}")
-        return float(data["data"].get("available_krw", 0))
+        available = float(data["data"].get("available_krw", 0))
+        total = float(data["data"].get("total_krw", 0))
+        in_use = float(data["data"].get("in_use_krw", 0))
+        logger.info(f"[잔고] available={available:,.0f} total={total:,.0f} in_use={in_use:,.0f}")
+        return available
+
+    def get_krw_balance_detail(self) -> dict:
+        """KRW 잔고 상세 (available, total, in_use) 반환"""
+        data = self.get_balance("ALL")
+        if data.get("status") != "0000":
+            raise RuntimeError(f"잔고 조회 실패: {data}")
+        return {
+            "available": float(data["data"].get("available_krw", 0)),
+            "total": float(data["data"].get("total_krw", 0)),
+            "in_use": float(data["data"].get("in_use_krw", 0)),
+        }
 
     def get_coin_balance(self, symbol: str) -> float:
         """특정 코인 보유 수량(가용) 반환"""

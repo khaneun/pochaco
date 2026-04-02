@@ -110,11 +110,13 @@ def _make_engine() -> Engine:
 
         # WAL 모드: 크래시 복구 + 동시 읽기 허용
         @event.listens_for(engine, "connect")
-        def _set_sqlite_pragma(conn, _):
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")   # FULL보다 빠르고 WAL 조합 시 안전
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=30000")   # 락 대기 30초
+        def _set_sqlite_pragma(dbapi_conn, _):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
 
     return engine
 

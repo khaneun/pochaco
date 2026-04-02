@@ -2,6 +2,39 @@
 
 ---
 
+## v1.5.0 (2026-04-03)
+
+### 안정성 개선 + 텔레그램 로그 조회
+
+#### BithumbClient 리팩토링 (`core/bithumb_client.py`)
+- **`_private_post` 공통 메서드 추가**: 모든 Private API 호출이 단일 메서드를 통해 서명·요청·응답 처리 (코드 중복 제거)
+- **`_sign` 개선**: nonce를 마이크로초 단위로 변경 (충돌 방지), `params` 원본 불변성 보장 (`sign_params` 분리)
+- **`market_buy` 방식 변경**: 호가 창(orderbook) 기반으로 수량 계산 후 매수 (수수료 안전마진 0.15% 적용)
+- **`cancel_all_orders` 신규 추가**: 심볼별 미체결 주문 일괄 취소
+- **`get_krw_balance_detail` 신규 추가**: available / total / in_use KRW 상세 반환
+- `get_krw_balance`에 available·total·in_use 로깅 추가
+
+#### TradingEngine 안정성 강화 (`strategy/trading_engine.py`)
+- **`_cancel_stuck_orders` 신규 추가**: `in_use_krw > 0` 감지 시 미체결 주문 일괄 취소
+- 기동 시 `_liquidate_all` 전 미체결 주문 정리 순서 보장
+- 매수 실패 시 미체결 취소 후 1회 자동 재시도
+
+#### Repository 멀티스레드 안전성 (`database/repository.py`)
+- **요청별 독립 세션** 패턴 도입: 단일 공유 `Session` → `@contextmanager _session()` 교체
+- 모든 CRUD 메서드가 별도 세션·커밋·롤백·close를 자동 처리
+- `get_daily_activity_summary`, `get_total_stats` 등 통계 조회 메서드 추가
+
+#### DB 엔진 개선 (`database/models.py`)
+- SQLite PRAGMA 설정 방식 수정: `conn.execute` → `cursor.execute` (SQLAlchemy 최신 API 호환)
+
+#### 텔레그램 봇 — `/log` 명령어 추가 (`core/telegram_bot.py`)
+- `/log` — 최근 50줄 조회 (기본값)
+- `/log N` — 최근 N줄 조회 (1~500 범위)
+- 텔레그램 4096자 제한 자동 처리 (초과 시 앞부분 생략)
+- `LOG_FILE` 경로(`settings.LOG_FILE`)에서 직접 읽기
+
+---
+
 ## v1.4.0 (2026-04-02)
 
 ### AWS EC2 배포 및 Secrets Manager 연동

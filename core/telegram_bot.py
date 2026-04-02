@@ -41,6 +41,7 @@ _HELP_TEXT = """📋 <b>pochaco 명령어 목록</b>
 /stop     — 신규 매수 일시 중지
 /resume   — 매수 재개
 /report   — 오늘 + 최근 7일 성과
+/log [N]  — 최근 로그 N줄 (기본 50)
 /dashboard — 웹 대시보드 접속 주소
 /help     — 이 메시지"""
 
@@ -338,6 +339,33 @@ class TelegramBot:
         except Exception:
             return "IP 조회 실패"
 
+    def _cmd_log(self, args: str) -> None:
+        try:
+            n = int(args.strip()) if args.strip().isdigit() else 50
+            n = max(1, min(n, 500))  # 1~500줄 제한
+
+            log_path = settings.LOG_FILE
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                self.send(f"❌ 로그 파일 없음: {log_path}")
+                return
+
+            tail = lines[-n:]
+            text = "".join(tail)
+
+            # 텔레그램 메시지 최대 4096자 제한 — 초과 시 앞부분 잘라냄
+            header = f"📄 <b>최근 로그 {len(tail)}줄</b> ({log_path})\n\n<pre>"
+            footer = "</pre>"
+            max_body = 4096 - len(header) - len(footer)
+            if len(text) > max_body:
+                text = "...(앞부분 생략)...\n" + text[-max_body + 20:]
+
+            self.send(header + text + footer)
+        except Exception as e:
+            self.send(f"❌ 로그 조회 실패: {e}")
+
     def _cmd_dashboard(self, _args: str) -> None:
         pub_ip = self._get_public_ip()
         port = settings.DASHBOARD_PORT
@@ -373,6 +401,7 @@ class TelegramBot:
         "stop":      "_cmd_stop",
         "resume":    "_cmd_resume",
         "report":    "_cmd_report",
+        "log":       "_cmd_log",
         "dashboard": "_cmd_dashboard",
     }
 

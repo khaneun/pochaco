@@ -1,13 +1,11 @@
 """핵심 매매 루프 엔진
 
 기동 시점부터 아래 사이클을 무한 반복합니다:
-  1. 전체 현금화 (보유 코인 전부 시장가 매도)
+  1. 전체 현금화 (보유 코인 전부 시장가 매도 + 미체결 주문 취소)
   2. AI Agent 코인 선정 (변동성·거래량·등락폭 기준)
   3. 가용 KRW 전액 매수
   4. 익절 또는 손절 도달까지 감시
   5. 조건 충족 시 전량 시장가 매도 → 1번으로
-
-스케줄러(9시 리셋 등)는 사용하지 않습니다.
 """
 import logging
 import time
@@ -39,23 +37,21 @@ class TradingEngine:
         self._analyzer = analyzer
         self._running = False
         self._paused = False
-        self._notifier = None           # TelegramBot (선택)
-        self.daily_start_krw: float = 0.0  # 일별 리포트용 외부 참조
+        self._notifier = None
+        self._price_fail_count: dict[int, int] = {}  # position_id → 연속 실패 횟수
+        self.daily_start_krw: float = 0.0
 
     # ------------------------------------------------------------------ #
     #  퍼블릭 인터페이스                                                    #
     # ------------------------------------------------------------------ #
     def set_notifier(self, notifier) -> None:
-        """텔레그램 봇 주입 (선택)"""
         self._notifier = notifier
 
     def pause(self) -> None:
-        """신규 매수 일시 중지 (포지션 감시는 유지)"""
         self._paused = True
         logger.info("TradingEngine: 매수 일시 중지")
 
     def resume(self) -> None:
-        """매수 재개"""
         self._paused = False
         logger.info("TradingEngine: 매수 재개")
 
@@ -68,7 +64,6 @@ class TradingEngine:
         self._running = True
         logger.info("=== TradingEngine 시작 ===")
 
-        # 기동 시 전체 현금화 (이전 포지션 정리 포함)
         self._liquidate_all(note="기동 전체 현금화")
         self.daily_start_krw = self._client.get_krw_balance()
 
@@ -77,10 +72,8 @@ class TradingEngine:
                 pos = self._repo.get_open_position()
 
                 if pos is None:
-                    # 포지션 없음 → 선정 후 매수
                     self._select_and_buy()
                 else:
-                    # 포지션 보유 중 → 익절/손절 감시
                     self._check_exit(pos)
 
             except Exception as e:
@@ -90,7 +83,7 @@ class TradingEngine:
                         self._notifier.notify_error(str(e))
                     except Exception:
                         pass
-                time.sleep(5)  # 에러 후 짧은 대기
+                time.sleep(5)
 
             if self._running:
                 time.sleep(settings.POSITION_CHECK_INTERVAL)
@@ -101,10 +94,36 @@ class TradingEngine:
         self._running = False
 
     # ------------------------------------------------------------------ #
+    #  미체결 주문 정리                                                     #
+    # ------------------------------------------------------------------ #
+    def _cancel_stuck_orders(self) -> None:
+        """in_use_krw > 0이면 미체결 주문이 KRW를 묶고 있으므로 일괄 취소"""
+        try:
+            detail = self._client.get_krw_balance_detail()
+            if detail["in_use"] <= 0:
+                return
+            logger.warning(f"[미체결 감지] in_use_krw={detail['in_use']:,.0f}원 — 일괄 취소")
+            balance_data = self._client.get_balance("ALL")
+            if balance_data.get("status") != "0000":
+                return
+            for key, value in balance_data["data"].items():
+                if key.startswith("in_use_") and key != "in_use_krw":
+                    symbol = key.replace("in_use_", "").upper()
+                    if float(value) > 0:
+                        self._client.cancel_all_orders(symbol)
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"[미체결 취소 오류] {e}")
+
+    # ------------------------------------------------------------------ #
     #  Step 1: 전체 현금화                                                  #
     # ------------------------------------------------------------------ #
     def _liquidate_all(self, note: str = "현금화") -> None:
         logger.info(f"[현금화 시작] {note}")
+
+        # 먼저 미체결 주문 정리
+        self._cancel_stuck_orders()
+
         balance_data = self._client.get_balance("ALL")
         if balance_data.get("status") != "0000":
             raise RuntimeError(f"잔고 조회 실패: {balance_data}")
@@ -141,7 +160,6 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"  {symbol} 현금화 오류: {e}")
 
-        # DB 포지션 일괄 종료
         self._repo.close_all_positions()
 
         krw = self._client.get_krw_balance()
@@ -158,6 +176,8 @@ class TradingEngine:
         krw = self._client.get_krw_balance()
         if krw < settings.MIN_ORDER_KRW:
             logger.warning(f"[매수 스킵] KRW 잔고 부족: {krw:,.0f}원")
+            # 미체결 주문 때문일 수 있음 → 취소 시도
+            self._cancel_stuck_orders()
             time.sleep(30)
             return
 
@@ -175,13 +195,24 @@ class TradingEngine:
             f"확신도={decision.confidence:.0%} | {decision.reason}"
         )
 
-        # 수수료 여유분 1% 제외 후 전액 매수
-        buy_amount = krw * 0.99
+        buy_amount = krw * 0.95
         result = self._client.market_buy(decision.symbol, buy_amount)
         if result.get("status") != "0000":
-            logger.error(f"[매수 실패] {result} — 30초 후 재시도")
-            time.sleep(30)
-            return
+            logger.error(f"[매수 실패] {result}")
+            # in_use_krw 감지 → 미체결 취소 후 1회 재시도
+            self._cancel_stuck_orders()
+            time.sleep(2)
+            krw = self._client.get_krw_balance()
+            if krw >= settings.MIN_ORDER_KRW:
+                buy_amount = krw * 0.95
+                result = self._client.market_buy(decision.symbol, buy_amount)
+                if result.get("status") != "0000":
+                    logger.error(f"[매수 재시도 실패] {result} — 30초 후 재시도")
+                    time.sleep(30)
+                    return
+            else:
+                time.sleep(30)
+                return
 
         # 체결 반영 대기
         time.sleep(1)
@@ -226,7 +257,25 @@ class TradingEngine:
     #  Step 4: 익절/손절 감시                                               #
     # ------------------------------------------------------------------ #
     def _check_exit(self, position: Position) -> None:
-        current_price = self._client.get_current_price(position.symbol)
+        try:
+            current_price = self._client.get_current_price(position.symbol)
+            self._price_fail_count.pop(position.id, None)
+        except Exception as e:
+            fail_count = self._price_fail_count.get(position.id, 0) + 1
+            self._price_fail_count[position.id] = fail_count
+            logger.error(f"[시세 조회 실패] {position.symbol} ({fail_count}/5): {e}")
+            if fail_count >= 5:
+                logger.warning(f"[강제 청산 시도] {position.symbol} 시세 5회 연속 조회 실패")
+                try:
+                    units = self._client.get_coin_balance(position.symbol)
+                    if units > 0:
+                        self._client.market_sell(position.symbol, units)
+                except Exception as sell_err:
+                    logger.error(f"[강제 청산 실패] {position.symbol}: {sell_err}")
+                self._repo.close_position(position.id)
+                self._price_fail_count.pop(position.id, None)
+            return
+
         pnl_pct = (current_price - position.buy_price) / position.buy_price * 100
 
         logger.debug(
@@ -238,10 +287,10 @@ class TradingEngine:
 
         if pnl_pct >= position.take_profit_pct:
             self._execute_sell(position, current_price, pnl_pct,
-                               f"익절 ({pnl_pct:+.2f}% ≥ +{position.take_profit_pct}%)")
+                               f"익절 ({pnl_pct:+.2f}% >= +{position.take_profit_pct}%)")
         elif pnl_pct <= position.stop_loss_pct:
             self._execute_sell(position, current_price, pnl_pct,
-                               f"손절 ({pnl_pct:+.2f}% ≤ {position.stop_loss_pct}%)")
+                               f"손절 ({pnl_pct:+.2f}% <= {position.stop_loss_pct}%)")
 
     def _execute_sell(
         self,
@@ -251,18 +300,46 @@ class TradingEngine:
         reason: str,
     ) -> None:
         logger.info(f"[매도 실행] {reason}")
-        result = self._client.market_sell(position.symbol, position.units)
-        if result.get("status") != "0000":
-            logger.error(f"[매도 실패] {result}")
+
+        # 실제 보유 수량 확인 후 매도 (DB와 실제 잔고 불일치 방지)
+        actual_units = self._client.get_coin_balance(position.symbol)
+        if actual_units <= 0:
+            logger.warning(f"[매도 스킵] {position.symbol} 실제 잔고 0 — 포지션만 종료")
+            self._repo.close_position(position.id)
             return
 
-        krw_received = current_price * position.units
-        pnl_krw = (current_price - position.buy_price) * position.units
+        sell_units = actual_units
+        result = None
+        for attempt in range(1, 4):
+            result = self._client.market_sell(position.symbol, sell_units)
+            if result.get("status") == "0000":
+                break
+            logger.warning(f"[매도 실패 {attempt}/3] {result}")
+            if attempt < 3:
+                time.sleep(2)
+                sell_units = self._client.get_coin_balance(position.symbol)
+                if sell_units <= 0:
+                    logger.info(f"[매도 스킵] {position.symbol} 잔고 0 — 이미 체결됨")
+                    break
+
+        if result is None or result.get("status") != "0000":
+            logger.error(f"[매도 최종 실패] {position.symbol} — 수동 확인 필요")
+            if self._notifier:
+                try:
+                    self._notifier.notify_error(
+                        f"매도 3회 실패: {position.symbol} {sell_units}개"
+                    )
+                except Exception:
+                    pass
+            return
+
+        krw_received = current_price * actual_units
+        pnl_krw = (current_price - position.buy_price) * actual_units
         held_min = (datetime.utcnow() - position.opened_at).total_seconds() / 60
 
         self._repo.save_trade(
             symbol=position.symbol, side="sell",
-            price=current_price, units=position.units,
+            price=current_price, units=actual_units,
             krw_amount=krw_received, note=reason,
         )
         self._repo.close_position(position.id)
@@ -282,4 +359,3 @@ class TradingEngine:
                 )
             except Exception:
                 pass
-        # 루프 다음 회차에서 자동으로 선정→매수 진행

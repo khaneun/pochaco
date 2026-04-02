@@ -95,12 +95,39 @@ class TradingAgent:
             # JSON 코드블록 감싸진 경우 제거
             clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             data = json.loads(clean)
+
+            symbol = data["symbol"].upper()
+            take_profit_pct = float(data["take_profit_pct"])
+            stop_loss_pct = float(data["stop_loss_pct"])
+            confidence = float(data.get("confidence", 0.5))
+            reason = data.get("reason", "")
+
+            # ── 안전장치: 강제 범위 제한 ──
+            if stop_loss_pct > -0.5:
+                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -2.0% 강제")
+                stop_loss_pct = -2.0
+            elif stop_loss_pct > 0:
+                stop_loss_pct = -abs(stop_loss_pct)
+            if stop_loss_pct < -5.0:
+                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -2.0% 제한")
+                stop_loss_pct = -2.0
+
+            if take_profit_pct < 3.0:
+                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → 3.0% 최소")
+                take_profit_pct = 3.0
+
+            # R:R 비율 3:1 미달 시 자동 조정
+            rr_ratio = take_profit_pct / abs(stop_loss_pct) if stop_loss_pct != 0 else 99
+            if rr_ratio < 3.0:
+                take_profit_pct = abs(stop_loss_pct) * 3.0
+                logger.warning(f"[AI 보정] R:R 미달 → take_profit={take_profit_pct}%")
+
             return AgentDecision(
-                symbol=data["symbol"].upper(),
-                take_profit_pct=float(data["take_profit_pct"]),
-                stop_loss_pct=float(data["stop_loss_pct"]),
-                confidence=float(data.get("confidence", 0.5)),
-                reason=data.get("reason", ""),
+                symbol=symbol,
+                take_profit_pct=round(take_profit_pct, 2),
+                stop_loss_pct=round(stop_loss_pct, 2),
+                confidence=confidence,
+                reason=reason,
                 llm_provider=self.provider_name,
             )
         except (json.JSONDecodeError, KeyError) as e:
