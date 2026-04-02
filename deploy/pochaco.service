@@ -1,0 +1,37 @@
+[Unit]
+Description=pochaco AI 자동매매 시스템
+Documentation=https://github.com/khaneun/pochaco
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/pochaco
+
+# AWS Secrets Manager에서 민감 정보 자동 로드
+Environment="AWS_SECRET_NAME=pochaco/production"
+Environment="AWS_REGION=ap-northeast-2"
+Environment="HEADLESS=true"
+
+# 가상환경 Python으로 실행
+ExecStart=/opt/pochaco/.venv/bin/python main.py
+
+# 비정상 종료 시 10초 후 재시작
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# 표준 출력/에러를 journald로 수집
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pochaco
+
+# 보안 강화
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

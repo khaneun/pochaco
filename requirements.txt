@@ -1,0 +1,20 @@
+# 핵심
+requests>=2.31.0
+websockets>=12.0
+APScheduler>=3.10.4
+SQLAlchemy>=2.0.0
+rich>=13.7.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# LLM 공급자 (사용하는 것만 설치해도 됩니다)
+anthropic>=0.40.0           # LLM_PROVIDER=anthropic
+openai>=1.30.0              # LLM_PROVIDER=openai
+google-generativeai>=0.8.0  # LLM_PROVIDER=gemini
+
+# AWS (Secrets Manager 연동)
+boto3>=1.34.0
+
+# PostgreSQL 사용 시 (DATABASE_URL 설정 시)
+# psycopg2-binary>=2.9.9
