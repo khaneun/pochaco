@@ -59,12 +59,12 @@ def _build_json_status(client: "BithumbClient") -> dict:
                 pass
 
         stats = repo.get_total_stats()
-        recent_trades = repo.get_all_trades(limit=20)
+        recent_trades = repo.get_all_trades(limit=100)
         recent_reports = repo.get_recent_reports(7)
 
         trades_data = [
             {
-                "time": t.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "time": t.created_at.strftime("%m-%d %H:%M:%S"),
                 "symbol": t.symbol,
                 "side": t.side,
                 "price": t.price,
@@ -93,7 +93,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
         eval_stats = repo.get_evaluation_stats(last_n=10)
         evals_data = [
             {
-                "time": ev.created_at.strftime("%Y-%m-%d %H:%M"),
+                "time": ev.created_at.strftime("%m-%d %H:%M:%S"),
                 "symbol": ev.symbol,
                 "exit_type": ev.exit_type,
                 "pnl_pct": round(ev.pnl_pct, 2),
@@ -109,7 +109,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
         ]
 
         return {
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": datetime.now().strftime("%m-%d %H:%M:%S"),
             "balance": {"krw": round(krw, 0), "total_assets": round(total, 0)},
             "performance": {
                 "total_pnl_pct": round(total_pnl_pct, 2),
@@ -183,6 +183,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .expandable .full {{ display: none; }}
   .more-btn {{ background: none; border: none; color: #38bdf8; cursor: pointer;
                font-size: 0.75rem; padding: 0 2px; text-decoration: underline; }}
+  .pager {{ display: flex; justify-content: center; gap: 6px; margin-top: 10px; }}
+  .pager button {{ background: #334155; border: 1px solid #475569; color: #e2e8f0;
+                   border-radius: 6px; padding: 4px 12px; cursor: pointer;
+                   font-size: 0.78rem; }}
+  .pager button:hover {{ background: #475569; }}
+  .pager button:disabled {{ opacity: 0.35; cursor: default; }}
+  .pager span {{ font-size: 0.78rem; color: #94a3b8; line-height: 28px; }}
   .stat-row {{ display: flex; justify-content: space-between;
                padding: 6px 0; border-bottom: 1px solid #334155; }}
   .stat-row:last-child {{ border-bottom: none; }}
@@ -205,6 +212,48 @@ function toggleMore(btn) {{
     short.style.display = 'inline';
   }}
 }}
+
+/* 페이지네이션: 2줄씩 묶인 tr 그룹 단위로 페이징 */
+function initPager(tableId, pagerId, rowsPerPage) {{
+  var table = document.getElementById(tableId);
+  if (!table) return;
+  var tbody = table.querySelector('tbody') || table;
+  var allRows = Array.from(tbody.querySelectorAll('tr:not(:first-child)'));
+  /* 2줄(main+sub)이 한 그룹 */
+  var groups = [];
+  for (var i = 0; i < allRows.length; i += 2) {{
+    groups.push([allRows[i], allRows[i+1]]);
+  }}
+  var totalPages = Math.ceil(groups.length / rowsPerPage) || 1;
+  var page = 0;
+
+  function render() {{
+    groups.forEach(function(g) {{ g.forEach(function(r) {{ r.style.display = 'none'; }}); }});
+    var start = page * rowsPerPage;
+    var end = Math.min(start + rowsPerPage, groups.length);
+    for (var j = start; j < end; j++) {{
+      groups[j].forEach(function(r) {{ r.style.display = ''; }});
+    }}
+    var pager = document.getElementById(pagerId);
+    if (pager) {{
+      pager.querySelector('.pg-info').textContent = (page+1) + ' / ' + totalPages;
+      pager.querySelector('.pg-prev').disabled = (page === 0);
+      pager.querySelector('.pg-next').disabled = (page >= totalPages - 1);
+    }}
+  }}
+
+  var pager = document.getElementById(pagerId);
+  if (pager) {{
+    pager.querySelector('.pg-prev').onclick = function() {{ if(page>0){{ page--; render(); }} }};
+    pager.querySelector('.pg-next').onclick = function() {{ if(page<totalPages-1){{ page++; render(); }} }};
+  }}
+  render();
+}}
+
+document.addEventListener('DOMContentLoaded', function() {{
+  initPager('eval-table', 'eval-pager', 3);
+  initPager('trade-table', 'trade-pager', 10);
+}});
 </script>
 </head>
 <body>
@@ -260,6 +309,11 @@ function toggleMore(btn) {{
     <h2>📊 AI 성과 평가 & 전략 조정</h2>
     {eval_summary_html}
     {evals_html}
+    <div class="pager" id="eval-pager">
+      <button class="pg-prev">&laquo; 이전</button>
+      <span class="pg-info">1 / 1</span>
+      <button class="pg-next">다음 &raquo;</button>
+    </div>
   </div>
 </div>
 
@@ -268,6 +322,11 @@ function toggleMore(btn) {{
   <div class="card">
     <h2>🔄 최근 거래 내역</h2>
     {trades_html}
+    <div class="pager" id="trade-pager">
+      <button class="pg-prev">&laquo; 이전</button>
+      <span class="pg-info">1 / 1</span>
+      <button class="pg-next">다음 &raquo;</button>
+    </div>
   </div>
 </div>
 
@@ -381,7 +440,7 @@ def _render_html(data: dict) -> str:
             total_d = r["trade_count"] // 2 if r["trade_count"] > 0 else 0
             rows += (
                 f"<tr>"
-                f"<td>{r['date']}</td>"
+                f"<td>{r['date'][5:]}</td>"
                 f'<td class="{color}">{sign}{r["pnl_pct"]:.2f}%</td>'
                 f'<td class="{color}">{sign}{r["pnl_krw"]:,.0f}</td>'
                 f'<td><span class="badge {badge_cls}">'
@@ -407,7 +466,7 @@ def _render_html(data: dict) -> str:
             note = t["note"] or ""
             # 시간 분리: "2026-04-03 14:16:54" → date / hms
             t_parts = t["time"].split(" ")
-            t_date = t_parts[0][2:] if len(t_parts) > 0 else t["time"]  # yy-mm-dd
+            t_date = t_parts[0] if len(t_parts) > 0 else t["time"]  # mm-dd
             t_hms  = t_parts[1] if len(t_parts) > 1 else ""
             note_html = _expandable(note, 35)
             rows += (
@@ -425,7 +484,7 @@ def _render_html(data: dict) -> str:
                 f"</tr>"
             )
         trades_html = (
-            "<table>"
+            "<table id='trade-table'>"
             "<tr><th>시간</th><th>심볼</th>"
             "<th style='text-align:right'>가격(원)</th>"
             "<th style='text-align:right'>수량</th>"
@@ -461,7 +520,7 @@ def _render_html(data: dict) -> str:
             held = ev["held_minutes"]
             held_str = f"{held/60:.1f}h" if held >= 60 else f"{held:.0f}m"
             t_parts = ev["time"].split(" ")
-            t_date = t_parts[0][2:] if len(t_parts) > 0 else ev["time"]
+            t_date = t_parts[0] if len(t_parts) > 0 else ev["time"]  # mm-dd
             t_hms  = t_parts[1] if len(t_parts) > 1 else ""
             lesson_html = _expandable(ev.get("lesson", ""), 35)
             erows += (
@@ -480,7 +539,7 @@ def _render_html(data: dict) -> str:
                 f"</tr>"
             )
         evals_html = (
-            "<table>"
+            "<table id='eval-table'>"
             "<tr><th>시간</th><th>코인</th><th>수익률</th>"
             "<th>보유</th><th>설정 TP/SL</th><th>제안 TP/SL</th></tr>"
             f"{erows}</table>"
