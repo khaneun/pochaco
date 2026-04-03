@@ -10,25 +10,23 @@ pochaco를 AWS EC2에 배포하는 표준 절차입니다.
 | 항목 | 값 |
 |------|-----|
 | 인스턴스 이름 | `pochaco-trader` |
-| 인스턴스 ID | `i-00d817b47d8c2672a` |
-| 퍼블릭 IP | `3.34.125.179` (Elastic IP 아닌 경우 재시작 시 변경될 수 있음) |
 | 리전 | `ap-northeast-2` (서울) |
 | AMI | Amazon Linux 2023 |
 | SSH 유저 | `ec2-user` |
-| SSH 키 | `~/kitty-key.pem` |
+| SSH 키 | `~/<your-key>.pem` |
 | 앱 디렉터리 | `/opt/pochaco` |
 | DB 경로 | `/opt/pochaco/data/pochaco.db` |
 | 로그 경로 | `/opt/pochaco/logs/pochaco.log` |
 | systemd 서비스 | `pochaco` |
-| 웹 대시보드 | `http://3.34.125.179:8080` |
+| 웹 대시보드 | `http://<EC2_IP>:8080` |
 
 ---
 
 ## 사전 조건
 
-- `~/kitty-key.pem` — EC2 SSH 키 (`chmod 400` 필수)
+- `~/<your-key>.pem` — EC2 키페어 PEM 파일 (`chmod 400` 필수)
 - AWS CLI 인증 완료 (`aws sts get-caller-identity`로 확인)
-- 로컬 git remote: `https://github.com/khaneun/pochaco.git`
+- 로컬 git remote 설정 완료 (`git remote -v`로 확인)
 
 ---
 
@@ -57,7 +55,7 @@ git push origin main
 ### 2. EC2 서비스 중지
 
 ```bash
-SSH="ssh -i ~/kitty-key.pem -o StrictHostKeyChecking=no ec2-user@${EC2_IP}"
+SSH="ssh -i ~/<your-key>.pem -o StrictHostKeyChecking=no ec2-user@${EC2_IP}"
 
 $SSH "sudo systemctl stop pochaco && echo stopped"
 
@@ -72,7 +70,7 @@ $SSH "sudo systemctl is-active pochaco || echo confirmed: inactive"
 
 ```bash
 rsync -avz --delete \
-  -e "ssh -i ~/kitty-key.pem -o StrictHostKeyChecking=no" \
+  -e "ssh -i ~/<your-key>.pem -o StrictHostKeyChecking=no" \
   --exclude='.env' \
   --exclude='.venv/' \
   --exclude='__pycache__/' \
@@ -83,7 +81,7 @@ rsync -avz --delete \
   --exclude='*.db' \
   --exclude='*.db-wal' \
   --exclude='*.db-shm' \
-  /home/rudolph/project/pochaco/ "ec2-user@${EC2_IP}:/opt/pochaco/"
+  ~/project/pochaco/ "ec2-user@${EC2_IP}:/opt/pochaco/"
 ```
 
 ### 4. EC2에서 의존성 설치
@@ -129,11 +127,11 @@ $SSH "journalctl -u pochaco --since '1 minute ago' --no-pager | tail -30"
 cd ~/project/pochaco
 
 # 서비스 먼저 중지
-SSH="ssh -i ~/kitty-key.pem -o StrictHostKeyChecking=no ec2-user@${EC2_IP}"
+SSH="ssh -i ~/<your-key>.pem -o StrictHostKeyChecking=no ec2-user@${EC2_IP}"
 $SSH "sudo systemctl stop pochaco"
 
 # 배포
-EC2_HOST="ec2-user@${EC2_IP}" SSH_KEY="~/kitty-key.pem" bash deploy/deploy.sh
+EC2_HOST="ec2-user@${EC2_IP}" SSH_KEY="~/<your-key>.pem" bash deploy/deploy.sh
 ```
 
 > `deploy.sh`는 내부적으로 rsync → pip install → systemctl restart 를 수행합니다.
@@ -144,7 +142,7 @@ EC2_HOST="ec2-user@${EC2_IP}" SSH_KEY="~/kitty-key.pem" bash deploy/deploy.sh
 ## 서비스 상태 확인 명령어
 
 ```bash
-SSH="ssh -i ~/kitty-key.pem -o StrictHostKeyChecking=no ec2-user@${EC2_IP}"
+SSH="ssh -i ~/<your-key>.pem -o StrictHostKeyChecking=no ec2-user@${EC2_IP}"
 
 # 서비스 상태
 $SSH "sudo systemctl status pochaco --no-pager"
