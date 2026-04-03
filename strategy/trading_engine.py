@@ -71,7 +71,6 @@ class TradingEngine:
         self._running = True
         logger.info("=== TradingEngine 시작 ===")
 
-        self._liquidate_all(note="기동 전체 현금화")
         self.daily_start_krw = self._client.get_krw_balance()
 
         while self._running:

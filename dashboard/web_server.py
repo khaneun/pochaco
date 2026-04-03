@@ -44,7 +44,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
                 held_min = (datetime.utcnow() - pos.opened_at).total_seconds() / 60
                 position_data = {
                     "symbol": pos.symbol,
-                    "units": round(pos.units, 6),
+                    "units": round(pos.units, 2),
                     "buy_price": pos.buy_price,
                     "current_price": cur,
                     "pnl_pct": round(pnl_pct, 2),
@@ -68,7 +68,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
                 "symbol": t.symbol,
                 "side": t.side,
                 "price": t.price,
-                "units": round(t.units, 6),
+                "units": round(t.units, 2),
                 "krw_amount": round(t.krw_amount, 0),
                 "note": t.note or "",
             }
@@ -393,7 +393,7 @@ def _render_html(data: dict) -> str:
         bar_color = "#4ade80" if pnl_pct >= 0 else "#f87171"
         position_html = f"""
         <div class="big-num {pnl_color}">{pnl_pct:+.2f}%</div>
-        <div class="sub">{pos['symbol']} {pos['units']} 개</div>
+        <div class="sub">{pos['symbol']} {pos['units']:.2f} 개</div>
         <br>
         <div class="stat-row">
           <span class="stat-label">매수가</span>
@@ -475,7 +475,7 @@ def _render_html(data: dict) -> str:
                 f"<span class='time-hms'>{t_hms}</span></td>"
                 f"<td><b>{t['symbol']}</b></td>"
                 f"<td style='text-align:right'>{t['price']:,.0f}</td>"
-                f"<td style='text-align:right'>{t['units']:.4f}</td>"
+                f"<td style='text-align:right'>{t['units']:.2f}</td>"
                 f"<td style='text-align:right'>{t['krw_amount']:,.0f}</td>"
                 f"</tr>"
                 f"<tr class='trade-row-sub'>"
@@ -534,8 +534,8 @@ def _render_html(data: dict) -> str:
                 f"<td><b>+{ev['suggested_tp']:.1f} / {ev['suggested_sl']:.1f}</b></td>"
                 f"</tr>"
                 f"<tr class='eval-row-sub'>"
-                f'<td colspan="2"><span class="badge {"badge-green" if ev["exit_type"] == "take_profit" else "badge-red"}">{exit_label}</span></td>'
-                f"<td colspan='4'>{lesson_html}</td>"
+                f'<td><span class="badge {"badge-green" if ev["exit_type"] == "take_profit" else "badge-red"}">{exit_label}</span></td>'
+                f"<td colspan='5'>{lesson_html}</td>"
                 f"</tr>"
             )
         evals_html = (
