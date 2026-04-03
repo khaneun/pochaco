@@ -131,14 +131,18 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="refresh" content="30">
-<title>pochaco 대시보드</title>
+<title>Pochaco Monitor</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }}
   header {{ background: #1e293b; padding: 16px 24px; border-bottom: 1px solid #334155;
-            display: flex; justify-content: space-between; align-items: center; }}
+            display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }}
   header h1 {{ font-size: 1.4rem; color: #38bdf8; font-weight: 700; }}
   header span {{ font-size: 0.8rem; color: #64748b; }}
+  .health-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                 background: #4ade80; box-shadow: 0 0 6px #4ade80; margin-right: 6px;
+                 animation: pulse 2s infinite; vertical-align: middle; }}
+  @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.5; }} }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
            gap: 16px; padding: 20px; }}
   .card {{ background: #1e293b; border-radius: 12px; padding: 20px;
@@ -159,6 +163,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
         border-bottom: 1px solid #334155; font-weight: 500; }}
   td {{ padding: 6px 8px; border-bottom: 1px solid #1e293b; }}
   tr:hover td {{ background: #0f172a; }}
+  .trade-row-main td {{ border-bottom: none; padding-bottom: 2px; }}
+  .trade-row-sub td {{ border-bottom: 1px solid #1e293b; padding-top: 2px;
+                       font-size: 0.78rem; color: #64748b; }}
+  .trade-row-main:hover td, .trade-row-sub:hover td {{ background: #0f172a; }}
   .stat-row {{ display: flex; justify-content: space-between;
                padding: 6px 0; border-bottom: 1px solid #334155; }}
   .stat-row:last-child {{ border-bottom: none; }}
@@ -171,8 +179,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>🤖 pochaco 자동매매 대시보드</h1>
-  <span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
+  <h1>Pochaco Monitor</h1>
+  <span><span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
 </header>
 
 <div class="grid">
@@ -337,28 +345,35 @@ def _render_html(data: dict) -> str:
     else:
         reports_html = '<div class="no-data">성과 데이터 없음<br>(매일 23:55 기록)</div>'
 
-    # 거래 내역 HTML
+    # 거래 내역 HTML — 2줄 레이아웃
+    # 1행: 시간 / 심볼 / 가격 / 수량 / 금액
+    # 2행: 구분 배지 / 비고 (colspan)
     if data["recent_trades"]:
         rows = ""
         for t in data["recent_trades"]:
             side_class = "badge-green" if t["side"] == "buy" else "badge-red"
-            side_label = "BUY" if t["side"] == "buy" else "SELL"
+            side_label = "매수" if t["side"] == "buy" else "매도"
+            note = t["note"] or ""
             rows += (
-                f"<tr>"
+                f"<tr class='trade-row-main'>"
                 f"<td class='gray'>{t['time']}</td>"
                 f"<td><b>{t['symbol']}</b></td>"
+                f"<td style='text-align:right'>{t['price']:,.0f}</td>"
+                f"<td style='text-align:right'>{t['units']:.4f}</td>"
+                f"<td style='text-align:right'>{t['krw_amount']:,.0f}</td>"
+                f"</tr>"
+                f"<tr class='trade-row-sub'>"
                 f'<td><span class="badge {side_class}">{side_label}</span></td>'
-                f"<td>{t['price']:,.0f}</td>"
-                f"<td>{t['units']:.4f}</td>"
-                f"<td>{t['krw_amount']:,.0f}</td>"
-                f"<td class='gray'>{t['note'][:28]}</td>"
+                f"<td colspan='4'>{note}</td>"
                 f"</tr>"
             )
         trades_html = (
-            "<table><tr>"
-            "<th>시간</th><th>심볼</th><th>구분</th>"
-            "<th>가격(원)</th><th>수량</th><th>금액(원)</th><th>비고</th>"
-            f"</tr>{rows}</table>"
+            "<table>"
+            "<tr><th>시간</th><th>심볼</th>"
+            "<th style='text-align:right'>가격(원)</th>"
+            "<th style='text-align:right'>수량</th>"
+            "<th style='text-align:right'>금액(원)</th></tr>"
+            f"{rows}</table>"
         )
     else:
         trades_html = '<div class="no-data">거래 내역 없음</div>'
