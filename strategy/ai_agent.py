@@ -64,7 +64,7 @@ class TradingAgent:
         if not stats:
             return ""
         lines = [
-            "\n**[과거 매매 성과 분석 — 반드시 참고하여 현실적인 목표를 설정하세요]**",
+            "\n**[과거 매매 성과 — 이 데이터를 기반으로 전략 파라미터를 결정하세요]**",
             f"- 최근 {stats['count']}건 매매: 승률 {stats['win_rate']:.0%} "
             f"(익절 {stats['win_count']}건, 손절 {stats['loss_count']}건)",
             f"- 평균 실현 수익률: {stats['avg_pnl_pct']:+.2f}%",
@@ -72,6 +72,26 @@ class TradingAgent:
             f"- 기존 평균 익절 설정: +{stats['avg_tp_set']:.1f}%, 평균 손절 설정: {stats['avg_sl_set']:.1f}%",
             f"- AI 제안 평균 익절: +{stats['avg_suggested_tp']:.1f}%, 제안 평균 손절: {stats['avg_suggested_sl']:.1f}%",
         ]
+
+        # 추세 방향 정보
+        if stats.get("tp_direction"):
+            tp_vals = stats.get("tp_trend", [])
+            trend_str = "→".join(f"{v:.1f}" for v in tp_vals)
+            lines.append(
+                f"- 익절 제안 추세: {stats['tp_direction']} ({trend_str}%)"
+            )
+
+        # 최근 거래 코인 정보
+        recent = stats.get("recent_trades", [])
+        if recent:
+            lines.append("- 최근 거래 코인 (재선정 시 주의):")
+            for t in recent:
+                exit_kr = "익절" if t["exit_type"] == "take_profit" else "손절"
+                lines.append(
+                    f"  * {t['symbol']}: {exit_kr} {t['pnl_pct']:+.2f}%, "
+                    f"보유 {t['held_minutes']:.0f}분"
+                )
+
         if stats.get("recent_lessons"):
             lines.append("- 최근 교훈:")
             for lesson in stats["recent_lessons"]:
@@ -91,16 +111,20 @@ class TradingAgent:
         market_text = self._snapshots_to_text(snapshots)
         history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
 
-        # 과거 성과가 있으면 그에 맞춘 현실적 가이드라인 사용
+        # 과거 성과가 있으면 적응형 범위를 프롬프트에 강제
         if eval_stats and eval_stats.get("count", 0) >= 3:
+            tp_min = eval_stats.get("tp_clamp_min", 2.0)
+            tp_max = eval_stats.get("tp_clamp_max", 8.0)
+            sl_min = eval_stats.get("sl_clamp_min", -3.0)
+            sl_max = eval_stats.get("sl_clamp_max", -1.0)
             tp_guide = (
-                f"- 익절(take_profit_pct): 과거 AI 제안 평균 +{eval_stats['avg_suggested_tp']:.1f}%를 참고하되, "
-                f"시장 상황에 맞게 2%~8% 범위에서 설정\n"
-                f"- 손절(stop_loss_pct): 과거 AI 제안 평균 {eval_stats['avg_suggested_sl']:.1f}%를 참고하되, "
-                f"-1.0%~-3.0% 범위에서 설정"
+                f"- 익절(take_profit_pct): 과거 성과 기반 적응 범위 **+{tp_min:.1f}%~+{tp_max:.1f}%** 내에서 설정 (필수)\n"
+                f"- 손절(stop_loss_pct): 적응 범위 **{sl_min:.1f}%~{sl_max:.1f}%** 내에서 설정 (필수)"
             )
             rr_guide = "- 리워드:리스크 비율 최소 2:1 이상 (과거 성과 기반 유연 적용)"
         else:
+            tp_min, tp_max = 2.0, 8.0
+            sl_min, sl_max = -3.0, -1.0
             tp_guide = (
                 "- 익절(take_profit_pct): 2%~8% 범위에서 현실적으로 설정\n"
                 "- 손절(stop_loss_pct): -1.0%~-3.0% 범위에서 설정"
@@ -151,24 +175,25 @@ class TradingAgent:
             confidence = float(data.get("confidence", 0.5))
             reason = data.get("reason", "")
 
-            # ── 안전장치: 부호 및 범위 보정 ──
+            # ── 안전장치: 적응형 범위 clamp ──
+            # tp_min/tp_max, sl_min/sl_max는 eval_stats 기반 또는 기본값
             if stop_loss_pct > 0:
                 stop_loss_pct = -abs(stop_loss_pct)
-            if stop_loss_pct > -0.5:
-                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -1.5% (너무 작음)")
-                stop_loss_pct = -1.5
-            if stop_loss_pct < -5.0:
-                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -3.0% (너무 큼)")
-                stop_loss_pct = -3.0
+            if stop_loss_pct > sl_max:
+                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → {sl_max}% (범위 초과)")
+                stop_loss_pct = sl_max
+            if stop_loss_pct < sl_min:
+                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → {sl_min}% (범위 초과)")
+                stop_loss_pct = sl_min
 
-            if take_profit_pct < 1.5:
-                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → 2.0% (수수료 미만)")
-                take_profit_pct = 2.0
-            if take_profit_pct > 15.0:
-                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → 8.0% (비현실적)")
-                take_profit_pct = 8.0
+            if take_profit_pct < tp_min:
+                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → {tp_min}% (범위 하한)")
+                take_profit_pct = tp_min
+            if take_profit_pct > tp_max:
+                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → {tp_max}% (범위 상한)")
+                take_profit_pct = tp_max
 
-            # R:R 최소 2:1 보정 (기존 3:1에서 완화)
+            # R:R 최소 2:1 보정
             rr_ratio = take_profit_pct / abs(stop_loss_pct) if stop_loss_pct != 0 else 99
             if rr_ratio < 2.0:
                 take_profit_pct = abs(stop_loss_pct) * 2.0

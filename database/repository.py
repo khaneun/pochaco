@@ -315,7 +315,10 @@ class TradeRepository:
             return rows
 
     def get_evaluation_stats(self, last_n: int = 10) -> dict:
-        """최근 N건 평가 기반 전략 통계 — Agent 프롬프트에 주입용"""
+        """최근 N건 평가 기반 전략 통계 — Agent 프롬프트에 주입용
+
+        추세 방향, 최근 거래 코인 정보, suggested clamp 범위를 함께 반환합니다.
+        """
         with self._session() as db:
             evals = (
                 db.query(StrategyEvaluation)
@@ -336,6 +339,46 @@ class TradeRepository:
             avg_suggested_tp = sum(e.suggested_tp_pct for e in evals) / len(evals)
             avg_suggested_sl = sum(e.suggested_sl_pct for e in evals) / len(evals)
 
+            # ── 추세 방향: 최근 5건의 suggested_tp 시계열 (오래된순) ──
+            recent_5 = list(reversed(evals[:5]))  # 오래된 순
+            tp_trend = [e.suggested_tp_pct for e in recent_5]
+            sl_trend = [e.suggested_sl_pct for e in recent_5]
+
+            # 단순 추세: 후반 평균 - 전반 평균
+            tp_direction = ""
+            if len(tp_trend) >= 4:
+                first_half = sum(tp_trend[:len(tp_trend)//2]) / (len(tp_trend)//2)
+                second_half = sum(tp_trend[len(tp_trend)//2:]) / (len(tp_trend) - len(tp_trend)//2)
+                diff = second_half - first_half
+                if diff < -0.3:
+                    tp_direction = "하향"
+                elif diff > 0.3:
+                    tp_direction = "상향"
+                else:
+                    tp_direction = "유지"
+
+            # ── 최근 거래 코인 + 결과 (프롬프트 주입용) ──
+            recent_trades_summary = [
+                {
+                    "symbol": e.symbol,
+                    "pnl_pct": e.pnl_pct,
+                    "exit_type": e.exit_type,
+                    "held_minutes": e.held_minutes,
+                }
+                for e in evals[:5]
+            ]
+
+            # ── suggested 기반 적응형 clamp 범위 ──
+            # 과거 데이터가 충분하면 avg ± 1.5% 범위로 좁힘
+            if len(evals) >= 3:
+                tp_clamp_min = max(2.0, round(avg_suggested_tp - 1.5, 1))
+                tp_clamp_max = min(8.0, round(avg_suggested_tp + 1.5, 1))
+                sl_clamp_min = max(-3.0, round(avg_suggested_sl - 0.5, 1))  # 더 넓은 손절
+                sl_clamp_max = min(-1.0, round(avg_suggested_sl + 0.5, 1))  # 더 좁은 손절
+            else:
+                tp_clamp_min, tp_clamp_max = 2.0, 8.0
+                sl_clamp_min, sl_clamp_max = -3.0, -1.0
+
             return {
                 "count": len(evals),
                 "win_count": len(wins),
@@ -347,5 +390,12 @@ class TradeRepository:
                 "avg_sl_set": round(avg_sl_set, 2),
                 "avg_suggested_tp": round(avg_suggested_tp, 2),
                 "avg_suggested_sl": round(avg_suggested_sl, 2),
+                "tp_trend": tp_trend,
+                "tp_direction": tp_direction,
                 "recent_lessons": [e.lesson for e in evals[:3] if e.lesson],
+                "recent_trades": recent_trades_summary,
+                "tp_clamp_min": tp_clamp_min,
+                "tp_clamp_max": tp_clamp_max,
+                "sl_clamp_min": sl_clamp_min,
+                "sl_clamp_max": sl_clamp_max,
             }

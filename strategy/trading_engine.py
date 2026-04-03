@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 # 보유 중 전략 조정 주기 (초) — 30분마다
 _ADJUST_INTERVAL_SEC = 30 * 60
+# 최대 보유 시간 (분) — 초과 시 강제 매도
+_MAX_HOLD_MINUTES = 720  # 12시간
 
 
 class TradingEngine:
@@ -43,6 +45,7 @@ class TradingEngine:
         self._notifier = None
         self._price_fail_count: dict[int, int] = {}  # position_id → 연속 실패 횟수
         self._last_adjust_time: float = 0.0           # 마지막 전략 조정 시각 (epoch)
+        self._last_adjustment: dict | None = None     # 가장 최근 동적 조정 기록
         self.daily_start_krw: float = 0.0
 
     # ------------------------------------------------------------------ #
@@ -244,8 +247,9 @@ class TradingEngine:
             f"투입={buy_amount:,.0f}원"
         )
 
-        # 전략 조정 타이머 리셋
+        # 전략 조정 타이머 + 기록 리셋
         self._last_adjust_time = time.time()
+        self._last_adjustment = None
 
         if self._notifier:
             try:
@@ -293,6 +297,15 @@ class TradingEngine:
             f"수익={pnl_pct:+.2f}% "
             f"익절=+{position.take_profit_pct}% 손절={position.stop_loss_pct}%"
         )
+
+        # 시간 기반 강제 탈출 체크
+        holding_minutes = (datetime.utcnow() - position.opened_at).total_seconds() / 60
+        if holding_minutes >= _MAX_HOLD_MINUTES:
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"시간초과 강제매도 ({holding_minutes:.0f}분 >= {_MAX_HOLD_MINUTES}분, {pnl_pct:+.2f}%)",
+            )
+            return
 
         # 익절/손절 체크
         if pnl_pct >= position.take_profit_pct:
@@ -346,10 +359,15 @@ class TradingEngine:
                     f"({reason})"
                 )
 
-                # Position 업데이트
+                # Position 업데이트 + 조정 기록 보존
                 self._update_position_targets(
                     position.id, new_tp, new_sl, reason,
                 )
+                self._last_adjustment = {
+                    "adjusted_tp_pct": new_tp,
+                    "adjusted_sl_pct": new_sl,
+                    "adjustment_reason": reason,
+                }
 
                 if self._notifier:
                     try:
@@ -473,7 +491,12 @@ class TradingEngine:
     ) -> None:
         """매도 후 AI에게 성과 평가를 요청하고 DB에 저장"""
         try:
-            exit_type = "take_profit" if "익절" in reason else "stop_loss"
+            if "익절" in reason:
+                exit_type = "take_profit"
+            elif "시간초과" in reason:
+                exit_type = "timeout"
+            else:
+                exit_type = "stop_loss"
             eval_stats = self._repo.get_evaluation_stats(last_n=10)
 
             evaluation = self._agent.evaluate_trade(
@@ -489,6 +512,8 @@ class TradingEngine:
                 eval_stats=eval_stats,
             )
 
+            # 동적 조정 기록이 있으면 함께 저장
+            adj = self._last_adjustment or {}
             self._repo.save_evaluation(
                 position_id=position.id,
                 symbol=position.symbol,
@@ -503,6 +528,9 @@ class TradingEngine:
                 suggested_tp_pct=evaluation.suggested_tp_pct,
                 suggested_sl_pct=evaluation.suggested_sl_pct,
                 lesson=evaluation.lesson,
+                adjusted_tp_pct=adj.get("adjusted_tp_pct"),
+                adjusted_sl_pct=adj.get("adjusted_sl_pct"),
+                adjustment_reason=adj.get("adjustment_reason", ""),
             )
 
             logger.info(
