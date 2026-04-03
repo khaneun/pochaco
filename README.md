@@ -329,4 +329,5 @@ DATABASE_URL=postgresql+psycopg2://user:password@host:5432/pochaco
 requests, websockets, APScheduler, SQLAlchemy, rich, python-dotenv, pydantic-settings
 anthropic, openai, google-generativeai   ← 사용하는 LLM만 설치
 boto3                                    ← AWS Secrets Manager 연동
+PyJWT                                    ← 빗썸 API v2 JWT 인증
 ```

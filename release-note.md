@@ -2,6 +2,28 @@
 
 ---
 
+## v1.6.0 (2026-04-03)
+
+### 빗썸 API v2 마이그레이션
+
+#### BithumbClient 전면 교체 (`core/bithumb_client.py`)
+- **인증 방식 변경**: HMAC-SHA512(v1) → JWT HS256(v2)
+  - `_sign` 제거, `_jwt_header(params)` 추가
+  - `Authorization: Bearer {jwt_token}` 헤더 방식
+  - UUID nonce + millisecond timestamp + SHA512 query_hash
+- **Private API 엔드포인트 변경**
+  - `POST /info/balance` → `GET /v1/accounts`
+  - `POST /trade/market_buy` → `POST /v1/orders` (`ord_type=price`, KRW 금액 직접 지정)
+  - `POST /trade/market_sell` → `POST /v1/orders` (`ord_type=market`, 코인 수량 지정)
+  - `POST /trade/place` → `POST /v1/orders` (`ord_type=limit`)
+  - `POST /trade/cancel` → `DELETE /v1/order`
+  - `POST /info/orders` → `GET /v1/orders`
+- **Public API (ticker, orderbook, candlestick)**: v1 엔드포인트 그대로 유지 (인증 불필요)
+- **하위 호환성 유지**: `get_balance()` 반환 포맷을 v1 스타일로 정규화, trading_engine.py 변경 없음
+- **의존성 추가**: `PyJWT>=2.8.0`
+
+---
+
 ## v1.5.0 (2026-04-03)
 
 ### 안정성 개선 + 텔레그램 로그 조회

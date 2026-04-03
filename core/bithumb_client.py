@@ -1,12 +1,15 @@
-"""빗썸 REST API 클라이언트"""
-import base64
+"""빗썸 REST API 클라이언트
+
+Public API  : v1 엔드포인트 유지 (/public/ticker 등, 인증 불필요)
+Private API : v2 JWT 인증 방식 (/v1/accounts, /v1/orders 등)
+"""
 import hashlib
-import hmac
+import logging
 import time
 import urllib.parse
-import logging
-from typing import Any
+import uuid
 
+import jwt
 import requests
 
 from config import settings
@@ -26,37 +29,53 @@ class BithumbClient:
         self._session.headers.update({"Accept": "application/json"})
 
     # ------------------------------------------------------------------ #
-    #  인증 헬퍼                                                           #
+    #  인증 헬퍼 (API v2 JWT)                                              #
     # ------------------------------------------------------------------ #
-    def _sign(self, endpoint: str, params: dict) -> dict:
-        """HMAC-SHA512 서명 생성 후 헤더 반환
+    def _jwt_header(self, params: dict | None = None) -> dict:
+        """JWT 인증 헤더 생성 (HS256)
 
-        빗썸 인증 규격:
-          hmac_data = endpoint + "\0" + urlencode({...params, endpoint}) + "\0" + nonce
-          Api-Sign  = Base64(HMAC-SHA512(secret_key, hmac_data))
-        nonce는 밀리초(13자리), endpoint는 query string 마지막에 위치해야 합니다.
+        params가 있으면 SHA512 query_hash를 payload에 포함합니다.
         """
-        nonce = str(int(time.time() * 1_000))
-        sign_params = {**params, "endpoint": endpoint}  # endpoint는 마지막
-
-        query = urllib.parse.urlencode(sign_params)
-        hmac_data = f"{endpoint}\0{query}\0{nonce}"
-        raw_sig = hmac.new(
-            self._secret_key.encode("utf-8"),
-            hmac_data.encode("utf-8"),
-            digestmod=hashlib.sha512,
-        ).hexdigest()
-        signature = base64.b64encode(raw_sig.encode("utf-8")).decode("utf-8")
-
-        return {
-            "Api-Key": self._api_key,
-            "Api-Sign": signature,
-            "Api-Nonce": nonce,
-            "Content-Type": "application/x-www-form-urlencoded",
+        payload: dict = {
+            "access_key": self._api_key,
+            "nonce": str(uuid.uuid4()),
+            "timestamp": round(time.time() * 1000),
         }
+        if params:
+            query_string = urllib.parse.urlencode(params).encode()
+            query_hash = hashlib.sha512(query_string).hexdigest()
+            payload["query_hash"] = query_hash
+            payload["query_hash_alg"] = "SHA512"
+
+        token = jwt.encode(payload, self._secret_key, algorithm="HS256")
+        return {"Authorization": f"Bearer {token}"}
+
+    def _v2_get(self, path: str, params: dict | None = None) -> any:
+        headers = self._jwt_header(params)
+        resp = self._session.get(
+            self.BASE_URL + path, params=params, headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _v2_post(self, path: str, body: dict) -> any:
+        headers = {**self._jwt_header(body), "Content-Type": "application/json"}
+        resp = self._session.post(
+            self.BASE_URL + path, json=body, headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _v2_delete(self, path: str, params: dict) -> any:
+        headers = self._jwt_header(params)
+        resp = self._session.delete(
+            self.BASE_URL + path, params=params, headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     # ------------------------------------------------------------------ #
-    #  Public API                                                          #
+    #  Public API (v1, 인증 불필요)                                        #
     # ------------------------------------------------------------------ #
     def get_ticker(self, symbol: str = "ALL") -> dict:
         """현재가 정보 조회. symbol='ALL' 이면 전체 코인"""
@@ -94,112 +113,114 @@ class BithumbClient:
         return [k for k in data["data"].keys() if k != "date"]
 
     # ------------------------------------------------------------------ #
-    #  Private API                                                         #
+    #  Private API (v2 JWT)                                               #
     # ------------------------------------------------------------------ #
-    def _private_post(self, endpoint: str, params: dict) -> dict:
-        """Private API POST 요청 공통 처리"""
-        # POST body에도 endpoint 포함 (빗썸 API 규격)
-        post_params = {**params, "endpoint": endpoint}
-        headers = self._sign(endpoint, params)
-        resp = self._session.post(
-            self.BASE_URL + endpoint, data=post_params, headers=headers, timeout=10
-        )
-        resp.raise_for_status()
-        return resp.json()
-
     def get_balance(self, currency: str = "ALL") -> dict:
-        """잔고 조회"""
-        return self._private_post("/info/balance", {"currency": currency})
+        """잔고 조회 — trading_engine 호환 포맷(v1 스타일)으로 반환
+
+        v2 응답: [{"currency":"KRW","balance":"94825","locked":"0",...}, ...]
+        반환:    {"status":"0000","data":{"available_krw":"94825","total_krw":"94825","in_use_krw":"0",...}}
+        """
+        accounts = self._v2_get("/v1/accounts")
+        data: dict = {}
+        for acc in accounts:
+            cur = acc["currency"].lower()
+            bal = float(acc.get("balance", 0))
+            locked = float(acc.get("locked", 0))
+            data[f"available_{cur}"] = str(bal)
+            data[f"total_{cur}"] = str(bal + locked)
+            data[f"in_use_{cur}"] = str(locked)
+        return {"status": "0000", "data": data}
 
     def get_orders(self, symbol: str, order_id: str = "", order_type: str = "") -> dict:
-        """미체결 주문 조회"""
-        params = {
-            "order_currency": symbol,
-            "payment_currency": "KRW",
-        }
-        if order_id:
-            params["order_id"] = order_id
-        if order_type:
-            params["type"] = order_type
-        return self._private_post("/info/orders", params)
-
-    def get_user_transactions(self, symbol: str, offset: int = 0, count: int = 20) -> dict:
-        """거래 내역 조회"""
-        return self._private_post("/info/user_transactions", {
-            "order_currency": symbol,
-            "payment_currency": "KRW",
-            "offset": offset,
-            "count": count,
-        })
+        """미체결 주문 조회 — v1 호환 포맷 반환"""
+        params: dict = {"market": f"KRW-{symbol}", "state": "wait", "limit": 100}
+        orders = self._v2_get("/v1/orders", params)
+        # v1 호환 포맷으로 변환
+        normalized = [
+            {
+                "order_id": o.get("uuid", ""),
+                "type": "bid" if o.get("side") == "bid" else "ask",
+                "order_currency": symbol,
+                "payment_currency": "KRW",
+                "units": o.get("volume", "0"),
+                "price": o.get("price", "0"),
+            }
+            for o in (orders if isinstance(orders, list) else [])
+        ]
+        return {"status": "0000", "data": normalized}
 
     def market_buy(self, symbol: str, krw_amount: float) -> dict:
-        """시장가 매수"""
-        ob = self.get_orderbook(symbol)
-        ask_price = float(ob["data"]["asks"][0]["price"])
-        units = f"{(krw_amount / ask_price) * 0.9975:.8f}"
-        params = {
-            "order_currency": symbol,
-            "payment_currency": "KRW",
-            "units": units,
+        """시장가 매수 (v2: ord_type=price → KRW 금액으로 즉시 체결)"""
+        body = {
+            "market": f"KRW-{symbol}",
+            "side": "bid",
+            "ord_type": "price",
+            "price": str(krw_amount),
         }
-        post_params = {**params, "endpoint": "/trade/market_buy"}
-
-        logger.info(
-            f"[매수 요청 상세]\n"
-            f"  symbol       : {symbol}\n"
-            f"  ask_price    : {ask_price:,} KRW\n"
-            f"  krw_amount   : {krw_amount:,.0f} KRW\n"
-            f"  units (수량) : {units} {symbol}\n"
-            f"  예상 체결금  : {float(units) * ask_price:,.0f} KRW\n"
-            f"  POST body    : {post_params}"
-        )
-        result = self._private_post("/trade/market_buy", params)
-        logger.info(f"[매수 결과] status={result.get('status')} message={result.get('message')} data={result.get('data')}")
-        return result
+        logger.info(f"[매수] {symbol} {krw_amount:,.0f} KRW (ord_type=price)")
+        try:
+            result = self._v2_post("/v1/orders", body)
+            logger.info(f"[매수 결과] {result}")
+            return {"status": "0000", "data": result}
+        except requests.HTTPError as e:
+            body_text = e.response.text if e.response is not None else str(e)
+            logger.error(f"[매수 실패] {e.response.status_code if e.response is not None else ''}: {body_text}")
+            return {"status": "9999", "message": body_text}
 
     def market_sell(self, symbol: str, units: float) -> dict:
-        """시장가 매도 (코인 수량 지정)"""
-        params = {
-            "order_currency": symbol,
-            "payment_currency": "KRW",
-            "units": units,
+        """시장가 매도 (v2: ord_type=market → 코인 수량으로 즉시 체결)"""
+        body = {
+            "market": f"KRW-{symbol}",
+            "side": "ask",
+            "ord_type": "market",
+            "volume": str(units),
         }
-        logger.info(f"[매도] {symbol} {units} 개")
-        result = self._private_post("/trade/market_sell", params)
-        if result.get("status") == "0000":
-            logger.info(f"[매도 체결] {result}")
-        else:
-            logger.warning(f"[매도 실패] {result}")
-        return result
+        logger.info(f"[매도] {symbol} {units}개 (ord_type=market)")
+        try:
+            result = self._v2_post("/v1/orders", body)
+            logger.info(f"[매도 결과] {result}")
+            return {"status": "0000", "data": result}
+        except requests.HTTPError as e:
+            body_text = e.response.text if e.response is not None else str(e)
+            logger.warning(f"[매도 실패] {body_text}")
+            return {"status": "9999", "message": body_text}
 
     def limit_buy(self, symbol: str, price: float, units: float) -> dict:
         """지정가 매수"""
-        return self._private_post("/trade/place", {
-            "order_currency": symbol,
-            "payment_currency": "KRW",
-            "type": "bid",
-            "price": price,
-            "units": units,
-        })
+        body = {
+            "market": f"KRW-{symbol}",
+            "side": "bid",
+            "ord_type": "limit",
+            "price": str(price),
+            "volume": str(units),
+        }
+        try:
+            return {"status": "0000", "data": self._v2_post("/v1/orders", body)}
+        except requests.HTTPError as e:
+            return {"status": "9999", "message": e.response.text if e.response else str(e)}
 
     def limit_sell(self, symbol: str, price: float, units: float) -> dict:
         """지정가 매도"""
-        return self._private_post("/trade/place", {
-            "order_currency": symbol,
-            "payment_currency": "KRW",
-            "type": "ask",
-            "price": price,
-            "units": units,
-        })
+        body = {
+            "market": f"KRW-{symbol}",
+            "side": "ask",
+            "ord_type": "limit",
+            "price": str(price),
+            "volume": str(units),
+        }
+        try:
+            return {"status": "0000", "data": self._v2_post("/v1/orders", body)}
+        except requests.HTTPError as e:
+            return {"status": "9999", "message": e.response.text if e.response else str(e)}
 
     def cancel_order(self, order_type: str, order_id: str, symbol: str) -> dict:
-        """주문 취소. order_type: 'bid'(매수) or 'ask'(매도)"""
-        return self._private_post("/trade/cancel", {
-            "type": order_type,
-            "order_id": order_id,
-            "order_currency": symbol,
-            "payment_currency": "KRW",
-        })
+        """주문 취소. order_id = v2 uuid"""
+        try:
+            result = self._v2_delete("/v1/order", {"uuid": order_id})
+            return {"status": "0000", "data": result}
+        except requests.HTTPError as e:
+            return {"status": "9999", "message": e.response.text if e.response else str(e)}
 
     def cancel_all_orders(self, symbol: str) -> list[dict]:
         """미체결 주문 일괄 취소"""
