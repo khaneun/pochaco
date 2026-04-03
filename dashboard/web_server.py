@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+_APP_DIR = Path(__file__).parent.parent
 
 from database import TradeRepository
 from database.models import Position
@@ -164,9 +168,21 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   td {{ padding: 6px 8px; border-bottom: 1px solid #1e293b; }}
   tr:hover td {{ background: #0f172a; }}
   .trade-row-main td {{ border-bottom: none; padding-bottom: 2px; }}
-  .trade-row-sub td {{ border-bottom: 1px solid #1e293b; padding-top: 2px;
-                       font-size: 0.78rem; color: #64748b; }}
+  .trade-row-sub td {{ padding-top: 2px; font-size: 0.78rem; color: #64748b; }}
+  .trade-row-main {{ border-top: 1px solid #334155; }}
   .trade-row-main:hover td, .trade-row-sub:hover td {{ background: #0f172a; }}
+  .eval-row-main td {{ border-bottom: none; padding-bottom: 2px; }}
+  .eval-row-sub td {{ padding-top: 2px; font-size: 0.78rem; color: #64748b; }}
+  .eval-row-main {{ border-top: 1px solid #334155; }}
+  .eval-row-main:hover td, .eval-row-sub:hover td {{ background: #0f172a; }}
+  .time-date {{ display: block; color: #64748b; font-size: 0.75rem; }}
+  .time-hms  {{ display: block; font-size: 0.82rem; }}
+  .profile-img {{ width: 2rem; height: 2rem; border-radius: 50%;
+                  object-fit: cover; margin-right: 10px; vertical-align: middle;
+                  border: 2px solid #334155; }}
+  .expandable .full {{ display: none; }}
+  .more-btn {{ background: none; border: none; color: #38bdf8; cursor: pointer;
+               font-size: 0.75rem; padding: 0 2px; text-decoration: underline; }}
   .stat-row {{ display: flex; justify-content: space-between;
                padding: 6px 0; border-bottom: 1px solid #334155; }}
   .stat-row:last-child {{ border-bottom: none; }}
@@ -176,10 +192,24 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .no-data {{ color: #475569; font-style: italic; text-align: center;
               padding: 20px; }}
 </style>
+<script>
+function toggleMore(btn) {{
+  var wrap = btn.closest('.expandable');
+  var short = wrap.querySelector('.short');
+  var full  = wrap.querySelector('.full');
+  if (full.style.display === 'none' || full.style.display === '') {{
+    short.style.display = 'none';
+    full.style.display  = 'inline';
+  }} else {{
+    full.style.display  = 'none';
+    short.style.display = 'inline';
+  }}
+}}
+</script>
 </head>
 <body>
 <header>
-  <h1>Pochaco Monitor</h1>
+  <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor</h1>
   <span><span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
 </header>
 
@@ -244,6 +274,27 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <footer>pochaco — AI 자동매매 시스템 &nbsp;|&nbsp; 데이터는 30초마다 갱신됩니다</footer>
 </body>
 </html>"""
+
+
+_expand_counter = 0
+
+
+def _expandable(text: str, limit: int = 35) -> str:
+    """limit자 초과 시 말줄임 + [more] 토글 버튼 HTML 반환"""
+    global _expand_counter
+    if not text or len(text) <= limit:
+        return text
+    _expand_counter += 1
+    eid = f"exp{_expand_counter}"
+    short = text[:limit].rstrip()
+    return (
+        f"<span class='expandable' id='{eid}'>"
+        f"<span class='short'>{short}…"
+        f"<button class='more-btn' onclick='toggleMore(this)'>more</button></span>"
+        f"<span class='full'>{text}"
+        f"<button class='more-btn' onclick='toggleMore(this)'>접기</button></span>"
+        f"</span>"
+    )
 
 
 def _render_html(data: dict) -> str:
@@ -346,17 +397,23 @@ def _render_html(data: dict) -> str:
         reports_html = '<div class="no-data">성과 데이터 없음<br>(매일 23:55 기록)</div>'
 
     # 거래 내역 HTML — 2줄 레이아웃
-    # 1행: 시간 / 심볼 / 가격 / 수량 / 금액
-    # 2행: 구분 배지 / 비고 (colspan)
+    # 1행: 시간(2줄) / 심볼 / 가격 / 수량 / 금액
+    # 2행: 구분 배지 / 비고 [more 확장]
     if data["recent_trades"]:
         rows = ""
         for t in data["recent_trades"]:
             side_class = "badge-green" if t["side"] == "buy" else "badge-red"
             side_label = "매수" if t["side"] == "buy" else "매도"
             note = t["note"] or ""
+            # 시간 분리: "2026-04-03 14:16:54" → date / hms
+            t_parts = t["time"].split(" ")
+            t_date = t_parts[0][2:] if len(t_parts) > 0 else t["time"]  # yy-mm-dd
+            t_hms  = t_parts[1] if len(t_parts) > 1 else ""
+            note_html = _expandable(note, 35)
             rows += (
                 f"<tr class='trade-row-main'>"
-                f"<td class='gray'>{t['time']}</td>"
+                f"<td><span class='time-date'>{t_date}</span>"
+                f"<span class='time-hms'>{t_hms}</span></td>"
                 f"<td><b>{t['symbol']}</b></td>"
                 f"<td style='text-align:right'>{t['price']:,.0f}</td>"
                 f"<td style='text-align:right'>{t['units']:.4f}</td>"
@@ -364,7 +421,7 @@ def _render_html(data: dict) -> str:
                 f"</tr>"
                 f"<tr class='trade-row-sub'>"
                 f'<td><span class="badge {side_class}">{side_label}</span></td>'
-                f"<td colspan='4'>{note}</td>"
+                f"<td colspan='4'>{note_html}</td>"
                 f"</tr>"
             )
         trades_html = (
@@ -403,23 +460,30 @@ def _render_html(data: dict) -> str:
             exit_label = "익절" if ev["exit_type"] == "take_profit" else "손절"
             held = ev["held_minutes"]
             held_str = f"{held/60:.1f}h" if held >= 60 else f"{held:.0f}m"
+            t_parts = ev["time"].split(" ")
+            t_date = t_parts[0][2:] if len(t_parts) > 0 else ev["time"]
+            t_hms  = t_parts[1] if len(t_parts) > 1 else ""
+            lesson_html = _expandable(ev.get("lesson", ""), 35)
             erows += (
-                f"<tr>"
-                f"<td class='gray'>{ev['time']}</td>"
+                f"<tr class='eval-row-main'>"
+                f"<td><span class='time-date'>{t_date}</span>"
+                f"<span class='time-hms'>{t_hms}</span></td>"
                 f"<td><b>{ev['symbol']}</b></td>"
-                f'<td class="{exit_cls}">{exit_label}</td>'
                 f'<td class="{exit_cls}">{ev["pnl_pct"]:+.2f}%</td>'
                 f"<td>{held_str}</td>"
                 f"<td>+{ev['original_tp']:.1f} / {ev['original_sl']:.1f}</td>"
                 f"<td><b>+{ev['suggested_tp']:.1f} / {ev['suggested_sl']:.1f}</b></td>"
-                f"<td class='gray' style='font-size:0.78rem;'>{ev['lesson'][:40]}</td>"
+                f"</tr>"
+                f"<tr class='eval-row-sub'>"
+                f'<td colspan="2"><span class="badge {"badge-green" if ev["exit_type"] == "take_profit" else "badge-red"}">{exit_label}</span></td>'
+                f"<td colspan='4'>{lesson_html}</td>"
                 f"</tr>"
             )
         evals_html = (
-            "<table><tr>"
-            "<th>시간</th><th>코인</th><th>결과</th><th>수익률</th>"
-            "<th>보유</th><th>설정 TP/SL</th><th>제안 TP/SL</th><th>교훈</th>"
-            f"</tr>{erows}</table>"
+            "<table>"
+            "<tr><th>시간</th><th>코인</th><th>수익률</th>"
+            "<th>보유</th><th>설정 TP/SL</th><th>제안 TP/SL</th></tr>"
+            f"{erows}</table>"
         )
     else:
         evals_html = '<div class="no-data">성과 평가 데이터 없음<br>(매매 완료 후 자동 기록)</div>'
@@ -466,6 +530,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(200, "application/json; charset=utf-8", body)
             except Exception as e:
                 self._respond(500, "application/json", json.dumps({"error": str(e)}).encode())
+
+        elif self.path == "/profile.png":
+            img_path = _APP_DIR / "profile.png"
+            if img_path.exists():
+                body = img_path.read_bytes()
+                self._respond(200, "image/png", body)
+            else:
+                self._respond(404, "text/plain", b"Not Found")
 
         else:
             self._respond(404, "text/plain", b"Not Found")
