@@ -84,6 +84,26 @@ def _build_json_status(client: "BithumbClient") -> dict:
         initial = stats["initial_krw"]
         total_pnl_pct = (total - initial) / initial * 100 if initial > 0 else 0.0
 
+        # 성과 평가 데이터
+        recent_evals = repo.get_recent_evaluations(limit=10)
+        eval_stats = repo.get_evaluation_stats(last_n=10)
+        evals_data = [
+            {
+                "time": ev.created_at.strftime("%Y-%m-%d %H:%M"),
+                "symbol": ev.symbol,
+                "exit_type": ev.exit_type,
+                "pnl_pct": round(ev.pnl_pct, 2),
+                "held_minutes": round(ev.held_minutes, 1),
+                "original_tp": ev.original_tp_pct,
+                "original_sl": ev.original_sl_pct,
+                "suggested_tp": ev.suggested_tp_pct,
+                "suggested_sl": ev.suggested_sl_pct,
+                "evaluation": ev.evaluation,
+                "lesson": ev.lesson or "",
+            }
+            for ev in recent_evals
+        ]
+
         return {
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "balance": {"krw": round(krw, 0), "total_assets": round(total, 0)},
@@ -98,6 +118,8 @@ def _build_json_status(client: "BithumbClient") -> dict:
             "position": position_data,
             "recent_trades": trades_data,
             "daily_reports": reports_data,
+            "evaluations": evals_data,
+            "eval_stats": eval_stats,
         }
     finally:
         repo.close()
@@ -192,6 +214,15 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     {reports_html}
   </div>
 
+</div>
+
+<!-- AI 성과 평가 & 전략 조정 -->
+<div style="padding: 0 20px 16px;">
+  <div class="card">
+    <h2>📊 AI 성과 평가 & 전략 조정</h2>
+    {eval_summary_html}
+    {evals_html}
+  </div>
 </div>
 
 <!-- 거래 내역 -->
@@ -332,6 +363,52 @@ def _render_html(data: dict) -> str:
     else:
         trades_html = '<div class="no-data">거래 내역 없음</div>'
 
+    # 성과 평가 HTML
+    eval_stats = data.get("eval_stats", {})
+    if eval_stats:
+        eval_summary_html = (
+            f'<div style="background:#0f172a; padding:12px 16px; border-radius:8px; '
+            f'margin-bottom:12px; font-size:0.85rem;">'
+            f'<span style="color:#facc15;">📈 최근 {eval_stats["count"]}건</span> &nbsp;|&nbsp; '
+            f'승률 <b>{eval_stats["win_rate"]:.0%}</b> &nbsp;|&nbsp; '
+            f'평균 수익 <span class="{"green" if eval_stats["avg_pnl_pct"] >= 0 else "red"}">'
+            f'{eval_stats["avg_pnl_pct"]:+.2f}%</span> &nbsp;|&nbsp; '
+            f'AI 제안 평균: 익절 <span class="green">+{eval_stats["avg_suggested_tp"]:.1f}%</span> '
+            f'손절 <span class="red">{eval_stats["avg_suggested_sl"]:.1f}%</span>'
+            f'</div>'
+        )
+    else:
+        eval_summary_html = ""
+
+    evals_list = data.get("evaluations", [])
+    if evals_list:
+        erows = ""
+        for ev in evals_list:
+            exit_cls = "green" if ev["exit_type"] == "take_profit" else "red"
+            exit_label = "익절" if ev["exit_type"] == "take_profit" else "손절"
+            held = ev["held_minutes"]
+            held_str = f"{held/60:.1f}h" if held >= 60 else f"{held:.0f}m"
+            erows += (
+                f"<tr>"
+                f"<td class='gray'>{ev['time']}</td>"
+                f"<td><b>{ev['symbol']}</b></td>"
+                f'<td class="{exit_cls}">{exit_label}</td>'
+                f'<td class="{exit_cls}">{ev["pnl_pct"]:+.2f}%</td>'
+                f"<td>{held_str}</td>"
+                f"<td>+{ev['original_tp']:.1f} / {ev['original_sl']:.1f}</td>"
+                f"<td><b>+{ev['suggested_tp']:.1f} / {ev['suggested_sl']:.1f}</b></td>"
+                f"<td class='gray' style='font-size:0.78rem;'>{ev['lesson'][:40]}</td>"
+                f"</tr>"
+            )
+        evals_html = (
+            "<table><tr>"
+            "<th>시간</th><th>코인</th><th>결과</th><th>수익률</th>"
+            "<th>보유</th><th>설정 TP/SL</th><th>제안 TP/SL</th><th>교훈</th>"
+            f"</tr>{erows}</table>"
+        )
+    else:
+        evals_html = '<div class="no-data">성과 평가 데이터 없음<br>(매매 완료 후 자동 기록)</div>'
+
     return _HTML_TEMPLATE.format(
         updated_at=data["updated_at"],
         total_assets_fmt=fmt_krw(bal["total_assets"]),
@@ -347,6 +424,8 @@ def _render_html(data: dict) -> str:
         position_html=position_html,
         reports_html=reports_html,
         trades_html=trades_html,
+        eval_summary_html=eval_summary_html,
+        evals_html=evals_html,
     )
 
 

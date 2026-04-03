@@ -2,10 +2,10 @@
 
 기동 시점부터 아래 사이클을 무한 반복합니다:
   1. 전체 현금화 (보유 코인 전부 시장가 매도 + 미체결 주문 취소)
-  2. AI Agent 코인 선정 (변동성·거래량·등락폭 기준)
+  2. AI Agent 코인 선정 (변동성·거래량·등락폭 + 과거 성과 기반)
   3. 가용 KRW 전액 매수
-  4. 익절 또는 손절 도달까지 감시
-  5. 조건 충족 시 전량 시장가 매도 → 1번으로
+  4. 익절 또는 손절 도달까지 감시 (보유 중 동적 조정 포함)
+  5. 조건 충족 시 전량 시장가 매도 → 성과 평가 → 1번으로
 """
 import logging
 import time
@@ -19,6 +19,9 @@ from strategy.ai_agent import TradingAgent
 from strategy.market_analyzer import MarketAnalyzer
 
 logger = logging.getLogger(__name__)
+
+# 보유 중 전략 조정 주기 (초) — 30분마다
+_ADJUST_INTERVAL_SEC = 30 * 60
 
 
 class TradingEngine:
@@ -39,6 +42,7 @@ class TradingEngine:
         self._paused = False
         self._notifier = None
         self._price_fail_count: dict[int, int] = {}  # position_id → 연속 실패 횟수
+        self._last_adjust_time: float = 0.0           # 마지막 전략 조정 시각 (epoch)
         self.daily_start_krw: float = 0.0
 
     # ------------------------------------------------------------------ #
@@ -176,7 +180,6 @@ class TradingEngine:
         krw = self._client.get_krw_balance()
         if krw < settings.MIN_ORDER_KRW:
             logger.warning(f"[매수 스킵] KRW 잔고 부족: {krw:,.0f}원")
-            # 미체결 주문 때문일 수 있음 → 취소 시도
             self._cancel_stuck_orders()
             time.sleep(30)
             return
@@ -188,7 +191,10 @@ class TradingEngine:
             time.sleep(30)
             return
 
-        decision = self._agent.select_coin(snapshots)
+        # 과거 성과 통계를 가져와서 Agent에게 전달
+        eval_stats = self._repo.get_evaluation_stats(last_n=10)
+
+        decision = self._agent.select_coin(snapshots, eval_stats=eval_stats)
         logger.info(
             f"[AI 선정] {decision.symbol} "
             f"익절=+{decision.take_profit_pct}% 손절={decision.stop_loss_pct}% "
@@ -199,7 +205,6 @@ class TradingEngine:
         result = self._client.market_buy(decision.symbol, buy_amount)
         if result.get("status") != "0000":
             logger.error(f"[매수 실패] {result}")
-            # in_use_krw 감지 → 미체결 취소 후 1회 재시도
             self._cancel_stuck_orders()
             time.sleep(2)
             krw = self._client.get_krw_balance()
@@ -238,6 +243,10 @@ class TradingEngine:
             f"[매수 완료] {decision.symbol} {units}개 @ {current_price:,.0f}원 "
             f"투입={buy_amount:,.0f}원"
         )
+
+        # 전략 조정 타이머 리셋
+        self._last_adjust_time = time.time()
+
         if self._notifier:
             try:
                 self._notifier.notify_buy(
@@ -254,7 +263,7 @@ class TradingEngine:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Step 4: 익절/손절 감시                                               #
+    #  Step 4: 익절/손절 감시 + 동적 전략 조정                               #
     # ------------------------------------------------------------------ #
     def _check_exit(self, position: Position) -> None:
         try:
@@ -285,13 +294,102 @@ class TradingEngine:
             f"익절=+{position.take_profit_pct}% 손절={position.stop_loss_pct}%"
         )
 
+        # 익절/손절 체크
         if pnl_pct >= position.take_profit_pct:
             self._execute_sell(position, current_price, pnl_pct,
                                f"익절 ({pnl_pct:+.2f}% >= +{position.take_profit_pct}%)")
         elif pnl_pct <= position.stop_loss_pct:
             self._execute_sell(position, current_price, pnl_pct,
                                f"손절 ({pnl_pct:+.2f}% <= {position.stop_loss_pct}%)")
+        else:
+            # 보유 중 — 주기적으로 전략 동적 조정
+            self._maybe_adjust_strategy(position, current_price, pnl_pct)
 
+    def _maybe_adjust_strategy(
+        self, position: Position, current_price: float, pnl_pct: float,
+    ) -> None:
+        """30분 간격으로 AI에게 전략 조정 질의"""
+        now = time.time()
+        if now - self._last_adjust_time < _ADJUST_INTERVAL_SEC:
+            return
+
+        holding_minutes = int(
+            (datetime.utcnow() - position.opened_at).total_seconds() / 60
+        )
+
+        # 보유 30분 미만이면 조정 스킵
+        if holding_minutes < 30:
+            return
+
+        self._last_adjust_time = now
+
+        try:
+            result = self._agent.should_adjust_strategy(
+                symbol=position.symbol,
+                buy_price=position.buy_price,
+                current_price=current_price,
+                current_pnl_pct=pnl_pct,
+                holding_minutes=holding_minutes,
+                original_tp=position.take_profit_pct,
+                original_sl=position.stop_loss_pct,
+            )
+
+            if result.get("adjust"):
+                new_tp = result["new_take_profit_pct"]
+                new_sl = result["new_stop_loss_pct"]
+                reason = result.get("reason", "AI 동적 조정")
+
+                logger.info(
+                    f"[전략 조정] {position.symbol} "
+                    f"익절 +{position.take_profit_pct}% → +{new_tp}%, "
+                    f"손절 {position.stop_loss_pct}% → {new_sl}% "
+                    f"({reason})"
+                )
+
+                # Position 업데이트
+                self._update_position_targets(
+                    position.id, new_tp, new_sl, reason,
+                )
+
+                if self._notifier:
+                    try:
+                        self._notifier.send(
+                            f"🔄 <b>전략 조정</b> {position.symbol}\n"
+                            f"익절: +{position.take_profit_pct}% → +{new_tp}%\n"
+                            f"손절: {position.stop_loss_pct}% → {new_sl}%\n"
+                            f"사유: {reason}"
+                        )
+                    except Exception:
+                        pass
+            else:
+                logger.debug(f"[전략 유지] {position.symbol} ({result.get('reason', '')})")
+
+        except Exception as e:
+            logger.error(f"[전략 조정 오류] {e}")
+
+    def _update_position_targets(
+        self, position_id: int, new_tp: float, new_sl: float, reason: str,
+    ) -> None:
+        """포지션의 익절/손절 기준을 DB에서 업데이트"""
+        from database.models import SessionLocal, Position as PositionModel
+        from contextlib import contextmanager
+
+        db = SessionLocal()
+        try:
+            pos = db.query(PositionModel).filter(PositionModel.id == position_id).first()
+            if pos:
+                pos.take_profit_pct = new_tp
+                pos.stop_loss_pct = new_sl
+                db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------ #
+    #  매도 실행 + 성과 평가                                                #
+    # ------------------------------------------------------------------ #
     def _execute_sell(
         self,
         position: Position,
@@ -301,7 +399,6 @@ class TradingEngine:
     ) -> None:
         logger.info(f"[매도 실행] {reason}")
 
-        # 실제 보유 수량 확인 후 매도 (DB와 실제 잔고 불일치 방지)
         actual_units = self._client.get_coin_balance(position.symbol)
         if actual_units <= 0:
             logger.warning(f"[매도 스킵] {position.symbol} 실제 잔고 0 — 포지션만 종료")
@@ -359,3 +456,71 @@ class TradingEngine:
                 )
             except Exception:
                 pass
+
+        # ── 매매 후 성과 평가 (Post-Trade Review) ──
+        self._run_post_trade_evaluation(position, current_price, pnl_pct, held_min, reason)
+
+    # ------------------------------------------------------------------ #
+    #  Post-Trade Evaluation                                               #
+    # ------------------------------------------------------------------ #
+    def _run_post_trade_evaluation(
+        self,
+        position: Position,
+        sell_price: float,
+        pnl_pct: float,
+        held_minutes: float,
+        reason: str,
+    ) -> None:
+        """매도 후 AI에게 성과 평가를 요청하고 DB에 저장"""
+        try:
+            exit_type = "take_profit" if "익절" in reason else "stop_loss"
+            eval_stats = self._repo.get_evaluation_stats(last_n=10)
+
+            evaluation = self._agent.evaluate_trade(
+                symbol=position.symbol,
+                buy_price=position.buy_price,
+                sell_price=sell_price,
+                pnl_pct=pnl_pct,
+                held_minutes=held_minutes,
+                exit_type=exit_type,
+                original_tp=position.take_profit_pct,
+                original_sl=position.stop_loss_pct,
+                agent_reason=position.agent_reason or "",
+                eval_stats=eval_stats,
+            )
+
+            self._repo.save_evaluation(
+                position_id=position.id,
+                symbol=position.symbol,
+                buy_price=position.buy_price,
+                sell_price=sell_price,
+                pnl_pct=pnl_pct,
+                held_minutes=held_minutes,
+                exit_type=exit_type,
+                original_tp_pct=position.take_profit_pct,
+                original_sl_pct=position.stop_loss_pct,
+                evaluation=evaluation.evaluation,
+                suggested_tp_pct=evaluation.suggested_tp_pct,
+                suggested_sl_pct=evaluation.suggested_sl_pct,
+                lesson=evaluation.lesson,
+            )
+
+            logger.info(
+                f"[성과 평가] {position.symbol} | {evaluation.evaluation} | "
+                f"제안: 익절 +{evaluation.suggested_tp_pct}% 손절 {evaluation.suggested_sl_pct}% | "
+                f"교훈: {evaluation.lesson}"
+            )
+
+            if self._notifier:
+                try:
+                    self._notifier.send(
+                        f"📊 <b>매매 평가</b> {position.symbol} ({pnl_pct:+.2f}%)\n"
+                        f"{evaluation.evaluation}\n"
+                        f"다음 제안: 익절 +{evaluation.suggested_tp_pct}% / 손절 {evaluation.suggested_sl_pct}%\n"
+                        f"💡 {evaluation.lesson}"
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"[성과 평가 오류] {e}", exc_info=True)

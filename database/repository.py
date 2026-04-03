@@ -5,7 +5,7 @@ from typing import Optional, Generator
 
 from sqlalchemy.orm import Session
 
-from .models import SessionLocal, Trade, Position, DailyReport
+from .models import SessionLocal, Trade, Position, DailyReport, StrategyEvaluation
 
 
 class TradeRepository:
@@ -258,4 +258,94 @@ class TradeRepository:
                 "avg_hold_minutes": avg_hold,
                 "total_pnl_krw": total_pnl,
                 "initial_krw": initial_krw,
+            }
+
+    # ------------------------------------------------------------------ #
+    #  StrategyEvaluation                                                  #
+    # ------------------------------------------------------------------ #
+    def save_evaluation(
+        self,
+        position_id: int,
+        symbol: str,
+        buy_price: float,
+        sell_price: float,
+        pnl_pct: float,
+        held_minutes: float,
+        exit_type: str,
+        original_tp_pct: float,
+        original_sl_pct: float,
+        evaluation: str,
+        suggested_tp_pct: float,
+        suggested_sl_pct: float,
+        lesson: str = "",
+        adjusted_tp_pct: float | None = None,
+        adjusted_sl_pct: float | None = None,
+        adjustment_reason: str = "",
+    ) -> StrategyEvaluation:
+        with self._session() as db:
+            ev = StrategyEvaluation(
+                position_id=position_id, symbol=symbol,
+                buy_price=buy_price, sell_price=sell_price,
+                pnl_pct=pnl_pct, held_minutes=held_minutes,
+                exit_type=exit_type,
+                original_tp_pct=original_tp_pct,
+                original_sl_pct=original_sl_pct,
+                evaluation=evaluation,
+                suggested_tp_pct=suggested_tp_pct,
+                suggested_sl_pct=suggested_sl_pct,
+                lesson=lesson,
+                adjusted_tp_pct=adjusted_tp_pct,
+                adjusted_sl_pct=adjusted_sl_pct,
+                adjustment_reason=adjustment_reason,
+            )
+            db.add(ev)
+            db.flush()
+            db.refresh(ev)
+            db.expunge(ev)
+            return ev
+
+    def get_recent_evaluations(self, limit: int = 10) -> list[StrategyEvaluation]:
+        with self._session() as db:
+            rows = (
+                db.query(StrategyEvaluation)
+                .order_by(StrategyEvaluation.created_at.desc())
+                .limit(limit).all()
+            )
+            db.expunge_all()
+            return rows
+
+    def get_evaluation_stats(self, last_n: int = 10) -> dict:
+        """최근 N건 평가 기반 전략 통계 — Agent 프롬프트에 주입용"""
+        with self._session() as db:
+            evals = (
+                db.query(StrategyEvaluation)
+                .order_by(StrategyEvaluation.created_at.desc())
+                .limit(last_n).all()
+            )
+            if not evals:
+                return {}
+
+            wins = [e for e in evals if e.exit_type == "take_profit"]
+            losses = [e for e in evals if e.exit_type == "stop_loss"]
+            avg_pnl = sum(e.pnl_pct for e in evals) / len(evals)
+            avg_hold = sum(e.held_minutes for e in evals) / len(evals)
+            avg_tp_set = sum(e.original_tp_pct for e in evals) / len(evals)
+            avg_sl_set = sum(e.original_sl_pct for e in evals) / len(evals)
+
+            # 최근 제안값 평균
+            avg_suggested_tp = sum(e.suggested_tp_pct for e in evals) / len(evals)
+            avg_suggested_sl = sum(e.suggested_sl_pct for e in evals) / len(evals)
+
+            return {
+                "count": len(evals),
+                "win_count": len(wins),
+                "loss_count": len(losses),
+                "win_rate": len(wins) / len(evals) if evals else 0,
+                "avg_pnl_pct": round(avg_pnl, 2),
+                "avg_hold_minutes": round(avg_hold, 1),
+                "avg_tp_set": round(avg_tp_set, 2),
+                "avg_sl_set": round(avg_sl_set, 2),
+                "avg_suggested_tp": round(avg_suggested_tp, 2),
+                "avg_suggested_sl": round(avg_suggested_sl, 2),
+                "recent_lessons": [e.lesson for e in evals[:3] if e.lesson],
             }

@@ -343,6 +343,64 @@ class Dashboard:
             return Panel(f"[red]{e}[/red]", title="AI 보고서", box=box.ROUNDED)
 
     # ---------------------------------------------------------------- #
+    #  패널: AI 성과 평가 & 전략 조정                                     #
+    # ---------------------------------------------------------------- #
+    def _build_evaluation_panel(self) -> Panel:
+        try:
+            evals = self._repo.get_recent_evaluations(limit=5)
+            eval_stats = self._repo.get_evaluation_stats(last_n=10)
+
+            tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold yellow", expand=True)
+            tbl.add_column("시간",       style="dim", width=17)
+            tbl.add_column("코인",       width=7)
+            tbl.add_column("결과",       width=5)
+            tbl.add_column("수익률",     justify="right", width=8)
+            tbl.add_column("보유",       justify="right", width=8)
+            tbl.add_column("설정 TP/SL", justify="center", width=12)
+            tbl.add_column("제안 TP/SL", justify="center", width=12)
+            tbl.add_column("교훈",       width=30)
+
+            for ev in evals:
+                exit_style = "green" if ev.exit_type == "take_profit" else "red"
+                exit_label = Text("익절" if ev.exit_type == "take_profit" else "손절", style=exit_style)
+                pnl_text = Text(f"{ev.pnl_pct:+.2f}%", style=exit_style)
+
+                held_str = f"{ev.held_minutes/60:.1f}h" if ev.held_minutes >= 60 else f"{ev.held_minutes:.0f}m"
+
+                tbl.add_row(
+                    ev.created_at.strftime("%m-%d %H:%M"),
+                    ev.symbol,
+                    exit_label,
+                    pnl_text,
+                    held_str,
+                    f"+{ev.original_tp_pct:.1f}/{ev.original_sl_pct:.1f}",
+                    f"[bold]+{ev.suggested_tp_pct:.1f}/{ev.suggested_sl_pct:.1f}[/bold]",
+                    (ev.lesson or "")[:30],
+                )
+
+            if not evals:
+                tbl.add_row("—", "평가 데이터 없음", "", "", "", "", "", "")
+
+            # 하단에 전략 통계 요약
+            summary = ""
+            if eval_stats:
+                summary = (
+                    f"\n  📈 최근 {eval_stats['count']}건 | "
+                    f"승률 {eval_stats['win_rate']:.0%} | "
+                    f"평균 수익 {eval_stats['avg_pnl_pct']:+.2f}% | "
+                    f"AI 제안 평균: 익절 +{eval_stats['avg_suggested_tp']:.1f}% 손절 {eval_stats['avg_suggested_sl']:.1f}%"
+                )
+
+            from rich.console import Group
+            return Panel(
+                Group(tbl, Text(summary, style="dim")),
+                title="[bold yellow]AI 성과 평가 & 전략 조정[/bold yellow]  (최근 5건)",
+                box=box.ROUNDED,
+            )
+        except Exception as e:
+            return Panel(f"[red]{e}[/red]", title="AI 성과 평가", box=box.ROUNDED)
+
+    # ---------------------------------------------------------------- #
     #  패널: 전체 거래 내역                                               #
     # ---------------------------------------------------------------- #
     def _build_trades_panel(self) -> Panel:
@@ -382,10 +440,11 @@ class Dashboard:
     def _build_layout(self) -> Layout:
         layout = Layout()
         layout.split_column(
-            Layout(name="header",    size=3),
-            Layout(name="top",       size=14),
-            Layout(name="chart",     size=12),
-            Layout(name="ai_report", size=11),
+            Layout(name="header",     size=3),
+            Layout(name="top",        size=14),
+            Layout(name="chart",      size=12),
+            Layout(name="evaluation", size=12),
+            Layout(name="ai_report",  size=11),
             Layout(name="trades"),
         )
         layout["top"].split_row(
@@ -397,6 +456,7 @@ class Dashboard:
         layout["portfolio"].update(self._build_portfolio_panel())
         layout["position"].update(self._build_position_panel())
         layout["chart"].update(self._build_chart_panel())
+        layout["evaluation"].update(self._build_evaluation_panel())
         layout["ai_report"].update(self._build_ai_report_panel())
         layout["trades"].update(self._build_trades_panel())
 

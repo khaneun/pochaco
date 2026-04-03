@@ -2,6 +2,48 @@
 
 ---
 
+## v1.7.0 (2026-04-03)
+
+### 자기 개선형 AI Agent — 성과 기반 전략 피드백 루프
+
+#### 핵심 개념
+매매 결과가 다음 의사결정에 반영되는 **폐쇄형 학습 루프**를 도입했습니다.
+`매수 → 감시(동적 조정) → 매도 → AI 평가 → 다음 코인 선정에 반영 → 반복`
+
+#### StrategyEvaluation DB 모델 (`database/models.py`)
+- 신규 테이블 `strategy_evaluations` 추가
+- 저장 항목: 매매 결과(수익률·보유시간·종료유형), 원래 설정(TP/SL), AI 평가 텍스트, 제안 파라미터(suggested_tp/sl), 핵심 교훈, 동적 조정 이력
+
+#### Repository 평가 CRUD (`database/repository.py`)
+- `save_evaluation()` — 매매 후 평가 결과 저장
+- `get_recent_evaluations(limit)` — 최근 N건 평가 조회
+- `get_evaluation_stats(last_n)` — Agent 프롬프트 주입용 통계 집계
+  (승률·평균 수익률·평균 보유시간·AI 제안 평균 TP/SL·최근 교훈)
+
+#### AI Agent 고도화 (`strategy/ai_agent.py`)
+- **`select_coin()` 과거 성과 반영**: `eval_stats` 파라미터 추가, 최근 매매 통계(승률·평균 수익·AI 제안 평균)를 프롬프트에 주입 — 과거 데이터 3건 이상 시 AI 제안 평균을 가이드라인으로 활용
+- **R:R 강제 완화**: 3:1 고정 → 2:1 이상 (익절 2~8%, 손절 -1~-3%)으로 현실적 조정. 비현실적으로 높은 익절선으로 인한 기회비용 해소
+- **`evaluate_trade()` 신규**: 매도 완료 후 AI에게 성과를 평가시키고 다음 전략 파라미터를 제안받는 메서드
+- **`should_adjust_strategy()` 개선**: 보유 시간대별 가이드라인 추가 (30분 미만 → 유지, 30분~2시간 → 수익 있으면 익절선 하향 고려, 2~6시간 → 적극 조정 권장, 6시간 이상 → 강력 권장)
+
+#### TradingEngine 피드백 루프 연동 (`strategy/trading_engine.py`)
+- **Post-Trade Evaluation**: 매도 직후 `_run_post_trade_evaluation()` 자동 호출 → AI 평가 + DB 저장 + 텔레그램 알림 (`📊 매매 평가` 메시지)
+- **보유 중 동적 전략 조정**: `_maybe_adjust_strategy()` 30분 간격 실행 → AI에게 익절/손절 조정 여부 질의 → 조정 시 DB 업데이트 + 텔레그램 알림 (`🔄 전략 조정` 메시지)
+- **코인 선정 시 과거 성과 전달**: `select_coin(snapshots, eval_stats=...)` — 선정 단계부터 과거 학습 내용 반영
+
+#### 터미널 대시보드 (`dashboard/terminal_ui.py`)
+- **"AI 성과 평가 & 전략 조정" 패널 신설** (5번째 섹션)
+  - 최근 5건: 코인·결과(익절/손절)·수익률·보유시간·설정 TP/SL·AI 제안 TP/SL·교훈
+  - 하단 요약: 최근 N건 승률·평균 수익·AI 제안 평균 파라미터
+
+#### 웹 대시보드 (`dashboard/web_server.py`)
+- JSON API `/api/status`에 `evaluations`, `eval_stats` 필드 추가
+- HTML 페이지에 "AI 성과 평가 & 전략 조정" 섹션 추가
+  - 통계 요약 배너 (승률·평균 수익·AI 제안 평균 TP/SL)
+  - 평가 테이블 (최근 10건)
+
+---
+
 ## v1.6.0 (2026-04-03)
 
 ### 빗썸 API v2 마이그레이션

@@ -1,4 +1,4 @@
-"""AI Agent - 코인 선정 및 익절/손절 기준 결정
+"""AI Agent - 코인 선정 및 익절/손절 기준 결정 + 성과 기반 자기 개선
 
 LLM 공급자에 의존하지 않습니다. core.llm_provider.get_llm_provider()가
 .env의 LLM_PROVIDER 값에 따라 Anthropic / OpenAI / Gemini 중 하나를 주입합니다.
@@ -21,6 +21,15 @@ class AgentDecision:
     confidence: float
     reason: str
     llm_provider: str = ""      # 어떤 LLM이 결정했는지 기록
+
+
+@dataclass
+class TradeEvaluation:
+    """매매 후 AI 평가 결과"""
+    evaluation: str             # 평가 텍스트
+    suggested_tp_pct: float     # 다음 매매에 제안하는 익절%
+    suggested_sl_pct: float     # 다음 매매에 제안하는 손절%
+    lesson: str                 # 핵심 교훈 한 줄
 
 
 class TradingAgent:
@@ -49,13 +58,54 @@ class TradingAgent:
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _eval_stats_to_text(stats: dict) -> str:
+        """평가 통계를 프롬프트용 텍스트로 변환"""
+        if not stats:
+            return ""
+        lines = [
+            "\n**[과거 매매 성과 분석 — 반드시 참고하여 현실적인 목표를 설정하세요]**",
+            f"- 최근 {stats['count']}건 매매: 승률 {stats['win_rate']:.0%} "
+            f"(익절 {stats['win_count']}건, 손절 {stats['loss_count']}건)",
+            f"- 평균 실현 수익률: {stats['avg_pnl_pct']:+.2f}%",
+            f"- 평균 보유 시간: {stats['avg_hold_minutes']:.0f}분",
+            f"- 기존 평균 익절 설정: +{stats['avg_tp_set']:.1f}%, 평균 손절 설정: {stats['avg_sl_set']:.1f}%",
+            f"- AI 제안 평균 익절: +{stats['avg_suggested_tp']:.1f}%, 제안 평균 손절: {stats['avg_suggested_sl']:.1f}%",
+        ]
+        if stats.get("recent_lessons"):
+            lines.append("- 최근 교훈:")
+            for lesson in stats["recent_lessons"]:
+                lines.append(f"  * {lesson}")
+        return "\n".join(lines)
+
     # ---------------------------------------------------------------- #
     #  코인 선정                                                          #
     # ---------------------------------------------------------------- #
-    def select_coin(self, snapshots: list[CoinSnapshot]) -> AgentDecision:
-        """시장 데이터를 분석해 매수할 코인 1개와 익절/손절 기준을 결정"""
+    def select_coin(
+        self,
+        snapshots: list[CoinSnapshot],
+        eval_stats: dict | None = None,
+    ) -> AgentDecision:
+        """시장 데이터 + 과거 성과를 분석해 매수할 코인 1개와 익절/손절 기준을 결정"""
 
         market_text = self._snapshots_to_text(snapshots)
+        history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
+
+        # 과거 성과가 있으면 그에 맞춘 현실적 가이드라인 사용
+        if eval_stats and eval_stats.get("count", 0) >= 3:
+            tp_guide = (
+                f"- 익절(take_profit_pct): 과거 AI 제안 평균 +{eval_stats['avg_suggested_tp']:.1f}%를 참고하되, "
+                f"시장 상황에 맞게 2%~8% 범위에서 설정\n"
+                f"- 손절(stop_loss_pct): 과거 AI 제안 평균 {eval_stats['avg_suggested_sl']:.1f}%를 참고하되, "
+                f"-1.0%~-3.0% 범위에서 설정"
+            )
+            rr_guide = "- 리워드:리스크 비율 최소 2:1 이상 (과거 성과 기반 유연 적용)"
+        else:
+            tp_guide = (
+                "- 익절(take_profit_pct): 2%~8% 범위에서 현실적으로 설정\n"
+                "- 손절(stop_loss_pct): -1.0%~-3.0% 범위에서 설정"
+            )
+            rr_guide = "- 리워드:리스크 비율 최소 2:1 이상"
 
         prompt = f"""당신은 단기 변동성 매매 전문 트레이더입니다.
 전략: 코인 1개를 전액 매수 → 익절 또는 손절 시 전량 매도 → 즉시 반복.
@@ -64,6 +114,7 @@ class TradingAgent:
 아래는 빗썸 거래소 상위 코인의 실시간 시장 데이터입니다.
 
 {market_text}
+{history_text}
 
 **코인 선정 기준 (우선순위 순)**
 1. 강한 단기 상승 모멘텀 — 현재가가 당일 고가 대비 10% 이내에 있고, 24h 변동률이 양수이며 상승 추세인 코인 최우선
@@ -72,17 +123,16 @@ class TradingAgent:
 4. 하락 중인 코인은 절대 선정 금지 — 24h 변동률이 음수이거나 현재가가 당일 저가 근처인 코인 제외
 
 **익절·손절 기준 설정 원칙 (반드시 준수)**
-- 리워드:리스크 비율을 최소 3:1 이상으로 설정 — 손절 1%당 익절은 3% 이상
-- 익절(take_profit_pct): 24h 고저 차이의 50% 이상을 목표로 설정, 최소 3% 이상
-- 손절(stop_loss_pct): 최대 -2%로 제한 — 그 이상의 손실은 절대 허용하지 않음
-- 수수료(매수+매도 약 0.4%) 감안 후에도 순이익이 발생해야 함 — 익절 기준은 반드시 1% 이상의 순수익 보장
-- 손절 기준이 -2%를 초과하는 선정은 무효 — 반드시 -2% 이하(예: -1.5%, -1.0%)로 설정
+{rr_guide}
+{tp_guide}
+- 수수료(매수+매도 약 0.4%) 감안 후에도 순이익이 발생해야 함
+- **핵심: 달성 가능한 현실적 목표를 설정하세요. 너무 높은 익절선은 기회비용만 증가시킵니다.**
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "symbol": "코인심볼(예:BTC)",
-  "take_profit_pct": 익절퍼센트(숫자, 예:4.5),
-  "stop_loss_pct": 손절퍼센트(음수숫자, -2.0 이하, 예:-1.5),
+  "take_profit_pct": 익절퍼센트(숫자, 예:3.5),
+  "stop_loss_pct": 손절퍼센트(음수숫자, 예:-1.5),
   "confidence": 확신도(0.0~1.0),
   "reason": "선정 이유 (한국어, 100자 이내) — 상승 모멘텀 근거 포함"
 }}"""
@@ -92,7 +142,6 @@ class TradingAgent:
         logger.info(f"AI Agent 응답: {raw}")
 
         try:
-            # JSON 코드블록 감싸진 경우 제거
             clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             data = json.loads(clean)
 
@@ -102,24 +151,27 @@ class TradingAgent:
             confidence = float(data.get("confidence", 0.5))
             reason = data.get("reason", "")
 
-            # ── 안전장치: 강제 범위 제한 ──
-            if stop_loss_pct > -0.5:
-                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -2.0% 강제")
-                stop_loss_pct = -2.0
-            elif stop_loss_pct > 0:
+            # ── 안전장치: 부호 및 범위 보정 ──
+            if stop_loss_pct > 0:
                 stop_loss_pct = -abs(stop_loss_pct)
+            if stop_loss_pct > -0.5:
+                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -1.5% (너무 작음)")
+                stop_loss_pct = -1.5
             if stop_loss_pct < -5.0:
-                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -2.0% 제한")
-                stop_loss_pct = -2.0
+                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → -3.0% (너무 큼)")
+                stop_loss_pct = -3.0
 
-            if take_profit_pct < 3.0:
-                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → 3.0% 최소")
-                take_profit_pct = 3.0
+            if take_profit_pct < 1.5:
+                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → 2.0% (수수료 미만)")
+                take_profit_pct = 2.0
+            if take_profit_pct > 15.0:
+                logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → 8.0% (비현실적)")
+                take_profit_pct = 8.0
 
-            # R:R 비율 3:1 미달 시 자동 조정
+            # R:R 최소 2:1 보정 (기존 3:1에서 완화)
             rr_ratio = take_profit_pct / abs(stop_loss_pct) if stop_loss_pct != 0 else 99
-            if rr_ratio < 3.0:
-                take_profit_pct = abs(stop_loss_pct) * 3.0
+            if rr_ratio < 2.0:
+                take_profit_pct = abs(stop_loss_pct) * 2.0
                 logger.warning(f"[AI 보정] R:R 미달 → take_profit={take_profit_pct}%")
 
             return AgentDecision(
@@ -135,7 +187,91 @@ class TradingAgent:
             raise RuntimeError(f"AI Agent 응답 파싱 실패: {e}")
 
     # ---------------------------------------------------------------- #
-    #  전략 조정 질의                                                     #
+    #  매매 후 성과 평가 (Post-Trade Review)                              #
+    # ---------------------------------------------------------------- #
+    def evaluate_trade(
+        self,
+        symbol: str,
+        buy_price: float,
+        sell_price: float,
+        pnl_pct: float,
+        held_minutes: float,
+        exit_type: str,
+        original_tp: float,
+        original_sl: float,
+        agent_reason: str,
+        eval_stats: dict | None = None,
+    ) -> TradeEvaluation:
+        """매매 완료 후 성과를 평가하고 다음 전략 파라미터를 제안"""
+
+        history_summary = ""
+        if eval_stats and eval_stats.get("count", 0) > 0:
+            history_summary = f"""
+최근 {eval_stats['count']}건 누적 성과:
+- 승률: {eval_stats['win_rate']:.0%}, 평균 수익률: {eval_stats['avg_pnl_pct']:+.2f}%
+- 평균 보유시간: {eval_stats['avg_hold_minutes']:.0f}분
+- 평균 익절 설정: +{eval_stats['avg_tp_set']:.1f}%, 평균 손절 설정: {eval_stats['avg_sl_set']:.1f}%"""
+
+        prompt = f"""당신은 트레이딩 전략 평가 전문가입니다.
+아래 매매 결과를 분석하고, 다음 매매를 위한 전략 파라미터를 제안하세요.
+
+**이번 매매 결과:**
+- 코인: {symbol}
+- 매수가: {buy_price:,.0f}원 → 매도가: {sell_price:,.0f}원
+- 실현 수익률: {pnl_pct:+.2f}%
+- 보유 시간: {held_minutes:.0f}분 ({held_minutes/60:.1f}시간)
+- 종료 유형: {"익절 달성" if exit_type == "take_profit" else "손절 발동"}
+- 원래 익절 기준: +{original_tp}%, 원래 손절 기준: {original_sl}%
+- AI 선정 이유: {agent_reason}
+{history_summary}
+
+**평가 관점:**
+1. 익절/손절 기준이 현실적이었는가? (너무 높으면 기회비용, 너무 낮으면 수수료 손실)
+2. 보유 시간이 적절했는가? (장시간 보유는 기회비용 증가)
+3. 코인 선정 판단은 적절했는가?
+
+반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
+{{
+  "evaluation": "이번 매매에 대한 평가 (한국어, 150자 이내)",
+  "suggested_tp_pct": 다음매매추천익절퍼센트(숫자, 2.0~8.0 범위),
+  "suggested_sl_pct": 다음매매추천손절퍼센트(음수숫자, -1.0~-3.0 범위),
+  "lesson": "핵심 교훈 한 줄 (한국어, 50자 이내)"
+}}"""
+
+        logger.info(f"AI Agent ({self.provider_name}): 매매 평가 중... [{symbol} {pnl_pct:+.2f}%]")
+        raw = self._llm.chat(prompt, max_tokens=512)
+        logger.info(f"AI 평가 응답: {raw}")
+
+        try:
+            clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            data = json.loads(clean)
+
+            suggested_tp = float(data.get("suggested_tp_pct", original_tp))
+            suggested_sl = float(data.get("suggested_sl_pct", original_sl))
+
+            # 범위 보정
+            suggested_tp = max(2.0, min(8.0, suggested_tp))
+            if suggested_sl > 0:
+                suggested_sl = -abs(suggested_sl)
+            suggested_sl = max(-3.0, min(-1.0, suggested_sl))
+
+            return TradeEvaluation(
+                evaluation=data.get("evaluation", "평가 없음"),
+                suggested_tp_pct=round(suggested_tp, 2),
+                suggested_sl_pct=round(suggested_sl, 2),
+                lesson=data.get("lesson", ""),
+            )
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"AI 평가 응답 파싱 실패: {e}\n원문: {raw}")
+            return TradeEvaluation(
+                evaluation=f"파싱 실패 — 기존 전략 유지 ({e})",
+                suggested_tp_pct=round(original_tp, 2),
+                suggested_sl_pct=round(original_sl, 2),
+                lesson="",
+            )
+
+    # ---------------------------------------------------------------- #
+    #  보유 중 전략 동적 조정                                              #
     # ---------------------------------------------------------------- #
     def should_adjust_strategy(
         self,
@@ -147,30 +283,71 @@ class TradingAgent:
         original_tp: float,
         original_sl: float,
     ) -> dict:
-        """포지션 보유 중 익절/손절 기준 조정 여부를 LLM에게 질의"""
+        """포지션 보유 중 익절/손절 기준 조정 여부를 LLM에게 질의
+
+        보유 시간이 길어지면 기회비용을 고려해 익절선을 낮추는 방향으로 유도.
+        """
+
+        # 보유 시간에 따른 가이드라인
+        if holding_minutes < 30:
+            time_guidance = "아직 보유 초기 단계입니다. 급격한 변동이 없다면 기존 전략을 유지하세요."
+        elif holding_minutes < 120:
+            time_guidance = (
+                "보유 시간이 30분 이상 경과했습니다. "
+                "현재 수익이 있다면 익절선을 낮춰 수익 확보를 고려하세요."
+            )
+        elif holding_minutes < 360:
+            time_guidance = (
+                "보유 시간이 2시간 이상입니다. 기회비용이 발생하고 있습니다. "
+                "익절선을 적극적으로 낮춰 빠른 수익 실현 또는 본전 탈출을 권장합니다."
+            )
+        else:
+            time_guidance = (
+                "보유 시간이 6시간 이상으로 매우 깁니다. "
+                "현재 수익이 +1% 이상이면 즉시 익절을, 손실이면 손절선 상향을 강력히 권장합니다."
+            )
 
         prompt = f"""현재 보유 포지션:
 - 코인: {symbol}
 - 매수가: {buy_price:,.0f}원
 - 현재가: {current_price:,.0f}원
 - 현재 수익률: {current_pnl_pct:+.2f}%
-- 보유 시간: {holding_minutes}분
+- 보유 시간: {holding_minutes}분 ({holding_minutes/60:.1f}시간)
 - 원래 익절 기준: +{original_tp}%
 - 원래 손절 기준: {original_sl}%
 
+**시간 기반 가이드라인:** {time_guidance}
+
 현재 상황에서 익절/손절 기준을 조정해야 하나요?
+- 조정 시 익절선은 현재 수익률보다 최소 0.5% 이상으로 설정
+- 수수료(0.4%)를 감안해 최소 +1.5% 이상의 익절선 유지
+
 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "adjust": true 또는 false,
   "new_take_profit_pct": 숫자(조정 불필요 시 원래값),
   "new_stop_loss_pct": 숫자(조정 불필요 시 원래값),
-  "reason": "이유 (50자 이내)"
+  "reason": "이유 (한국어, 50자 이내)"
 }}"""
 
         raw = self._llm.chat(prompt, max_tokens=256)
+        logger.info(f"AI 전략 조정 응답: {raw}")
         try:
             clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            return json.loads(clean)
+            data = json.loads(clean)
+
+            if data.get("adjust"):
+                new_tp = float(data.get("new_take_profit_pct", original_tp))
+                new_sl = float(data.get("new_stop_loss_pct", original_sl))
+                # 안전장치
+                new_tp = max(1.5, min(15.0, new_tp))
+                if new_sl > 0:
+                    new_sl = -abs(new_sl)
+                new_sl = max(-5.0, min(-0.5, new_sl))
+                data["new_take_profit_pct"] = round(new_tp, 2)
+                data["new_stop_loss_pct"] = round(new_sl, 2)
+
+            return data
         except json.JSONDecodeError:
             return {
                 "adjust": False,

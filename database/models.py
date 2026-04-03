@@ -76,6 +76,39 @@ class DailyReport(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class StrategyEvaluation(Base):
+    """매매 후 성과 평가 및 전략 조정 기록"""
+    __tablename__ = "strategy_evaluations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    position_id = Column(Integer, nullable=False, index=True)
+    symbol = Column(String(20), nullable=False)
+
+    # 매매 결과
+    buy_price = Column(Float, nullable=False)
+    sell_price = Column(Float, nullable=False)
+    pnl_pct = Column(Float, nullable=False)
+    held_minutes = Column(Float, nullable=False)
+    exit_type = Column(String(10), nullable=False)      # "take_profit" | "stop_loss" | "timeout"
+
+    # 원래 설정
+    original_tp_pct = Column(Float, nullable=False)
+    original_sl_pct = Column(Float, nullable=False)
+
+    # AI 평가 결과
+    evaluation = Column(Text, nullable=False)            # AI 평가 텍스트
+    suggested_tp_pct = Column(Float, nullable=False)     # 제안된 다음 익절%
+    suggested_sl_pct = Column(Float, nullable=False)     # 제안된 다음 손절%
+    lesson = Column(Text, default="")                    # 핵심 교훈 요약
+
+    # 동적 조정 기록 (보유 중 조정이 있었다면)
+    adjusted_tp_pct = Column(Float, nullable=True)       # 조정된 익절% (없으면 NULL)
+    adjusted_sl_pct = Column(Float, nullable=True)       # 조정된 손절% (없으면 NULL)
+    adjustment_reason = Column(Text, default="")
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 # ------------------------------------------------------------------ #
 #  엔진 팩토리                                                          #
 # ------------------------------------------------------------------ #
