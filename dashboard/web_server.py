@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 _APP_DIR = Path(__file__).parent.parent
 
+from config import settings
 from database import TradeRepository
 from database.models import Position
 
@@ -23,6 +24,20 @@ if TYPE_CHECKING:
     from core import BithumbClient
 
 logger = logging.getLogger(__name__)
+
+
+def _get_version() -> str:
+    """release-note.md에서 최신 버전 추출"""
+    try:
+        for line in (_APP_DIR / "release-note.md").read_text("utf-8").splitlines():
+            if line.startswith("## v"):
+                return line.split()[1]
+    except Exception:
+        pass
+    return ""
+
+
+_VERSION = _get_version()
 
 
 def _build_json_status(client: "BithumbClient") -> dict:
@@ -108,9 +123,41 @@ def _build_json_status(client: "BithumbClient") -> dict:
             for ev in recent_evals
         ]
 
+        # 거래소 실제 보유 코인 (DB position과 별도, 실제 잔고)
+        holdings = []
+        try:
+            bal_data = client.get_balance("ALL")
+            if bal_data.get("status") == "0000":
+                for key, value in bal_data["data"].items():
+                    if not key.startswith("available_"):
+                        continue
+                    sym = key.replace("available_", "").upper()
+                    if sym == "KRW":
+                        continue
+                    amt = float(value)
+                    if amt <= 0:
+                        continue
+                    try:
+                        px = client.get_current_price(sym)
+                        kv = amt * px
+                        if kv >= 100:
+                            holdings.append({
+                                "symbol": sym,
+                                "units": amt,
+                                "price": px,
+                                "krw_value": round(kv, 0),
+                            })
+                            total += kv  # 총 자산에 포함
+                    except Exception:
+                        holdings.append({"symbol": sym, "units": amt, "price": 0, "krw_value": 0})
+        except Exception:
+            pass
+
         return {
             "updated_at": datetime.now().strftime("%m-%d %H:%M:%S"),
+            "version": _VERSION,
             "balance": {"krw": round(krw, 0), "total_assets": round(total, 0)},
+            "holdings": holdings,
             "performance": {
                 "total_pnl_pct": round(total_pnl_pct, 2),
                 "win_rate": round(stats["win_rate"] * 100, 1),
@@ -200,6 +247,30 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
               padding: 20px; }}
 </style>
 <script>
+function liquidateAll() {{
+  if (!confirm('보유 중인 모든 코인을 시장가로 청산합니다.\\n정말 실행하시겠습니까?')) return;
+  var btn = document.getElementById('liq-btn');
+  btn.disabled = true; btn.textContent = '청산 중...';
+  fetch('/api/liquidate', {{ method: 'POST' }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(d) {{
+      if (d.success) {{
+        var sold = (d.results || []).filter(function(r) {{ return r.status === 'sold'; }});
+        var msg = '청산 완료!\\nKRW 잔고: ' + Number(d.krw_balance).toLocaleString() + '원';
+        if (sold.length) msg += '\\n매도: ' + sold.map(function(r) {{ return r.symbol + ' ' + Number(r.krw).toLocaleString() + '원'; }}).join(', ');
+        alert(msg);
+        location.reload();
+      }} else {{
+        alert('청산 실패: ' + (d.error || '알 수 없는 오류'));
+        btn.disabled = false; btn.textContent = '🔥 전체 청산';
+      }}
+    }})
+    .catch(function(e) {{
+      alert('오류: ' + e);
+      btn.disabled = false; btn.textContent = '🔥 전체 청산';
+    }});
+}}
+
 function toggleMore(btn) {{
   var wrap = btn.closest('.expandable');
   var short = wrap.querySelector('.short');
@@ -258,7 +329,8 @@ document.addEventListener('DOMContentLoaded', function() {{
 </head>
 <body>
 <header>
-  <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor</h1>
+  <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
+    <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
   <span><span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
 </header>
 
@@ -270,6 +342,7 @@ document.addEventListener('DOMContentLoaded', function() {{
     <div class="big-num">{total_assets_fmt}</div>
     <div class="sub">KRW 잔고: {krw_fmt}</div>
     {pos_asset_line}
+    {holdings_html}
     <br>
     <div class="stat-row">
       <span class="stat-label">누적 수익률</span>
@@ -382,6 +455,31 @@ def _render_html(data: dict) -> str:
 
     avg_h = perf["avg_hold_minutes"]
     avg_hold = f"{avg_h / 60:.1f}시간" if avg_h >= 60 else f"{avg_h:.0f}분"
+
+    # 보유 코인 + 청산 버튼
+    holdings = data.get("holdings", [])
+    if holdings:
+        h_lines = []
+        h_total = 0
+        for h in holdings:
+            h_total += h["krw_value"]
+            h_lines.append(
+                f'<div class="sub" style="margin-top:2px;">'
+                f'{h["symbol"]}: {h["units"]:.6g}개'
+                f' ≈ {h["krw_value"]:,.0f}원'
+                f'</div>'
+            )
+        holdings_html = "\n".join(h_lines)
+        holdings_html += (
+            '<div style="margin-top:8px;">'
+            '<button id="liq-btn" onclick="liquidateAll()" '
+            'style="background:#dc2626; color:#fff; border:none; border-radius:8px; '
+            'padding:8px 16px; font-size:0.85rem; font-weight:600; cursor:pointer; '
+            'width:100%;">'
+            '🔥 전체 청산</button></div>'
+        )
+    else:
+        holdings_html = ""
 
     # 포지션 HTML
     if pos:
@@ -549,9 +647,11 @@ def _render_html(data: dict) -> str:
 
     return _HTML_TEMPLATE.format(
         updated_at=data["updated_at"],
+        version=data.get("version", ""),
         total_assets_fmt=fmt_krw(bal["total_assets"]),
         krw_fmt=fmt_krw(bal["krw"]),
         pos_asset_line=pos_asset_line,
+        holdings_html=holdings_html,
         total_pnl_color=total_pnl_color,
         total_pnl_pct=perf["total_pnl_pct"],
         win_rate=perf["win_rate"],
@@ -565,6 +665,59 @@ def _render_html(data: dict) -> str:
         eval_summary_html=eval_summary_html,
         evals_html=evals_html,
     )
+
+
+def _liquidate_all_holdings(client: "BithumbClient") -> dict:
+    """거래소의 모든 보유 코인을 시장가 매도 + DB 포지션 종료"""
+    repo = TradeRepository()
+    results = []
+    try:
+        balance_data = client.get_balance("ALL")
+        if balance_data.get("status") != "0000":
+            return {"success": False, "error": f"잔고 조회 실패: {balance_data}"}
+
+        for key, value in balance_data["data"].items():
+            if not key.startswith("available_"):
+                continue
+            symbol = key.replace("available_", "").upper()
+            if symbol == "KRW":
+                continue
+            amount = float(value)
+            if amount <= 0:
+                continue
+
+            try:
+                current_price = client.get_current_price(symbol)
+                krw_value = amount * current_price
+                if krw_value < settings.MIN_ORDER_KRW:
+                    results.append({"symbol": symbol, "status": "skip",
+                                    "reason": f"소액 {krw_value:.0f}원"})
+                    continue
+
+                sell_result = client.market_sell(symbol, amount)
+                if sell_result.get("status") == "0000":
+                    repo.save_trade(
+                        symbol=symbol, side="sell",
+                        price=current_price, units=amount,
+                        krw_amount=krw_value, note="대시보드 전체 청산",
+                    )
+                    results.append({"symbol": symbol, "status": "sold",
+                                    "units": round(amount, 6),
+                                    "krw": round(krw_value, 0)})
+                    logger.info(f"[대시보드 청산] {symbol} {amount}개 → {krw_value:,.0f}원")
+                else:
+                    results.append({"symbol": symbol, "status": "failed",
+                                    "reason": str(sell_result)})
+            except Exception as e:
+                results.append({"symbol": symbol, "status": "error", "reason": str(e)})
+
+        repo.close_all_positions()
+        krw = client.get_krw_balance()
+        return {"success": True, "results": results, "krw_balance": round(krw, 0)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        repo.close()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -598,6 +751,18 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._respond(404, "text/plain", b"Not Found")
 
+        else:
+            self._respond(404, "text/plain", b"Not Found")
+
+    def do_POST(self):
+        if self.path == "/api/liquidate":
+            try:
+                result = _liquidate_all_holdings(self.client)
+                body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                body = json.dumps({"success": False, "error": str(e)}).encode()
+                self._respond(500, "application/json; charset=utf-8", body)
         else:
             self._respond(404, "text/plain", b"Not Found")
 
