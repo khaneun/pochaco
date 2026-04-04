@@ -1,15 +1,16 @@
 """핵심 매매 루프 엔진
 
 기동 시점부터 아래 사이클을 무한 반복합니다:
-  1. 전체 현금화 (보유 코인 전부 시장가 매도 + 미체결 주문 취소)
-  2. AI Agent 코인 선정 (변동성·거래량·등락폭 + 과거 성과 기반)
-  3. 가용 KRW 전액 매수
-  4. 익절 또는 손절 도달까지 감시 (보유 중 동적 조정 포함)
-  5. 조건 충족 시 전량 시장가 매도 → 성과 평가 → 1번으로
+  1. CoinSelector 사전 필터링 → AI Agent 코인 선정
+  2. 가용 KRW 전액 매수
+  3. 스마트 익절/손절 감시 (트레일링 + 손절 관찰 + 동적 조정)
+  4. 조건 충족 시 전량 시장가 매도 → 성과 평가 → 1번으로
 """
 import logging
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 
 from config import settings
 from core import BithumbClient
@@ -17,6 +18,8 @@ from database import TradeRepository
 from database.models import Position
 from strategy.ai_agent import TradingAgent
 from strategy.market_analyzer import MarketAnalyzer
+from strategy.strategy_optimizer import StrategyOptimizer
+from strategy.coin_selector import CoinSelector
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,34 @@ logger = logging.getLogger(__name__)
 _ADJUST_INTERVAL_SEC = 30 * 60
 # 최대 보유 시간 (분) — 초과 시 강제 매도
 _MAX_HOLD_MINUTES = 720  # 12시간
+
+
+# ================================================================== #
+#  스마트 매도 상태 머신                                                #
+# ================================================================== #
+class _ExitPhase(Enum):
+    """매도 감시 상태"""
+    MONITORING = "monitoring"        # 일반 감시 중
+    TRAILING_TP = "trailing_tp"      # 익절 돌파 → 트레일링 추적
+    OBSERVING_SL = "observing_sl"    # 손절 터치 → 관찰 중 (가짜 하락 필터)
+
+
+@dataclass
+class _ExitTracker:
+    """포지션별 매도 상태 추적기"""
+    phase: _ExitPhase = _ExitPhase.MONITORING
+
+    # ── 트레일링 익절 ──
+    peak_pnl_pct: float = 0.0          # 트레일링 진입 후 최고 수익률
+    trail_offset_pct: float = 0.4      # 고점 대비 이만큼 하락하면 매도
+    trailing_since: float = 0.0        # 트레일링 진입 시각 (epoch)
+    trailing_timeout: float = 600.0    # 트레일링 최대 유지 시간 (초, 기본 10분)
+
+    # ── 손절 관찰 ──
+    sl_observation_count: int = 0      # 관찰 횟수
+    sl_max_observations: int = 3       # 최대 관찰 횟수 (3회 × 10초 = 30초)
+    sl_min_pnl: float = 0.0           # 관찰 중 최저 수익률
+    sl_deep_factor: float = 1.5       # 이 배수 이상 초과 하락 시 즉시 손절
 
 
 class TradingEngine:
@@ -35,15 +66,20 @@ class TradingEngine:
         repo: TradeRepository,
         agent: TradingAgent,
         analyzer: MarketAnalyzer,
+        optimizer: StrategyOptimizer | None = None,
+        selector: CoinSelector | None = None,
     ):
         self._client = client
         self._repo = repo
         self._agent = agent
         self._analyzer = analyzer
+        self._optimizer = optimizer
+        self._selector = selector or CoinSelector()
         self._running = False
         self._paused = False
         self._notifier = None
         self._price_fail_count: dict[int, int] = {}  # position_id → 연속 실패 횟수
+        self._exit_trackers: dict[int, _ExitTracker] = {}  # position_id → 매도 상태
         self._last_adjust_time: float = 0.0           # 마지막 전략 조정 시각 (epoch)
         self._last_adjustment: dict | None = None     # 가장 최근 동적 조정 기록
         self.daily_start_krw: float = 0.0
@@ -72,6 +108,24 @@ class TradingEngine:
         logger.info("=== TradingEngine 시작 ===")
 
         self.daily_start_krw = self._client.get_krw_balance()
+
+        # StrategyOptimizer 초기화 (기존 평가 데이터로 즉시 파라미터 결정)
+        if self._optimizer:
+            try:
+                init_stats = self._repo.get_evaluation_stats(last_n=10)
+                if init_stats:
+                    self._optimizer.optimize(init_stats)
+                    p = self._optimizer.get_params()
+                    logger.info(
+                        f"[StrategyOptimizer] 초기 파라미터: "
+                        f"익절 {p.tp_clamp_min}~{p.tp_clamp_max}% "
+                        f"/ 손절 {p.sl_clamp_min}~{p.sl_clamp_max}% "
+                        f"| {p.rationale}"
+                    )
+                else:
+                    logger.info("[StrategyOptimizer] 과거 데이터 없음 — 기본 파라미터(익절 1~3.5%, 손절 -2~-6%) 사용")
+            except Exception as e:
+                logger.error(f"[StrategyOptimizer 초기화 오류] {e}")
 
         while self._running:
             try:
@@ -196,7 +250,33 @@ class TradingEngine:
         # 과거 성과 통계를 가져와서 Agent에게 전달
         eval_stats = self._repo.get_evaluation_stats(last_n=10)
 
-        decision = self._agent.select_coin(snapshots, eval_stats=eval_stats)
+        # StrategyOptimizer 파라미터를 clamp 범위로 주입 (즉각 반영)
+        target_tp = 2.0
+        if self._optimizer:
+            opt = self._optimizer.get_params()
+            target_tp = opt.target_tp
+            if not eval_stats:
+                eval_stats = {"count": 3}
+            eval_stats["tp_clamp_min"] = opt.tp_clamp_min
+            eval_stats["tp_clamp_max"] = opt.tp_clamp_max
+            eval_stats["sl_clamp_min"] = opt.sl_clamp_min
+            eval_stats["sl_clamp_max"] = opt.sl_clamp_max
+            if eval_stats.get("count", 0) < 3:
+                eval_stats["count"] = 3
+            logger.info(
+                f"[StrategyOptimizer] 파라미터 주입: "
+                f"익절 {opt.tp_clamp_min}~{opt.tp_clamp_max}% "
+                f"/ 손절 {opt.sl_clamp_min}~{opt.sl_clamp_max}%"
+            )
+
+        # CoinSelector: 변동성·모멘텀 기반 사전 필터링
+        filtered, coin_scores = self._selector.filter_and_rank(snapshots, target_tp=target_tp)
+        if not filtered:
+            logger.warning("[CoinSelector] 조건 충족 코인 없음 — 전체 목록으로 폴백")
+            filtered = snapshots
+            coin_scores = []
+
+        decision = self._agent.select_coin(filtered, eval_stats=eval_stats, coin_scores=coin_scores)
         logger.info(
             f"[AI 선정] {decision.symbol} "
             f"익절=+{decision.take_profit_pct}% 손절={decision.stop_loss_pct}% "
@@ -246,9 +326,10 @@ class TradingEngine:
             f"투입={buy_amount:,.0f}원"
         )
 
-        # 전략 조정 타이머 + 기록 리셋
+        # 전략 조정 타이머 + 매도 상태 리셋
         self._last_adjust_time = time.time()
         self._last_adjustment = None
+        self._exit_trackers.clear()
 
         if self._notifier:
             try:
@@ -266,7 +347,7 @@ class TradingEngine:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Step 4: 익절/손절 감시 + 동적 전략 조정                               #
+    #  Step 4: 스마트 익절/손절 감시 (상태 머신)                              #
     # ------------------------------------------------------------------ #
     def _check_exit(self, position: Position) -> None:
         try:
@@ -286,10 +367,37 @@ class TradingEngine:
                     logger.error(f"[강제 청산 실패] {position.symbol}: {sell_err}")
                 self._repo.close_position(position.id)
                 self._price_fail_count.pop(position.id, None)
+                self._exit_trackers.pop(position.id, None)
             return
 
         pnl_pct = (current_price - position.buy_price) / position.buy_price * 100
+        tracker = self._exit_trackers.get(position.id, _ExitTracker())
 
+        # 시간 기반 강제 탈출 체크 (모든 상태에서 적용)
+        holding_minutes = (datetime.utcnow() - position.opened_at).total_seconds() / 60
+        if holding_minutes >= _MAX_HOLD_MINUTES:
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"시간초과 강제매도 ({holding_minutes:.0f}분 >= {_MAX_HOLD_MINUTES}분, {pnl_pct:+.2f}%)",
+            )
+            self._exit_trackers.pop(position.id, None)
+            return
+
+        # ── 상태 머신 분기 ──
+        if tracker.phase == _ExitPhase.TRAILING_TP:
+            self._handle_trailing_tp(position, current_price, pnl_pct, tracker)
+        elif tracker.phase == _ExitPhase.OBSERVING_SL:
+            self._handle_observing_sl(position, current_price, pnl_pct, tracker)
+        else:
+            self._handle_monitoring(position, current_price, pnl_pct, tracker)
+
+        # 상태 저장
+        self._exit_trackers[position.id] = tracker
+
+    def _handle_monitoring(
+        self, position: Position, current_price: float, pnl_pct: float, tracker: _ExitTracker,
+    ) -> None:
+        """일반 감시 상태 — 익절/손절 도달 시 스마트 모드 진입"""
         logger.debug(
             f"[감시] {position.symbol} "
             f"매수가={position.buy_price:,.0f} 현재가={current_price:,.0f} "
@@ -297,25 +405,165 @@ class TradingEngine:
             f"익절=+{position.take_profit_pct}% 손절={position.stop_loss_pct}%"
         )
 
-        # 시간 기반 강제 탈출 체크
-        holding_minutes = (datetime.utcnow() - position.opened_at).total_seconds() / 60
-        if holding_minutes >= _MAX_HOLD_MINUTES:
-            self._execute_sell(
-                position, current_price, pnl_pct,
-                f"시간초과 강제매도 ({holding_minutes:.0f}분 >= {_MAX_HOLD_MINUTES}분, {pnl_pct:+.2f}%)",
-            )
-            return
-
-        # 익절/손절 체크
         if pnl_pct >= position.take_profit_pct:
-            self._execute_sell(position, current_price, pnl_pct,
-                               f"익절 ({pnl_pct:+.2f}% >= +{position.take_profit_pct}%)")
+            # ── 익절 돌파 → 트레일링 모드 진입 (낚시: 줄을 풀어줌) ──
+            tracker.phase = _ExitPhase.TRAILING_TP
+            tracker.peak_pnl_pct = pnl_pct
+            tracker.trailing_since = time.time()
+            tracker.trail_offset_pct = self._calc_trail_offset(pnl_pct, position.take_profit_pct)
+            logger.info(
+                f"[트레일링 진입] {position.symbol} {pnl_pct:+.2f}% >= TP +{position.take_profit_pct}% "
+                f"| 오프셋={tracker.trail_offset_pct}% (고점 대비 이만큼 하락 시 매도)"
+            )
+            if self._notifier:
+                try:
+                    self._notifier.send(
+                        f"🎣 <b>트레일링 익절 진입</b> {position.symbol}\n"
+                        f"수익: {pnl_pct:+.2f}% (TP +{position.take_profit_pct}% 돌파)\n"
+                        f"고점 추적 중... 하락 시 매도 (오프셋 {tracker.trail_offset_pct}%)"
+                    )
+                except Exception:
+                    pass
+
         elif pnl_pct <= position.stop_loss_pct:
-            self._execute_sell(position, current_price, pnl_pct,
-                               f"손절 ({pnl_pct:+.2f}% <= {position.stop_loss_pct}%)")
+            # ── 손절 터치 → 관찰 모드 진입 (낚시: 찍고 반등하는지 확인) ──
+            # 단, 급락(SL의 1.5배 이상)이면 즉시 손절
+            deep_sl = position.stop_loss_pct * tracker.sl_deep_factor
+            if pnl_pct <= deep_sl:
+                logger.warning(
+                    f"[급락 즉시 손절] {position.symbol} {pnl_pct:+.2f}% <= "
+                    f"심화 SL {deep_sl:+.2f}%"
+                )
+                self._execute_sell(
+                    position, current_price, pnl_pct,
+                    f"급락 손절 ({pnl_pct:+.2f}% <= 심화SL {deep_sl:+.2f}%)",
+                )
+                self._exit_trackers.pop(position.id, None)
+                return
+
+            tracker.phase = _ExitPhase.OBSERVING_SL
+            tracker.sl_observation_count = 1
+            tracker.sl_min_pnl = pnl_pct
+            logger.info(
+                f"[손절 관찰 시작] {position.symbol} {pnl_pct:+.2f}% <= SL {position.stop_loss_pct}% "
+                f"| 반등 여부 관찰 중 (최대 {tracker.sl_max_observations}회)"
+            )
+
         else:
             # 보유 중 — 주기적으로 전략 동적 조정
             self._maybe_adjust_strategy(position, current_price, pnl_pct)
+
+    def _handle_trailing_tp(
+        self, position: Position, current_price: float, pnl_pct: float, tracker: _ExitTracker,
+    ) -> None:
+        """트레일링 익절 상태 — 고점 추적, 하락 시 매도"""
+        # 고점 갱신
+        if pnl_pct > tracker.peak_pnl_pct:
+            tracker.peak_pnl_pct = pnl_pct
+            # 수익 커지면 오프셋도 동적 조정 (더 여유)
+            tracker.trail_offset_pct = self._calc_trail_offset(pnl_pct, position.take_profit_pct)
+
+        drop_from_peak = tracker.peak_pnl_pct - pnl_pct
+        elapsed = time.time() - tracker.trailing_since
+
+        logger.debug(
+            f"[트레일링] {position.symbol} 현재={pnl_pct:+.2f}% "
+            f"고점={tracker.peak_pnl_pct:+.2f}% 하락={drop_from_peak:.2f}% "
+            f"오프셋={tracker.trail_offset_pct}% 경과={elapsed:.0f}초"
+        )
+
+        if drop_from_peak >= tracker.trail_offset_pct:
+            # ── 고점에서 하락 → 매도 (낚시: 줄을 끊음) ──
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"트레일링 익절 (고점 {tracker.peak_pnl_pct:+.2f}% → {pnl_pct:+.2f}%, "
+                f"하락 {drop_from_peak:.2f}% >= 오프셋 {tracker.trail_offset_pct}%)",
+            )
+            self._exit_trackers.pop(position.id, None)
+
+        elif elapsed >= tracker.trailing_timeout:
+            # ── 타임아웃 → 현재 가격으로 매도 ──
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"트레일링 타임아웃 ({elapsed:.0f}초, {pnl_pct:+.2f}%, "
+                f"고점 {tracker.peak_pnl_pct:+.2f}%)",
+            )
+            self._exit_trackers.pop(position.id, None)
+
+        elif pnl_pct < position.take_profit_pct * 0.5:
+            # ── TP 이하로 크게 하락 → 즉시 매도 (모멘텀 상실) ──
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"트레일링 모멘텀 상실 ({pnl_pct:+.2f}% < TP의 50%)",
+            )
+            self._exit_trackers.pop(position.id, None)
+
+    def _handle_observing_sl(
+        self, position: Position, current_price: float, pnl_pct: float, tracker: _ExitTracker,
+    ) -> None:
+        """손절 관찰 상태 — 가짜 하락인지 진짜 하락인지 판단"""
+        tracker.sl_observation_count += 1
+        if pnl_pct < tracker.sl_min_pnl:
+            tracker.sl_min_pnl = pnl_pct
+
+        logger.debug(
+            f"[손절 관찰] {position.symbol} #{tracker.sl_observation_count}/"
+            f"{tracker.sl_max_observations} 현재={pnl_pct:+.2f}% "
+            f"최저={tracker.sl_min_pnl:+.2f}% SL={position.stop_loss_pct}%"
+        )
+
+        # ── 급락 → 즉시 손절 ──
+        deep_sl = position.stop_loss_pct * tracker.sl_deep_factor
+        if pnl_pct <= deep_sl:
+            logger.warning(f"[관찰 중 급락] {position.symbol} {pnl_pct:+.2f}% <= 심화SL {deep_sl:+.2f}%")
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"관찰 중 급락 ({pnl_pct:+.2f}% <= 심화SL {deep_sl:+.2f}%)",
+            )
+            self._exit_trackers.pop(position.id, None)
+            return
+
+        # ── 반등 감지 → 손절 취소 (낚시: 물고기가 돌아옴) ──
+        recovery_threshold = position.stop_loss_pct + abs(position.stop_loss_pct) * 0.15
+        if pnl_pct > recovery_threshold:
+            logger.info(
+                f"[손절 취소] {position.symbol} 반등 감지! "
+                f"{pnl_pct:+.2f}% > 회복기준 {recovery_threshold:+.2f}% "
+                f"(최저 {tracker.sl_min_pnl:+.2f}%에서 반등)"
+            )
+            tracker.phase = _ExitPhase.MONITORING
+            tracker.sl_observation_count = 0
+            if self._notifier:
+                try:
+                    self._notifier.send(
+                        f"🔄 <b>손절 취소</b> {position.symbol}\n"
+                        f"가짜 하락 감지 — {tracker.sl_min_pnl:+.2f}%에서 반등 → {pnl_pct:+.2f}%"
+                    )
+                except Exception:
+                    pass
+            return
+
+        # ── 관찰 완료 → 하락 확인, 손절 실행 ──
+        if tracker.sl_observation_count >= tracker.sl_max_observations:
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"손절 확인 ({tracker.sl_observation_count}회 관찰, "
+                f"최저 {tracker.sl_min_pnl:+.2f}%, 반등 없음)",
+            )
+            self._exit_trackers.pop(position.id, None)
+
+    @staticmethod
+    def _calc_trail_offset(current_pnl: float, original_tp: float) -> float:
+        """트레일링 오프셋 계산 — 오버슈트가 클수록 여유를 줌"""
+        overshoot = current_pnl - original_tp
+        if overshoot > 2.0:
+            return 1.0    # 2%+ 초과 → 넉넉하게 (큰 수익 보존)
+        elif overshoot > 1.0:
+            return 0.7
+        elif overshoot > 0.3:
+            return 0.5
+        else:
+            return 0.3    # 갓 돌파 → 타이트하게 (수익 확보)
 
     def _maybe_adjust_strategy(
         self, position: Position, current_price: float, pnl_pct: float,
@@ -389,7 +637,6 @@ class TradingEngine:
     ) -> None:
         """포지션의 익절/손절 기준을 DB에서 업데이트"""
         from database.models import SessionLocal, Position as PositionModel
-        from contextlib import contextmanager
 
         db = SessionLocal()
         try:
@@ -415,6 +662,7 @@ class TradingEngine:
         reason: str,
     ) -> None:
         logger.info(f"[매도 실행] {reason}")
+        self._exit_trackers.pop(position.id, None)
 
         actual_units = self._client.get_coin_balance(position.symbol)
         if actual_units <= 0:
@@ -548,6 +796,26 @@ class TradingEngine:
                     )
                 except Exception:
                     pass
+
+            # ── 평가 완료 즉시 StrategyOptimizer 재실행 → 다음 사이클에 즉시 반영 ──
+            if self._optimizer:
+                try:
+                    updated_stats = self._repo.get_evaluation_stats(last_n=10)
+                    new_params = self._optimizer.optimize(updated_stats)
+                    if self._notifier:
+                        try:
+                            self._notifier.send(
+                                f"⚙️ <b>전략 최적화 완료</b>\n"
+                                f"익절 목표: +{new_params.target_tp}% "
+                                f"({new_params.tp_clamp_min}~{new_params.tp_clamp_max}%)\n"
+                                f"손절 목표: {new_params.target_sl}% "
+                                f"({new_params.sl_clamp_min}~{new_params.sl_clamp_max}%)\n"
+                                f"📝 {new_params.rationale}"
+                            )
+                        except Exception:
+                            pass
+                except Exception as opt_err:
+                    logger.error(f"[StrategyOptimizer 재실행 오류] {opt_err}")
 
         except Exception as e:
             logger.error(f"[성과 평가 오류] {e}", exc_info=True)

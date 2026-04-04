@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from core.llm_provider import BaseLLMProvider, get_llm_provider
 from .market_analyzer import CoinSnapshot
+from .coin_selector import CoinScore
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +47,37 @@ class TradingAgent:
     #  공통 프롬프트 빌더                                                 #
     # ---------------------------------------------------------------- #
     @staticmethod
-    def _snapshots_to_text(snapshots: list[CoinSnapshot]) -> str:
+    def _snapshots_to_text(
+        snapshots: list[CoinSnapshot],
+        scores: list[CoinScore] | None = None,
+    ) -> str:
+        """스냅샷을 AI 프롬프트 텍스트로 변환 (스코어 정보 포함)"""
+        score_map = {sc.symbol: sc for sc in (scores or [])}
         lines = []
         for s in snapshots:
-            lines.append(
+            # 변동폭 계산
+            vol_pct = (
+                (s.high_price - s.low_price) / s.low_price * 100
+                if s.low_price > 0 else 0
+            )
+            # 현재가 위치
+            price_range = s.high_price - s.low_price
+            pos_pct = (
+                (s.current_price - s.low_price) / price_range * 100
+                if price_range > 0 else 50
+            )
+            line = (
                 f"- {s.symbol}: "
                 f"현재가={s.current_price:,.0f}원, "
                 f"24h변동={s.change_pct_24h:+.2f}%, "
                 f"24h거래대금={s.volume_krw_24h / 1e8:.1f}억원, "
-                f"고가={s.high_price:,.0f}, 저가={s.low_price:,.0f}"
+                f"고가={s.high_price:,.0f}, 저가={s.low_price:,.0f}, "
+                f"변동폭={vol_pct:.1f}%, 현재가위치={pos_pct:.0f}%"
             )
+            sc = score_map.get(s.symbol)
+            if sc:
+                line += f" (모멘텀={sc.momentum:+.1f}, 스코어={sc.total_score:.1f})"
+            lines.append(line)
         return "\n".join(lines)
 
     @staticmethod
@@ -105,31 +127,32 @@ class TradingAgent:
         self,
         snapshots: list[CoinSnapshot],
         eval_stats: dict | None = None,
+        coin_scores: list[CoinScore] | None = None,
     ) -> AgentDecision:
         """시장 데이터 + 과거 성과를 분석해 매수할 코인 1개와 익절/손절 기준을 결정"""
 
-        market_text = self._snapshots_to_text(snapshots)
+        market_text = self._snapshots_to_text(snapshots, scores=coin_scores)
         history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
 
-        # 과거 성과가 있으면 적응형 범위를 프롬프트에 강제
+        # 과거 성과가 있으면 적응형 범위를 프롬프트에 강제 (StrategyOptimizer 값 우선 반영)
         if eval_stats and eval_stats.get("count", 0) >= 3:
-            tp_min = eval_stats.get("tp_clamp_min", 2.0)
-            tp_max = eval_stats.get("tp_clamp_max", 8.0)
-            sl_min = eval_stats.get("sl_clamp_min", -3.0)
-            sl_max = eval_stats.get("sl_clamp_max", -1.0)
+            tp_min = eval_stats.get("tp_clamp_min", 1.0)
+            tp_max = eval_stats.get("tp_clamp_max", 3.5)
+            sl_min = eval_stats.get("sl_clamp_min", -6.0)
+            sl_max = eval_stats.get("sl_clamp_max", -2.0)
             tp_guide = (
-                f"- 익절(take_profit_pct): 과거 성과 기반 적응 범위 **+{tp_min:.1f}%~+{tp_max:.1f}%** 내에서 설정 (필수)\n"
-                f"- 손절(stop_loss_pct): 적응 범위 **{sl_min:.1f}%~{sl_max:.1f}%** 내에서 설정 (필수)"
+                f"- 익절(take_profit_pct): 전략 최적화 범위 **+{tp_min:.1f}%~+{tp_max:.1f}%** 내에서 설정 (필수)\n"
+                f"- 손절(stop_loss_pct): 전략 최적화 범위 **{sl_min:.1f}%~{sl_max:.1f}%** 내에서 설정 (필수)"
             )
-            rr_guide = "- 리워드:리스크 비율 최소 2:1 이상 (과거 성과 기반 유연 적용)"
+            rr_guide = "- 승률 중심 전략: 익절은 낮게 빠르게, 손절은 넓게 느리게 (작은 수익 다수 > 큰 수익 소수)"
         else:
-            tp_min, tp_max = 2.0, 8.0
-            sl_min, sl_max = -3.0, -1.0
+            tp_min, tp_max = 1.0, 3.5
+            sl_min, sl_max = -6.0, -2.0
             tp_guide = (
-                "- 익절(take_profit_pct): 2%~8% 범위에서 현실적으로 설정\n"
-                "- 손절(stop_loss_pct): -1.0%~-3.0% 범위에서 설정"
+                "- 익절(take_profit_pct): 1.0%~3.5% 범위에서 달성 가능하게 설정\n"
+                "- 손절(stop_loss_pct): -2.0%~-6.0% 범위에서 넉넉하게 설정"
             )
-            rr_guide = "- 리워드:리스크 비율 최소 2:1 이상"
+            rr_guide = "- 승률 중심 전략: 익절은 낮게 빠르게, 손절은 넓게 느리게"
 
         prompt = f"""당신은 단기 변동성 매매 전문 트레이더입니다.
 전략: 코인 1개를 전액 매수 → 익절 또는 손절 시 전량 매도 → 즉시 반복.
@@ -141,16 +164,16 @@ class TradingAgent:
 {history_text}
 
 **코인 선정 기준 (우선순위 순)**
-1. 강한 단기 상승 모멘텀 — 현재가가 당일 고가 대비 10% 이내에 있고, 24h 변동률이 양수이며 상승 추세인 코인 최우선
-2. 거래대금 충분 — 최소 50억원/24h 이상, 슬리피지 최소화 및 빠른 체결 보장
-3. 고저 차이가 클 것 — 24h 고저 차이가 5% 이상인 코인 우선 (변동성 확보)
-4. 하락 중인 코인은 절대 선정 금지 — 24h 변동률이 음수이거나 현재가가 당일 저가 근처인 코인 제외
+1. **변동폭 vs 익절 현실성** — 변동폭이 목표 익절%의 1.5배 이상인 코인만 선정 (예: 익절 2% 목표 시 변동폭 3% 이상 필수). 변동폭이 작은 코인은 절대 선정 금지
+2. 강한 단기 상승 모멘텀 — 현재가위치가 50~80% 구간이고, 모멘텀이 양수인 코인 최우선. 스코어가 높은 코인을 우선 검토하세요
+3. 거래대금 충분 — 최소 50억원/24h 이상
+4. 하락 중인 코인은 절대 선정 금지 — 24h 변동률이 음수이거나 현재가위치가 20% 이하인 코인 제외
 
 **익절·손절 기준 설정 원칙 (반드시 준수)**
 {rr_guide}
 {tp_guide}
 - 수수료(매수+매도 약 0.4%) 감안 후에도 순이익이 발생해야 함
-- **핵심: 달성 가능한 현실적 목표를 설정하세요. 너무 높은 익절선은 기회비용만 증가시킵니다.**
+- **핵심: 익절은 낮고 빠르게, 손절은 넓고 느리게. 야금야금 손절 방지가 최우선.**
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
@@ -175,8 +198,8 @@ class TradingAgent:
             confidence = float(data.get("confidence", 0.5))
             reason = data.get("reason", "")
 
-            # ── 안전장치: 적응형 범위 clamp ──
-            # tp_min/tp_max, sl_min/sl_max는 eval_stats 기반 또는 기본값
+            # ── 안전장치: 전략 최적화 범위 clamp ──
+            # tp_min/tp_max, sl_min/sl_max는 StrategyOptimizer 또는 기본값
             if stop_loss_pct > 0:
                 stop_loss_pct = -abs(stop_loss_pct)
             if stop_loss_pct > sl_max:
@@ -193,11 +216,11 @@ class TradingAgent:
                 logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → {tp_max}% (범위 상한)")
                 take_profit_pct = tp_max
 
-            # R:R 최소 2:1 보정
+            # R:R 최소 1:1 보정 (승률 중심 전략 — 2:1 요구 제거)
             rr_ratio = take_profit_pct / abs(stop_loss_pct) if stop_loss_pct != 0 else 99
-            if rr_ratio < 2.0:
-                take_profit_pct = abs(stop_loss_pct) * 2.0
-                logger.warning(f"[AI 보정] R:R 미달 → take_profit={take_profit_pct}%")
+            if rr_ratio < 1.0:
+                take_profit_pct = abs(stop_loss_pct) * 1.0
+                logger.warning(f"[AI 보정] R:R 1:1 미달 → take_profit={take_profit_pct}%")
 
             return AgentDecision(
                 symbol=symbol,
@@ -240,6 +263,10 @@ class TradingAgent:
         prompt = f"""당신은 트레이딩 전략 평가 전문가입니다.
 아래 매매 결과를 분석하고, 다음 매매를 위한 전략 파라미터를 제안하세요.
 
+**전략 방향 (준수):**
+- 익절은 낮고 빠르게 (1.0%~3.5%) — 달성 못 하면 결국 손절만 반복됨
+- 손절은 넓고 느리게 (2.0%~6.0%) — 반등 기회 충분히 대기
+
 **이번 매매 결과:**
 - 코인: {symbol}
 - 매수가: {buy_price:,.0f}원 → 매도가: {sell_price:,.0f}원
@@ -251,15 +278,15 @@ class TradingAgent:
 {history_summary}
 
 **평가 관점:**
-1. 익절/손절 기준이 현실적이었는가? (너무 높으면 기회비용, 너무 낮으면 수수료 손실)
-2. 보유 시간이 적절했는가? (장시간 보유는 기회비용 증가)
-3. 코인 선정 판단은 적절했는가?
+1. 익절이 너무 높아서 도달하지 못했는가? → 낮추기
+2. 손절이 너무 좁아서 야금야금 손절됐는가? → 넓히기
+3. 보유 시간이 길었다면 익절이 높았던 것 → 낮추기
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "evaluation": "이번 매매에 대한 평가 (한국어, 150자 이내)",
-  "suggested_tp_pct": 다음매매추천익절퍼센트(숫자, 2.0~8.0 범위),
-  "suggested_sl_pct": 다음매매추천손절퍼센트(음수숫자, -1.0~-3.0 범위),
+  "suggested_tp_pct": 다음매매추천익절퍼센트(숫자, 1.0~4.0 범위),
+  "suggested_sl_pct": 다음매매추천손절퍼센트(음수숫자, -2.0~-6.0 범위),
   "lesson": "핵심 교훈 한 줄 (한국어, 50자 이내)"
 }}"""
 
@@ -274,11 +301,11 @@ class TradingAgent:
             suggested_tp = float(data.get("suggested_tp_pct", original_tp))
             suggested_sl = float(data.get("suggested_sl_pct", original_sl))
 
-            # 범위 보정
-            suggested_tp = max(2.0, min(8.0, suggested_tp))
+            # 범위 보정 (낮은 익절, 넓은 손절 전략)
+            suggested_tp = max(1.0, min(4.0, suggested_tp))
             if suggested_sl > 0:
                 suggested_sl = -abs(suggested_sl)
-            suggested_sl = max(-3.0, min(-1.0, suggested_sl))
+            suggested_sl = max(-6.0, min(-2.0, suggested_sl))
 
             return TradeEvaluation(
                 evaluation=data.get("evaluation", "평가 없음"),
@@ -343,9 +370,11 @@ class TradingAgent:
 
 **시간 기반 가이드라인:** {time_guidance}
 
-현재 상황에서 익절/손절 기준을 조정해야 하나요?
-- 조정 시 익절선은 현재 수익률보다 최소 0.5% 이상으로 설정
-- 수수료(0.4%)를 감안해 최소 +1.5% 이상의 익절선 유지
+**조정 원칙:**
+- 익절은 낮추는 방향 — 오래 보유할수록 익절 낮추기
+- 손절은 유지 또는 살짝 넓히기 — 좁히지 마세요
+- 현재 수익이 있다면 수익 확보 위해 익절 낮추기 검토
+- 수수료(0.4%) 감안 최소 +0.8% 이상의 익절선 유지
 
 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
@@ -364,11 +393,11 @@ class TradingAgent:
             if data.get("adjust"):
                 new_tp = float(data.get("new_take_profit_pct", original_tp))
                 new_sl = float(data.get("new_stop_loss_pct", original_sl))
-                # 안전장치
-                new_tp = max(1.5, min(15.0, new_tp))
+                # 안전장치 (익절 낮게, 손절 넓게)
+                new_tp = max(0.8, min(5.0, new_tp))
                 if new_sl > 0:
                     new_sl = -abs(new_sl)
-                new_sl = max(-5.0, min(-0.5, new_sl))
+                new_sl = max(-8.0, min(-0.5, new_sl))
                 data["new_take_profit_pct"] = round(new_tp, 2)
                 data["new_stop_loss_pct"] = round(new_sl, 2)
 

@@ -15,7 +15,7 @@ from config import settings
 from core import BithumbClient
 from core.telegram_bot import TelegramBot
 from database import TradeRepository
-from strategy import TradingAgent, MarketAnalyzer, TradingEngine
+from strategy import TradingAgent, MarketAnalyzer, TradingEngine, StrategyOptimizer, CoinSelector
 from scheduler import TradingScheduler
 from dashboard import Dashboard
 from dashboard.web_server import WebDashboard
@@ -61,11 +61,13 @@ def main() -> None:
     check_config()
 
     # 의존성 주입
-    client   = BithumbClient()
-    repo     = TradeRepository()
-    agent    = TradingAgent()
-    analyzer = MarketAnalyzer(client)
-    engine   = TradingEngine(client, repo, agent, analyzer)
+    client    = BithumbClient()
+    repo      = TradeRepository()
+    agent     = TradingAgent()
+    analyzer  = MarketAnalyzer(client)
+    optimizer = StrategyOptimizer()   # 수익 극대화 전략 최적화 Agent
+    selector  = CoinSelector()       # 변동성·모멘텀 기반 종목 필터링 Agent
+    engine    = TradingEngine(client, repo, agent, analyzer, optimizer, selector)
 
     # 텔레그램 봇 초기화 (TELEGRAM_ENABLED=true 시)
     telegram: TelegramBot | None = None
