@@ -443,27 +443,31 @@ def _render_html(data: dict) -> str:
 
     total_pnl_color = "green" if perf["total_pnl_pct"] >= 0 else "red"
 
-    # 포지션 평가액 줄
+    # 포지션 평가액 줄 (코인명 + 평가금액 + 개수)
     pos_asset_line = ""
+    pos_symbol = ""
     if pos:
+        pos_symbol = pos["symbol"]
         pos_asset_line = (
             f'<div class="sub">'
             f'{pos["symbol"]} 평가: {fmt_krw(pos["units"] * pos["current_price"])}'
+            f' ({pos["units"]:.6g}개)'
             f'</div>'
         )
 
     avg_h = perf["avg_hold_minutes"]
     avg_hold = f"{avg_h / 60:.1f}시간" if avg_h >= 60 else f"{avg_h:.0f}분"
 
-    # 보유 코인 (1000원 이상만 표시, 청산 버튼 없음)
-    holdings = [h for h in data.get("holdings", []) if h["krw_value"] >= 1000]
+    # 보유 코인 (1000원 이상, 포지션 코인 제외 — 중복 방지)
+    holdings = [h for h in data.get("holdings", [])
+                if h["krw_value"] >= 1000 and h["symbol"] != pos_symbol]
     if holdings:
         h_lines = []
         for h in holdings:
             h_lines.append(
                 f'<div class="sub" style="margin-top:2px;">'
-                f'{h["symbol"]}: {h["units"]:.6g}개'
-                f' ≈ {h["krw_value"]:,.0f}원'
+                f'{h["symbol"]} 평가: {h["krw_value"]:,.0f}원'
+                f' ({h["units"]:.6g}개)'
                 f'</div>'
             )
         holdings_html = "\n".join(h_lines)
