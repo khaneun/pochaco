@@ -98,58 +98,85 @@ class StrategyOptimizer:
     #  내부: 휴리스틱 분석                                                #
     # ---------------------------------------------------------------- #
     def _heuristic_optimize(self, eval_stats: dict) -> StrategyParams:
-        """LLM 없이 규칙 기반으로 즉각 파라미터 결정"""
+        """LLM 없이 규칙 기반으로 즉각 파라미터 결정
+
+        repository의 suggested 값(과거 AI 제안 가중평균)을 기반으로 하되,
+        연속 손절 등 특수 상황에서만 규칙으로 오버라이드합니다.
+        """
         recent_trades = eval_stats.get("recent_trades", [])
         win_rate = eval_stats.get("win_rate", 0.5)
         avg_hold = eval_stats.get("avg_hold_minutes", 60.0)
         avg_pnl = eval_stats.get("avg_pnl_pct", 0.0)
 
-        # 최근 연속 손절 카운트 (최신부터 역순)
+        # repository의 suggested 기반 clamp (AI 제안의 가중평균)
+        repo_tp_min = eval_stats.get("tp_clamp_min", 1.0)
+        repo_tp_max = eval_stats.get("tp_clamp_max", 3.5)
+        repo_sl_min = eval_stats.get("sl_clamp_min", -6.0)
+        repo_sl_max = eval_stats.get("sl_clamp_max", -2.0)
+        suggested_tp = eval_stats.get("avg_suggested_tp", 2.0)
+        suggested_sl = eval_stats.get("avg_suggested_sl", -3.0)
+
+        # 최근 연속 손절 카운트 + 평균 손실 크기
         consecutive_losses = 0
+        loss_pnl_sum = 0.0
         for t in recent_trades:
             if t.get("exit_type") == "stop_loss":
                 consecutive_losses += 1
+                loss_pnl_sum += t.get("pnl_pct", 0)
             else:
                 break
+        avg_loss_size = abs(loss_pnl_sum / consecutive_losses) if consecutive_losses > 0 else 0
 
-        # ── 손절 파라미터 결정 (넓게) ──────────────────────────────
+        # ── 손절 파라미터 결정 ──────────────────────────────
+        # 기본: repository의 suggested 기반 (AI 제안 가중평균 계승)
+        target_sl = round(suggested_sl, 1)
+        sl_min, sl_max = repo_sl_min, repo_sl_max
+
         if consecutive_losses >= 3:
-            # 연속 손절 3건+ → 손절 폭 대폭 확대
-            target_sl, sl_min, sl_max = -5.5, -7.0, -3.5
-            rationale = f"연속 손절 {consecutive_losses}건 → 손절 폭 대폭 확대"
+            if avg_loss_size > 3.0:
+                # 손실 크기가 큼 → 시장 악화, 손절 넓히기보다 코인 선정 개선 필요
+                # 손절은 소폭만 확대, 대신 익절을 더 낮춰 빠른 탈출 유도
+                target_sl = max(target_sl - 0.5, -6.0)
+                rationale = f"연속 손절 {consecutive_losses}건(평균 -{avg_loss_size:.1f}%) — 시장 악화, 빠른 탈출 전략"
+            else:
+                # 손실 크기가 작음 → 손절이 좁아서 찍힌 것, 넓히기
+                target_sl = max(target_sl - 1.5, -6.0)
+                sl_min = max(sl_min - 1.0, -7.0)
+                rationale = f"연속 손절 {consecutive_losses}건(소폭) → 손절 확대"
         elif consecutive_losses == 2:
-            target_sl, sl_min, sl_max = -4.5, -6.0, -3.0
-            rationale = f"연속 손절 2건 → 손절 완화"
+            target_sl = max(target_sl - 0.5, -5.5)
+            rationale = f"연속 손절 2건 → 손절 소폭 완화"
         elif win_rate < 0.35:
-            target_sl, sl_min, sl_max = -4.5, -6.0, -3.0
+            target_sl = max(target_sl - 1.0, -5.5)
             rationale = f"낮은 승률 {win_rate:.0%} → 손절 완화"
-        elif avg_pnl < -1.5:
-            target_sl, sl_min, sl_max = -4.0, -5.5, -2.5
-            rationale = f"평균 손실 {avg_pnl:.1f}% → 손절 완화"
         else:
-            target_sl, sl_min, sl_max = -3.0, -5.0, -2.0
-            rationale = "일반 상태 — 기본 넓은 손절"
+            rationale = f"suggested 기반 유지 (승률 {win_rate:.0%})"
 
-        # ── 익절 파라미터 결정 (낮게, 빠르게) ──────────────────────
-        if avg_hold > 180:
-            # 평균 3시간+ 보유 → 익절 더 낮춰 빨리 탈출
-            target_tp, tp_min, tp_max = 1.5, 1.0, 2.5
+        # ── 익절 파라미터 결정 ──────────────────────────────
+        # 기본: repository의 suggested 기반
+        target_tp = round(suggested_tp, 1)
+        tp_min, tp_max = repo_tp_min, repo_tp_max
+
+        if consecutive_losses >= 3 and avg_loss_size > 3.0:
+            # 시장 악화 시 익절을 더 낮춰 빠른 수익 실현
+            target_tp = max(1.0, target_tp - 0.5)
+            tp_max = min(tp_max, 2.5)
+        elif avg_hold > 180:
+            target_tp = max(1.0, target_tp - 0.5)
+            tp_max = min(tp_max, 2.5)
         elif avg_hold > 90:
-            # 평균 1.5시간+ 보유 → 익절 낮추기
-            target_tp, tp_min, tp_max = 2.0, 1.0, 3.0
+            target_tp = max(1.0, target_tp - 0.3)
         elif win_rate >= 0.6 and avg_pnl > 0.5:
-            # 승률 높고 흑자 → 현 전략 약간 유지
-            target_tp, tp_min, tp_max = 2.5, 1.5, 3.5
-        else:
-            target_tp, tp_min, tp_max = 2.0, 1.0, 3.5
+            # 잘 되고 있으면 현재 전략 유지
+            pass
 
         return StrategyParams(
-            target_tp=round(target_tp, 1),
-            target_sl=round(target_sl, 1),
-            tp_clamp_min=round(tp_min, 1),
-            tp_clamp_max=round(tp_max, 1),
-            sl_clamp_min=round(sl_min, 1),
-            sl_clamp_max=round(sl_max, 1),
+            target_tp=max(0.8, min(4.0, round(target_tp, 1))),
+            target_sl=max(-7.0, min(-1.5, round(target_sl, 1))),
+            tp_clamp_min=max(0.8, round(tp_min, 1)),
+            tp_clamp_max=min(4.5, round(tp_max, 1)),
+            sl_clamp_min=max(-8.0, round(sl_min, 1)),
+            sl_clamp_max=min(-1.5, round(sl_max, 1)),
             rationale=rationale,
             confidence=0.7,
         )

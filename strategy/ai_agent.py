@@ -134,8 +134,9 @@ class TradingAgent:
         market_text = self._snapshots_to_text(snapshots, scores=coin_scores)
         history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
 
-        # 과거 성과가 있으면 적응형 범위를 프롬프트에 강제 (StrategyOptimizer 값 우선 반영)
-        if eval_stats and eval_stats.get("count", 0) >= 3:
+        # clamp 범위가 있으면 적용 (StrategyOptimizer 또는 repository에서 주입)
+        has_clamp = eval_stats and "tp_clamp_min" in eval_stats
+        if has_clamp:
             tp_min = eval_stats.get("tp_clamp_min", 1.0)
             tp_max = eval_stats.get("tp_clamp_max", 3.5)
             sl_min = eval_stats.get("sl_clamp_min", -6.0)

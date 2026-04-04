@@ -250,23 +250,37 @@ class TradingEngine:
         # 과거 성과 통계를 가져와서 Agent에게 전달
         eval_stats = self._repo.get_evaluation_stats(last_n=10)
 
-        # StrategyOptimizer 파라미터를 clamp 범위로 주입 (즉각 반영)
+        # StrategyOptimizer 파라미터를 clamp 범위로 주입
+        # eval_stats가 있으면 merge (repository suggested + optimizer 보정)
+        # eval_stats가 없으면 optimizer 기본값으로 clamp 구성
         target_tp = 2.0
         if self._optimizer:
             opt = self._optimizer.get_params()
             target_tp = opt.target_tp
             if not eval_stats:
-                eval_stats = {"count": 3}
-            eval_stats["tp_clamp_min"] = opt.tp_clamp_min
-            eval_stats["tp_clamp_max"] = opt.tp_clamp_max
-            eval_stats["sl_clamp_min"] = opt.sl_clamp_min
-            eval_stats["sl_clamp_max"] = opt.sl_clamp_max
-            if eval_stats.get("count", 0) < 3:
-                eval_stats["count"] = 3
+                # 초기 상태: optimizer 기본값으로 clamp 직접 구성
+                eval_stats = {
+                    "count": 0,
+                    "tp_clamp_min": opt.tp_clamp_min,
+                    "tp_clamp_max": opt.tp_clamp_max,
+                    "sl_clamp_min": opt.sl_clamp_min,
+                    "sl_clamp_max": opt.sl_clamp_max,
+                }
+            else:
+                # repository clamp과 optimizer clamp을 merge
+                # optimizer의 범위와 repository의 범위 중 더 넓은 쪽 채택
+                eval_stats["tp_clamp_min"] = min(
+                    eval_stats.get("tp_clamp_min", 1.0), opt.tp_clamp_min)
+                eval_stats["tp_clamp_max"] = max(
+                    eval_stats.get("tp_clamp_max", 3.5), opt.tp_clamp_max)
+                eval_stats["sl_clamp_min"] = min(
+                    eval_stats.get("sl_clamp_min", -6.0), opt.sl_clamp_min)
+                eval_stats["sl_clamp_max"] = max(
+                    eval_stats.get("sl_clamp_max", -2.0), opt.sl_clamp_max)
             logger.info(
                 f"[StrategyOptimizer] 파라미터 주입: "
-                f"익절 {opt.tp_clamp_min}~{opt.tp_clamp_max}% "
-                f"/ 손절 {opt.sl_clamp_min}~{opt.sl_clamp_max}%"
+                f"익절 {eval_stats['tp_clamp_min']}~{eval_stats['tp_clamp_max']}% "
+                f"/ 손절 {eval_stats['sl_clamp_min']}~{eval_stats['sl_clamp_max']}%"
             )
 
         # CoinSelector: 변동성·모멘텀 기반 사전 필터링

@@ -369,15 +369,21 @@ class TradeRepository:
             ]
 
             # ── suggested 기반 적응형 clamp 범위 ──
-            # 과거 데이터가 충분하면 avg ± 1.5% 범위로 좁힘
+            # 최근 제안값의 가중평균(최근일수록 2배 가중)으로 범위 결정
             if len(evals) >= 3:
-                tp_clamp_min = max(2.0, round(avg_suggested_tp - 1.5, 1))
-                tp_clamp_max = min(8.0, round(avg_suggested_tp + 1.5, 1))
-                sl_clamp_min = max(-3.0, round(avg_suggested_sl - 0.5, 1))  # 더 넓은 손절
-                sl_clamp_max = min(-1.0, round(avg_suggested_sl + 0.5, 1))  # 더 좁은 손절
+                # 최근 것에 가중치 부여 (최신=2, 나머지=1)
+                weights = [2.0 if i < 3 else 1.0 for i in range(len(evals))]
+                w_sum = sum(weights)
+                w_tp = sum(e.suggested_tp_pct * w for e, w in zip(evals, weights)) / w_sum
+                w_sl = sum(e.suggested_sl_pct * w for e, w in zip(evals, weights)) / w_sum
+
+                tp_clamp_min = max(0.8, round(w_tp - 1.0, 1))
+                tp_clamp_max = min(4.0, round(w_tp + 1.0, 1))
+                sl_clamp_min = max(-7.0, round(w_sl - 1.5, 1))
+                sl_clamp_max = min(-1.5, round(w_sl + 1.0, 1))
             else:
-                tp_clamp_min, tp_clamp_max = 2.0, 8.0
-                sl_clamp_min, sl_clamp_max = -3.0, -1.0
+                tp_clamp_min, tp_clamp_max = 1.0, 3.5
+                sl_clamp_min, sl_clamp_max = -6.0, -2.0
 
             return {
                 "count": len(evals),

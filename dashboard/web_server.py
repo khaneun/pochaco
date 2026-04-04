@@ -123,7 +123,8 @@ def _build_json_status(client: "BithumbClient") -> dict:
             for ev in recent_evals
         ]
 
-        # 거래소 실제 보유 코인 (DB position과 별도, 실제 잔고)
+        # 거래소 실제 보유 코인 (position 코인은 이미 total에 포함 → 중복 방지)
+        pos_symbol = pos.symbol if pos else ""
         holdings = []
         try:
             bal_data = client.get_balance("ALL")
@@ -147,7 +148,9 @@ def _build_json_status(client: "BithumbClient") -> dict:
                                 "price": px,
                                 "krw_value": round(kv, 0),
                             })
-                            total += kv  # 총 자산에 포함
+                            # position 코인은 이미 위에서 total에 합산됨 → 건너뜀
+                            if sym != pos_symbol:
+                                total += kv
                     except Exception:
                         holdings.append({"symbol": sym, "units": amt, "price": 0, "krw_value": 0})
         except Exception:
