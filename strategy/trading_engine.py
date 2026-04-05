@@ -20,6 +20,7 @@ from strategy.ai_agent import TradingAgent
 from strategy.market_analyzer import MarketAnalyzer
 from strategy.strategy_optimizer import StrategyOptimizer
 from strategy.coin_selector import CoinSelector
+from . import cooldown as cooldown_registry
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +84,6 @@ class TradingEngine:
         self._last_adjust_time: float = 0.0           # 마지막 전략 조정 시각 (epoch)
         self._last_adjustment: dict | None = None     # 가장 최근 동적 조정 기록
         self.daily_start_krw: float = 0.0
-        # 최근 매도 이력 {symbol, exit_type, sold_at}
-        # 익절 후 동일 종목 재매수 방지 쿨다운에 사용
-        self._recent_sells: list[dict] = []
 
     # ------------------------------------------------------------------ #
     #  퍼블릭 인터페이스                                                    #
@@ -286,24 +284,8 @@ class TradingEngine:
                 f"/ 손절 {eval_stats['sl_clamp_min']}~{eval_stats['sl_clamp_max']}%"
             )
 
-        # ── 쿨다운 심볼 계산 ──
-        # 익절 후 30분 / 손절 후 10분 이내 동일 종목 재매수 금지
-        now = time.time()
-        cooldown_symbols: set[str] = set()
-        for sell in self._recent_sells:
-            elapsed_min = (now - sell["sold_at"]) / 60
-            if sell["exit_type"] == "take_profit" and elapsed_min < 30:
-                cooldown_symbols.add(sell["symbol"])
-                logger.info(
-                    f"[쿨다운] {sell['symbol']} 익절 후 {elapsed_min:.0f}분 경과 "
-                    f"— 30분 쿨다운 중 (재매수 금지)"
-                )
-            elif sell["exit_type"] == "stop_loss" and elapsed_min < 10:
-                cooldown_symbols.add(sell["symbol"])
-                logger.info(
-                    f"[쿨다운] {sell['symbol']} 손절 후 {elapsed_min:.0f}분 경과 "
-                    f"— 10분 쿨다운 중 (재매수 금지)"
-                )
+        # ── 쿨다운 심볼 조회 (자동 익손절 + 수동 청산 모두 포함) ──
+        cooldown_symbols = cooldown_registry.get_cooldown_symbols()
 
         # CoinSelector: 변동성·모멘텀 기반 사전 필터링
         filtered, coin_scores = self._selector.filter_and_rank(
@@ -744,16 +726,9 @@ class TradingEngine:
         )
         self._repo.close_position(position.id)
 
-        # ── 최근 매도 이력 기록 (쿨다운 추적용) ──
+        # ── 쿨다운 등록 ──
         exit_type_for_cd = "take_profit" if "익절" in reason else "stop_loss"
-        self._recent_sells.append({
-            "symbol": position.symbol,
-            "exit_type": exit_type_for_cd,
-            "sold_at": time.time(),
-        })
-        # 최대 20건만 유지
-        if len(self._recent_sells) > 20:
-            self._recent_sells = self._recent_sells[-20:]
+        cooldown_registry.record_sell(position.symbol, exit_type_for_cd)
 
         logger.info(
             f"[매도 완료] {position.symbol} 수익={pnl_pct:+.2f}% "

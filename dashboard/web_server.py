@@ -19,6 +19,7 @@ _APP_DIR = Path(__file__).parent.parent
 from config import settings
 from database import TradeRepository
 from database.models import Position
+from strategy import cooldown as cooldown_registry
 
 if TYPE_CHECKING:
     from core import BithumbClient
@@ -699,6 +700,9 @@ def _liquidate_position(client: "BithumbClient") -> dict:
             note=f"대시보드 청산 ({pnl_pct:+.2f}%)",
         )
         repo.close_position(pos.id)
+
+        # ── 수동 청산도 쿨다운 적용 (60분) ──
+        cooldown_registry.record_sell(symbol, "manual")
 
         krw = client.get_krw_balance()
         logger.info(
