@@ -83,6 +83,9 @@ class TradingEngine:
         self._last_adjust_time: float = 0.0           # 마지막 전략 조정 시각 (epoch)
         self._last_adjustment: dict | None = None     # 가장 최근 동적 조정 기록
         self.daily_start_krw: float = 0.0
+        # 최근 매도 이력 {symbol, exit_type, sold_at}
+        # 익절 후 동일 종목 재매수 방지 쿨다운에 사용
+        self._recent_sells: list[dict] = []
 
     # ------------------------------------------------------------------ #
     #  퍼블릭 인터페이스                                                    #
@@ -283,8 +286,29 @@ class TradingEngine:
                 f"/ 손절 {eval_stats['sl_clamp_min']}~{eval_stats['sl_clamp_max']}%"
             )
 
+        # ── 쿨다운 심볼 계산 ──
+        # 익절 후 30분 / 손절 후 10분 이내 동일 종목 재매수 금지
+        now = time.time()
+        cooldown_symbols: set[str] = set()
+        for sell in self._recent_sells:
+            elapsed_min = (now - sell["sold_at"]) / 60
+            if sell["exit_type"] == "take_profit" and elapsed_min < 30:
+                cooldown_symbols.add(sell["symbol"])
+                logger.info(
+                    f"[쿨다운] {sell['symbol']} 익절 후 {elapsed_min:.0f}분 경과 "
+                    f"— 30분 쿨다운 중 (재매수 금지)"
+                )
+            elif sell["exit_type"] == "stop_loss" and elapsed_min < 10:
+                cooldown_symbols.add(sell["symbol"])
+                logger.info(
+                    f"[쿨다운] {sell['symbol']} 손절 후 {elapsed_min:.0f}분 경과 "
+                    f"— 10분 쿨다운 중 (재매수 금지)"
+                )
+
         # CoinSelector: 변동성·모멘텀 기반 사전 필터링
-        filtered, coin_scores = self._selector.filter_and_rank(snapshots, target_tp=target_tp)
+        filtered, coin_scores = self._selector.filter_and_rank(
+            snapshots, target_tp=target_tp, cooldown_symbols=cooldown_symbols
+        )
         if not filtered:
             logger.warning("[CoinSelector] 조건 충족 코인 없음 — 전체 목록으로 폴백")
             filtered = snapshots
@@ -719,6 +743,18 @@ class TradingEngine:
             krw_amount=krw_received, note=reason,
         )
         self._repo.close_position(position.id)
+
+        # ── 최근 매도 이력 기록 (쿨다운 추적용) ──
+        exit_type_for_cd = "take_profit" if "익절" in reason else "stop_loss"
+        self._recent_sells.append({
+            "symbol": position.symbol,
+            "exit_type": exit_type_for_cd,
+            "sold_at": time.time(),
+        })
+        # 최대 20건만 유지
+        if len(self._recent_sells) > 20:
+            self._recent_sells = self._recent_sells[-20:]
+
         logger.info(
             f"[매도 완료] {position.symbol} 수익={pnl_pct:+.2f}% "
             f"회수={krw_received:,.0f}원 사유={reason}"

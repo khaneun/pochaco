@@ -46,20 +46,29 @@ class CoinSelector:
         self,
         snapshots: list[CoinSnapshot],
         target_tp: float = 2.0,
+        cooldown_symbols: set[str] | None = None,
     ) -> tuple[list[CoinSnapshot], list[CoinScore]]:
         """매매 가능한 코인만 필터링 + 스코어링
 
         Args:
             snapshots: 전체 코인 스냅샷 목록
             target_tp: 현재 목표 익절% (StrategyOptimizer 기준)
+            cooldown_symbols: 쿨다운 중인 심볼 집합 (재매수 금지)
 
         Returns:
             (필터링된 스냅샷 목록, 스코어 목록) — AI 프롬프트에 함께 전달
         """
+        cooldown_symbols = cooldown_symbols or set()
         scored: list[tuple[CoinSnapshot, CoinScore]] = []
         rejected = 0
 
         for s in snapshots:
+            # ── 쿨다운 필터: 익절/손절 후 일정 시간 동일 종목 재매수 금지 ──
+            if s.symbol in cooldown_symbols:
+                logger.info(f"  [쿨다운] {s.symbol}: 최근 매도 후 쿨다운 중 — 제외")
+                rejected += 1
+                continue
+
             # ── 변동폭 계산 ──
             if s.high_price <= 0 or s.low_price <= 0:
                 rejected += 1
