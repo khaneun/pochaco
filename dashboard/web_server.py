@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +25,17 @@ if TYPE_CHECKING:
     from core import BithumbClient
 
 logger = logging.getLogger(__name__)
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _to_kst(dt: datetime) -> datetime:
+    """UTC naive datetime → KST datetime"""
+    return dt.replace(tzinfo=timezone.utc).astimezone(_KST)
+
+
+def _kst_now() -> datetime:
+    return datetime.now(tz=_KST)
 
 
 def _get_version() -> str:
@@ -57,7 +68,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
                 pnl_krw = (cur - pos.buy_price) * pos.units
                 pos_value = pos.units * cur
                 total = krw + pos_value
-                held_min = (datetime.utcnow() - pos.opened_at).total_seconds() / 60
+                held_min = (datetime.now(tz=timezone.utc) - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60
                 position_data = {
                     "symbol": pos.symbol,
                     "units": round(pos.units, 2),
@@ -80,7 +91,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
 
         trades_data = [
             {
-                "time": t.created_at.strftime("%m-%d %H:%M:%S"),
+                "time": _to_kst(t.created_at).strftime("%m-%d %H:%M:%S"),
                 "symbol": t.symbol,
                 "side": t.side,
                 "price": t.price,
@@ -109,7 +120,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
         eval_stats = repo.get_evaluation_stats(last_n=10)
         evals_data = [
             {
-                "time": ev.created_at.strftime("%m-%d %H:%M:%S"),
+                "time": _to_kst(ev.created_at).strftime("%m-%d %H:%M:%S"),
                 "symbol": ev.symbol,
                 "exit_type": ev.exit_type,
                 "pnl_pct": round(ev.pnl_pct, 2),
@@ -158,7 +169,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
             pass
 
         return {
-            "updated_at": datetime.now().strftime("%m-%d %H:%M:%S"),
+            "updated_at": _kst_now().strftime("%m-%d %H:%M:%S"),
             "version": _VERSION,
             "balance": {"krw": round(krw, 0), "total_assets": round(total, 0)},
             "holdings": holdings,
