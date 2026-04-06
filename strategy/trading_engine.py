@@ -35,9 +35,8 @@ _MAX_HOLD_MINUTES = 720  # 12시간
 # ================================================================== #
 class _ExitPhase(Enum):
     """매도 감시 상태"""
-    MONITORING = "monitoring"        # 일반 감시 중
+    MONITORING = "monitoring"        # 일반 감시 중 (2단계 손절 포함)
     TRAILING_TP = "trailing_tp"      # 익절 돌파 → 트레일링 추적
-    OBSERVING_SL = "observing_sl"    # 손절 터치 → 관찰 중 (가짜 하락 필터)
 
 
 @dataclass
@@ -51,11 +50,8 @@ class _ExitTracker:
     trailing_since: float = 0.0        # 트레일링 진입 시각 (epoch)
     trailing_timeout: float = 600.0    # 트레일링 최대 유지 시간 (초, 기본 10분)
 
-    # ── 손절 관찰 ──
-    sl_observation_count: int = 0      # 관찰 횟수
-    sl_max_observations: int = 3       # 최대 관찰 횟수 (3회 × 10초 = 30초)
-    sl_min_pnl: float = 0.0           # 관찰 중 최저 수익률
-    sl_deep_factor: float = 1.5       # 이 배수 이상 초과 하락 시 즉시 손절
+    # ── 2단계 손절 ──
+    sl1_executed: bool = False         # 1차 손절(50% 매도) 완료 여부
 
 
 class TradingEngine:
@@ -299,7 +295,8 @@ class TradingEngine:
         decision = self._agent.select_coin(filtered, eval_stats=eval_stats, coin_scores=coin_scores)
         logger.info(
             f"[AI 선정] {decision.symbol} "
-            f"익절=+{decision.take_profit_pct}% 손절={decision.stop_loss_pct}% "
+            f"익절=+{decision.take_profit_pct}% "
+            f"1차SL={decision.stop_loss_1st_pct}% 2차SL={decision.stop_loss_pct}% "
             f"확신도={decision.confidence:.0%} | {decision.reason}"
         )
 
@@ -337,6 +334,7 @@ class TradingEngine:
             buy_price=current_price,
             buy_krw=buy_amount,
             take_profit_pct=decision.take_profit_pct,
+            stop_loss_1st_pct=decision.stop_loss_1st_pct,
             stop_loss_pct=decision.stop_loss_pct,
             agent_reason=decision.reason,
             llm_provider=decision.llm_provider,
@@ -361,6 +359,7 @@ class TradingEngine:
                     reason=decision.reason,
                     take_profit_pct=decision.take_profit_pct,
                     stop_loss_pct=decision.stop_loss_pct,
+                    stop_loss_1st_pct=decision.stop_loss_1st_pct,
                     llm_provider=decision.llm_provider,
                 )
             except Exception:
@@ -406,8 +405,6 @@ class TradingEngine:
         # ── 상태 머신 분기 ──
         if tracker.phase == _ExitPhase.TRAILING_TP:
             self._handle_trailing_tp(position, current_price, pnl_pct, tracker)
-        elif tracker.phase == _ExitPhase.OBSERVING_SL:
-            self._handle_observing_sl(position, current_price, pnl_pct, tracker)
         else:
             self._handle_monitoring(position, current_price, pnl_pct, tracker)
 
@@ -417,16 +414,25 @@ class TradingEngine:
     def _handle_monitoring(
         self, position: Position, current_price: float, pnl_pct: float, tracker: _ExitTracker,
     ) -> None:
-        """일반 감시 상태 — 익절/손절 도달 시 스마트 모드 진입"""
+        """일반 감시 상태 — 2단계 손절 + 트레일링 익절"""
+        # 1차 손절 기준: position.stop_loss_1st_pct, 없으면 SL2의 80% (더 위)
+        sl_1st = (
+            position.stop_loss_1st_pct
+            if position.stop_loss_1st_pct
+            else round(position.stop_loss_pct * 0.8, 2)
+        )
+
         logger.debug(
             f"[감시] {position.symbol} "
             f"매수가={position.buy_price:,.0f} 현재가={current_price:,.0f} "
             f"수익={pnl_pct:+.2f}% "
-            f"익절=+{position.take_profit_pct}% 손절={position.stop_loss_pct}%"
+            f"익절=+{position.take_profit_pct}% "
+            f"1차SL={sl_1st}% 2차SL={position.stop_loss_pct}% "
+            f"{'[1차실행]' if tracker.sl1_executed else ''}"
         )
 
         if pnl_pct >= position.take_profit_pct:
-            # ── 익절 돌파 → 트레일링 모드 진입 (낚시: 줄을 풀어줌) ──
+            # ── 익절 돌파 → 트레일링 모드 진입 ──
             tracker.phase = _ExitPhase.TRAILING_TP
             tracker.peak_pnl_pct = pnl_pct
             tracker.trailing_since = time.time()
@@ -445,29 +451,24 @@ class TradingEngine:
                 except Exception:
                     pass
 
-        elif pnl_pct <= position.stop_loss_pct:
-            # ── 손절 터치 → 관찰 모드 진입 (낚시: 찍고 반등하는지 확인) ──
-            # 단, 급락(SL의 1.5배 이상)이면 즉시 손절
-            deep_sl = position.stop_loss_pct * tracker.sl_deep_factor
-            if pnl_pct <= deep_sl:
-                logger.warning(
-                    f"[급락 즉시 손절] {position.symbol} {pnl_pct:+.2f}% <= "
-                    f"심화 SL {deep_sl:+.2f}%"
-                )
-                self._execute_sell(
-                    position, current_price, pnl_pct,
-                    f"급락 손절 ({pnl_pct:+.2f}% <= 심화SL {deep_sl:+.2f}%)",
-                )
-                self._exit_trackers.pop(position.id, None)
-                return
-
-            tracker.phase = _ExitPhase.OBSERVING_SL
-            tracker.sl_observation_count = 1
-            tracker.sl_min_pnl = pnl_pct
-            logger.info(
-                f"[손절 관찰 시작] {position.symbol} {pnl_pct:+.2f}% <= SL {position.stop_loss_pct}% "
-                f"| 반등 여부 관찰 중 (최대 {tracker.sl_max_observations}회)"
+        elif tracker.sl1_executed and pnl_pct <= position.stop_loss_pct:
+            # ── 2차 손절 도달 → 나머지 전량 매도 ──
+            logger.warning(
+                f"[2차 손절] {position.symbol} {pnl_pct:+.2f}% <= SL2 {position.stop_loss_pct}%"
             )
+            self._execute_sell(
+                position, current_price, pnl_pct,
+                f"2차 손절 ({pnl_pct:+.2f}% <= SL2 {position.stop_loss_pct}%)",
+            )
+            self._exit_trackers.pop(position.id, None)
+
+        elif not tracker.sl1_executed and pnl_pct <= sl_1st:
+            # ── 1차 손절 도달 → 50% 매도, 나머지 대기 ──
+            logger.warning(
+                f"[1차 손절] {position.symbol} {pnl_pct:+.2f}% <= SL1 {sl_1st}%"
+            )
+            self._execute_partial_sell(position, current_price, pnl_pct, ratio=0.5)
+            tracker.sl1_executed = True
 
         else:
             # 보유 중 — 주기적으로 전략 동적 조정
@@ -518,59 +519,68 @@ class TradingEngine:
             )
             self._exit_trackers.pop(position.id, None)
 
-    def _handle_observing_sl(
-        self, position: Position, current_price: float, pnl_pct: float, tracker: _ExitTracker,
+    def _execute_partial_sell(
+        self,
+        position: Position,
+        current_price: float,
+        pnl_pct: float,
+        ratio: float = 0.5,
     ) -> None:
-        """손절 관찰 상태 — 가짜 하락인지 진짜 하락인지 판단"""
-        tracker.sl_observation_count += 1
-        if pnl_pct < tracker.sl_min_pnl:
-            tracker.sl_min_pnl = pnl_pct
-
-        logger.debug(
-            f"[손절 관찰] {position.symbol} #{tracker.sl_observation_count}/"
-            f"{tracker.sl_max_observations} 현재={pnl_pct:+.2f}% "
-            f"최저={tracker.sl_min_pnl:+.2f}% SL={position.stop_loss_pct}%"
+        """포지션 일부(ratio 비율) 시장가 매도 — 1차 손절 전용"""
+        logger.info(
+            f"[1차 손절 실행] {position.symbol} "
+            f"수익={pnl_pct:+.2f}% | {ratio*100:.0f}% 매도"
         )
 
-        # ── 급락 → 즉시 손절 ──
-        deep_sl = position.stop_loss_pct * tracker.sl_deep_factor
-        if pnl_pct <= deep_sl:
-            logger.warning(f"[관찰 중 급락] {position.symbol} {pnl_pct:+.2f}% <= 심화SL {deep_sl:+.2f}%")
-            self._execute_sell(
-                position, current_price, pnl_pct,
-                f"관찰 중 급락 ({pnl_pct:+.2f}% <= 심화SL {deep_sl:+.2f}%)",
-            )
-            self._exit_trackers.pop(position.id, None)
+        actual_units = self._client.get_coin_balance(position.symbol)
+        if actual_units <= 0:
+            logger.warning(f"[1차 손절 스킵] {position.symbol} 잔고 0")
             return
 
-        # ── 반등 감지 → 손절 취소 (낚시: 물고기가 돌아옴) ──
-        recovery_threshold = position.stop_loss_pct + abs(position.stop_loss_pct) * 0.15
-        if pnl_pct > recovery_threshold:
-            logger.info(
-                f"[손절 취소] {position.symbol} 반등 감지! "
-                f"{pnl_pct:+.2f}% > 회복기준 {recovery_threshold:+.2f}% "
-                f"(최저 {tracker.sl_min_pnl:+.2f}%에서 반등)"
-            )
-            tracker.phase = _ExitPhase.MONITORING
-            tracker.sl_observation_count = 0
+        sell_units = actual_units * ratio
+        result = None
+        for attempt in range(1, 4):
+            result = self._client.market_sell(position.symbol, sell_units)
+            if result.get("status") == "0000":
+                break
+            logger.warning(f"[1차 손절 실패 {attempt}/3] {result}")
+            if attempt < 3:
+                time.sleep(2)
+                sell_units = self._client.get_coin_balance(position.symbol) * ratio
+
+        if result is None or result.get("status") != "0000":
+            logger.error(f"[1차 손절 최종 실패] {position.symbol} — 수동 확인 필요")
             if self._notifier:
                 try:
-                    self._notifier.send(
-                        f"🔄 <b>손절 취소</b> {position.symbol}\n"
-                        f"가짜 하락 감지 — {tracker.sl_min_pnl:+.2f}%에서 반등 → {pnl_pct:+.2f}%"
+                    self._notifier.notify_error(
+                        f"1차 손절 3회 실패: {position.symbol} {sell_units}개"
                     )
                 except Exception:
                     pass
             return
 
-        # ── 관찰 완료 → 하락 확인, 손절 실행 ──
-        if tracker.sl_observation_count >= tracker.sl_max_observations:
-            self._execute_sell(
-                position, current_price, pnl_pct,
-                f"손절 확인 ({tracker.sl_observation_count}회 관찰, "
-                f"최저 {tracker.sl_min_pnl:+.2f}%, 반등 없음)",
-            )
-            self._exit_trackers.pop(position.id, None)
+        krw_sold = current_price * sell_units
+        self._repo.save_trade(
+            symbol=position.symbol, side="sell",
+            price=current_price, units=sell_units,
+            krw_amount=krw_sold,
+            note=f"1차 손절 ({pnl_pct:+.2f}%, {ratio*100:.0f}% 매도)",
+        )
+
+        logger.info(
+            f"[1차 손절 완료] {position.symbol} {sell_units:.6f}개 @ {current_price:,.0f}원 "
+            f"| 수익: {pnl_pct:+.2f}% | 회수: {krw_sold:,.0f}원"
+        )
+        if self._notifier:
+            try:
+                self._notifier.send(
+                    f"⚠️ <b>1차 손절 실행</b> {position.symbol}\n"
+                    f"현재 수익: {pnl_pct:+.2f}% (1차 SL 도달)\n"
+                    f"보유량 50% 매도 완료 — 나머지 50% 반등 대기\n"
+                    f"2차 손절: {position.stop_loss_pct}%"
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _calc_trail_offset(current_pnl: float, original_tp: float) -> float:
@@ -604,6 +614,7 @@ class TradingEngine:
         self._last_adjust_time = now
 
         try:
+            tracker = self._exit_trackers.get(position.id, _ExitTracker())
             result = self._agent.should_adjust_strategy(
                 symbol=position.symbol,
                 buy_price=position.buy_price,
@@ -612,23 +623,28 @@ class TradingEngine:
                 holding_minutes=holding_minutes,
                 original_tp=position.take_profit_pct,
                 original_sl=position.stop_loss_pct,
+                original_sl_1st=position.stop_loss_1st_pct,
+                sl1_executed=tracker.sl1_executed,
             )
 
             if result.get("adjust"):
                 new_tp = result["new_take_profit_pct"]
                 new_sl = result["new_stop_loss_pct"]
+                new_sl_1st = result.get("new_stop_loss_1st_pct")
                 reason = result.get("reason", "AI 동적 조정")
 
                 logger.info(
                     f"[전략 조정] {position.symbol} "
                     f"익절 +{position.take_profit_pct}% → +{new_tp}%, "
-                    f"손절 {position.stop_loss_pct}% → {new_sl}% "
+                    f"1차SL {position.stop_loss_1st_pct}% → {new_sl_1st}%, "
+                    f"2차SL {position.stop_loss_pct}% → {new_sl}% "
                     f"({reason})"
                 )
 
                 # Position 업데이트 + 조정 기록 보존
                 self._update_position_targets(
                     position.id, new_tp, new_sl, reason,
+                    new_sl_1st=new_sl_1st,
                 )
                 self._last_adjustment = {
                     "adjusted_tp_pct": new_tp,
@@ -638,10 +654,12 @@ class TradingEngine:
 
                 if self._notifier:
                     try:
+                        sl1_str = f"\n1차SL: {position.stop_loss_1st_pct}% → {new_sl_1st}%" if new_sl_1st else ""
                         self._notifier.send(
                             f"🔄 <b>전략 조정</b> {position.symbol}\n"
-                            f"익절: +{position.take_profit_pct}% → +{new_tp}%\n"
-                            f"손절: {position.stop_loss_pct}% → {new_sl}%\n"
+                            f"익절: +{position.take_profit_pct}% → +{new_tp}%"
+                            f"{sl1_str}\n"
+                            f"2차SL: {position.stop_loss_pct}% → {new_sl}%\n"
                             f"사유: {reason}"
                         )
                     except Exception:
@@ -654,6 +672,7 @@ class TradingEngine:
 
     def _update_position_targets(
         self, position_id: int, new_tp: float, new_sl: float, reason: str,
+        new_sl_1st: float | None = None,
     ) -> None:
         """포지션의 익절/손절 기준을 DB에서 업데이트"""
         from database.models import SessionLocal, Position as PositionModel
@@ -664,6 +683,8 @@ class TradingEngine:
             if pos:
                 pos.take_profit_pct = new_tp
                 pos.stop_loss_pct = new_sl
+                if new_sl_1st is not None:
+                    pos.stop_loss_1st_pct = new_sl_1st
                 db.commit()
         except Exception:
             db.rollback()
@@ -682,6 +703,9 @@ class TradingEngine:
         reason: str,
     ) -> None:
         logger.info(f"[매도 실행] {reason}")
+        # sl1_executed 상태를 먼저 저장 후 tracker 제거
+        _tracker_snap = self._exit_trackers.get(position.id, _ExitTracker())
+        _sl1_was_executed = _tracker_snap.sl1_executed
         self._exit_trackers.pop(position.id, None)
 
         actual_units = self._client.get_coin_balance(position.symbol)
@@ -748,7 +772,10 @@ class TradingEngine:
                 pass
 
         # ── 매매 후 성과 평가 (Post-Trade Review) ──
-        self._run_post_trade_evaluation(position, current_price, pnl_pct, held_min, reason)
+        self._run_post_trade_evaluation(
+            position, current_price, pnl_pct, held_min, reason,
+            sl1_was_executed=_sl1_was_executed,
+        )
 
     # ------------------------------------------------------------------ #
     #  Post-Trade Evaluation                                               #
@@ -760,6 +787,7 @@ class TradingEngine:
         pnl_pct: float,
         held_minutes: float,
         reason: str,
+        sl1_was_executed: bool = False,
     ) -> None:
         """매도 후 AI에게 성과 평가를 요청하고 DB에 저장"""
         try:
@@ -770,6 +798,7 @@ class TradingEngine:
             else:
                 exit_type = "stop_loss"
             eval_stats = self._repo.get_evaluation_stats(last_n=10)
+            partial_executed = sl1_was_executed
 
             evaluation = self._agent.evaluate_trade(
                 symbol=position.symbol,
@@ -781,6 +810,8 @@ class TradingEngine:
                 original_tp=position.take_profit_pct,
                 original_sl=position.stop_loss_pct,
                 agent_reason=position.agent_reason or "",
+                original_sl_1st=position.stop_loss_1st_pct,
+                partial_sl_executed=partial_executed,
                 eval_stats=eval_stats,
             )
 
@@ -796,9 +827,11 @@ class TradingEngine:
                 exit_type=exit_type,
                 original_tp_pct=position.take_profit_pct,
                 original_sl_pct=position.stop_loss_pct,
+                original_sl_1st_pct=position.stop_loss_1st_pct,
                 evaluation=evaluation.evaluation,
                 suggested_tp_pct=evaluation.suggested_tp_pct,
                 suggested_sl_pct=evaluation.suggested_sl_pct,
+                suggested_sl_1st_pct=evaluation.suggested_sl_1st_pct,
                 lesson=evaluation.lesson,
                 adjusted_tp_pct=adj.get("adjusted_tp_pct"),
                 adjusted_sl_pct=adj.get("adjusted_sl_pct"),

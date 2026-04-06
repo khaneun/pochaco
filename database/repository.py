@@ -74,6 +74,7 @@ class TradeRepository:
         buy_krw: float,
         take_profit_pct: float,
         stop_loss_pct: float,
+        stop_loss_1st_pct: float | None = None,
         agent_reason: str = "",
         llm_provider: str = "",
     ) -> Position:
@@ -85,6 +86,7 @@ class TradeRepository:
             pos = Position(
                 symbol=symbol, units=units, buy_price=buy_price,
                 buy_krw=buy_krw, take_profit_pct=take_profit_pct,
+                stop_loss_1st_pct=stop_loss_1st_pct,
                 stop_loss_pct=stop_loss_pct, agent_reason=agent_reason,
                 llm_provider=llm_provider,
             )
@@ -277,6 +279,8 @@ class TradeRepository:
         evaluation: str,
         suggested_tp_pct: float,
         suggested_sl_pct: float,
+        original_sl_1st_pct: float | None = None,
+        suggested_sl_1st_pct: float | None = None,
         lesson: str = "",
         adjusted_tp_pct: float | None = None,
         adjusted_sl_pct: float | None = None,
@@ -289,6 +293,7 @@ class TradeRepository:
                 pnl_pct=pnl_pct, held_minutes=held_minutes,
                 exit_type=exit_type,
                 original_tp_pct=original_tp_pct,
+                original_sl_1st_pct=original_sl_1st_pct,
                 original_sl_pct=original_sl_pct,
                 evaluation=evaluation,
                 suggested_tp_pct=suggested_tp_pct,
@@ -370,6 +375,7 @@ class TradeRepository:
 
             # ── suggested 기반 적응형 clamp 범위 ──
             # 최근 제안값의 가중평균(최근일수록 2배 가중)으로 범위 결정
+            # 신규 전략: 2단계 손절 적용으로 SL2 범위 축소(-1.5~-4.5%), TP 범위 확대(2~6%)
             if len(evals) >= 3:
                 # 최근 것에 가중치 부여 (최신=2, 나머지=1)
                 weights = [2.0 if i < 3 else 1.0 for i in range(len(evals))]
@@ -377,13 +383,13 @@ class TradeRepository:
                 w_tp = sum(e.suggested_tp_pct * w for e, w in zip(evals, weights)) / w_sum
                 w_sl = sum(e.suggested_sl_pct * w for e, w in zip(evals, weights)) / w_sum
 
-                tp_clamp_min = max(0.8, round(w_tp - 1.0, 1))
-                tp_clamp_max = min(4.0, round(w_tp + 1.0, 1))
-                sl_clamp_min = max(-7.0, round(w_sl - 1.5, 1))
-                sl_clamp_max = min(-1.5, round(w_sl + 1.0, 1))
+                tp_clamp_min = max(1.5, round(w_tp - 1.0, 1))
+                tp_clamp_max = min(6.5, round(w_tp + 1.5, 1))
+                sl_clamp_min = max(-5.0, round(w_sl - 1.0, 1))
+                sl_clamp_max = min(-1.0, round(w_sl + 0.5, 1))
             else:
-                tp_clamp_min, tp_clamp_max = 1.0, 3.5
-                sl_clamp_min, sl_clamp_max = -6.0, -2.0
+                tp_clamp_min, tp_clamp_max = 2.0, 6.0
+                sl_clamp_min, sl_clamp_max = -4.5, -1.5
 
             return {
                 "count": len(evals),

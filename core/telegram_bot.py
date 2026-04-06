@@ -110,15 +110,21 @@ class TelegramBot:
         reason: str,
         take_profit_pct: float,
         stop_loss_pct: float,
+        stop_loss_1st_pct: float | None = None,
         llm_provider: str = "",
     ) -> None:
+        sl_info = (
+            f"1차SL {stop_loss_1st_pct}% (50%) → 2차SL {stop_loss_pct}% (전량)"
+            if stop_loss_1st_pct
+            else f"손절 {stop_loss_pct}%"
+        )
         self.send(
             f"🟢 <b>매수 완료</b>\n"
             f"코인: <b>{symbol}</b>\n"
             f"수량: {units:.6f}개\n"
             f"매수가: {price:,.0f} 원\n"
             f"투입: {krw_amount:,.0f} 원\n"
-            f"목표: 익절 +{take_profit_pct}% / 손절 {stop_loss_pct}%\n"
+            f"목표: 익절 +{take_profit_pct}% / {sl_info}\n"
             f"AI 이유: {reason[:80]}\n"
             f"LLM: {llm_provider}"
         )

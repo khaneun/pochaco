@@ -52,7 +52,8 @@ class Position(Base):
     buy_price = Column(Float, nullable=False)
     buy_krw = Column(Float, nullable=False)
     take_profit_pct = Column(Float, nullable=False)
-    stop_loss_pct = Column(Float, nullable=False)
+    stop_loss_1st_pct = Column(Float, nullable=True)   # 1차 손절 (50% 매도)
+    stop_loss_pct = Column(Float, nullable=False)       # 2차 손절 (전량 매도)
     agent_reason = Column(Text)
     llm_provider = Column(String(50), default="")   # 사용된 LLM 기록
     opened_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -93,7 +94,8 @@ class StrategyEvaluation(Base):
 
     # 원래 설정
     original_tp_pct = Column(Float, nullable=False)
-    original_sl_pct = Column(Float, nullable=False)
+    original_sl_1st_pct = Column(Float, nullable=True)  # 1차 손절%
+    original_sl_pct = Column(Float, nullable=False)      # 2차 손절%
 
     # AI 평가 결과
     evaluation = Column(Text, nullable=False)            # AI 평가 텍스트
@@ -157,3 +159,24 @@ def _make_engine() -> Engine:
 engine = _make_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base.metadata.create_all(engine)
+
+
+def _migrate_schema() -> None:
+    """기존 DB에 누락된 컬럼 자동 추가 (SQLite ALTER TABLE)"""
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    migrations = [
+        ("positions", "stop_loss_1st_pct", "REAL"),
+        ("strategy_evaluations", "original_sl_1st_pct", "REAL"),
+    ]
+    with engine.connect() as conn:
+        for table, col, coltype in migrations:
+            try:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+                conn.commit()
+                _log.info(f"[DB Migration] {table}.{col} 컬럼 추가 완료")
+            except Exception:
+                pass  # 이미 존재하는 컬럼은 무시
+
+
+_migrate_schema()

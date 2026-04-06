@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 class AgentDecision:
     symbol: str
     take_profit_pct: float
-    stop_loss_pct: float
+    stop_loss_1st_pct: float    # 1차 손절 (50% 매도)
+    stop_loss_pct: float        # 2차 손절 (전량 매도)
     confidence: float
     reason: str
     llm_provider: str = ""      # 어떤 LLM이 결정했는지 기록
@@ -27,10 +28,11 @@ class AgentDecision:
 @dataclass
 class TradeEvaluation:
     """매매 후 AI 평가 결과"""
-    evaluation: str             # 평가 텍스트
-    suggested_tp_pct: float     # 다음 매매에 제안하는 익절%
-    suggested_sl_pct: float     # 다음 매매에 제안하는 손절%
-    lesson: str                 # 핵심 교훈 한 줄
+    evaluation: str              # 평가 텍스트
+    suggested_tp_pct: float      # 다음 매매에 제안하는 익절%
+    suggested_sl_1st_pct: float  # 다음 매매에 제안하는 1차 손절%
+    suggested_sl_pct: float      # 다음 매매에 제안하는 2차 손절%
+    lesson: str                  # 핵심 교훈 한 줄
 
 
 class TradingAgent:
@@ -135,30 +137,43 @@ class TradingAgent:
         market_text = self._snapshots_to_text(snapshots, scores=coin_scores)
         history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
 
-        # clamp 범위가 있으면 적용 (StrategyOptimizer 또는 repository에서 주입)
+        # clamp 범위 결정 (StrategyOptimizer 또는 repository에서 주입)
+        # 신규 전략: 2단계 손절 (SL1 50%매도 + SL2 전량매도), 익절 범위 상향
         has_clamp = eval_stats and "tp_clamp_min" in eval_stats
         if has_clamp:
-            tp_min = eval_stats.get("tp_clamp_min", 1.0)
-            tp_max = eval_stats.get("tp_clamp_max", 3.5)
-            sl_min = eval_stats.get("sl_clamp_min", -6.0)
-            sl_max = eval_stats.get("sl_clamp_max", -2.0)
+            tp_min = eval_stats.get("tp_clamp_min", 2.0)
+            tp_max = eval_stats.get("tp_clamp_max", 6.0)
+            sl1_min = eval_stats.get("sl_clamp_min", -4.5)
+            sl1_max = eval_stats.get("sl_clamp_max", -1.5)
+            # SL2는 SL1보다 0.3%~1.5% 더 아래
+            sl2_min = max(-5.5, sl1_min - 1.5)
+            sl2_max = min(-1.8, sl1_max - 0.3)
             tp_guide = (
                 f"- 익절(take_profit_pct): 전략 최적화 범위 **+{tp_min:.1f}%~+{tp_max:.1f}%** 내에서 설정 (필수)\n"
-                f"- 손절(stop_loss_pct): 전략 최적화 범위 **{sl_min:.1f}%~{sl_max:.1f}%** 내에서 설정 (필수)"
+                f"- 1차 손절(sl_1st_pct): **{sl1_min:.1f}%~{sl1_max:.1f}%** — 도달 시 보유량의 50%만 매도\n"
+                f"- 2차 손절(sl_2nd_pct): **{sl2_min:.1f}%~{sl2_max:.1f}%** — 도달 시 나머지 전량 매도 (반드시 1차보다 더 낮은 음수)"
             )
-            rr_guide = "- 승률 중심 전략: 익절은 낮게 빠르게, 손절은 넓게 느리게 (작은 수익 다수 > 큰 수익 소수)"
+            rr_guide = "- 2단계 손절 전략: 최대 실효 손실을 줄여 더 큰 익절 목표 가능. 수익이 클수록 전략 성과 극대화."
         else:
-            tp_min, tp_max = 1.0, 3.5
-            sl_min, sl_max = -6.0, -2.0
+            tp_min, tp_max = 2.0, 6.0
+            sl1_min, sl1_max = -3.0, -1.0
+            sl2_min, sl2_max = -4.5, -1.5
             tp_guide = (
-                "- 익절(take_profit_pct): 1.0%~3.5% 범위에서 달성 가능하게 설정\n"
-                "- 손절(stop_loss_pct): -2.0%~-6.0% 범위에서 넉넉하게 설정"
+                "- 익절(take_profit_pct): 2.0%~6.0% 범위에서 달성 가능하게 설정 (더 큰 익절이 더 큰 수익)\n"
+                "- 1차 손절(sl_1st_pct): -1.0%~-3.0% 범위 — 도달 시 보유량의 50%만 매도 (기준: -2% 전후)\n"
+                "- 2차 손절(sl_2nd_pct): -1.5%~-4.5% 범위 — 도달 시 나머지 전량 매도 (기준: -2.5% 전후, 1차보다 반드시 더 낮은 음수)"
             )
-            rr_guide = "- 승률 중심 전략: 익절은 낮게 빠르게, 손절은 넓게 느리게"
+            rr_guide = "- 2단계 손절 전략: 1차에서 50% 자른 뒤 반등 기회 유지. 익절은 크게 노려 수익 극대화."
 
         prompt = f"""당신은 단기 변동성 매매 전문 트레이더입니다.
-전략: 코인 1개를 전액 매수 → 익절 또는 손절 시 전량 매도 → 즉시 반복.
+전략: 코인 1개를 전액 매수 → 2단계 손절 또는 익절 시 매도 → 즉시 반복.
 수익은 오직 가격 변동성에서만 나옵니다.
+
+【2단계 손절 전략 설명】
+- 1차 손절(sl_1st_pct) 도달 → 보유량 50%만 매도 → 나머지 50%는 반등 대기
+- 2차 손절(sl_2nd_pct) 도달 → 나머지 전량 매도
+- 실효 최대 손실 = sl_1st × 50% + sl_2nd × 50% (단순 손절보다 훨씬 유리)
+- 따라서 익절 목표를 더 크게 잡아 수익을 극대화해야 함
 
 아래는 빗썸 거래소 상위 코인의 실시간 시장 데이터입니다.
 
@@ -166,8 +181,8 @@ class TradingAgent:
 {history_text}
 
 **코인 선정 기준 (우선순위 순)**
-1. **변동폭 vs 익절 현실성** — 변동폭이 목표 익절%의 1.5배 이상인 코인만 선정 (예: 익절 2% 목표 시 변동폭 3% 이상 필수). 변동폭이 작은 코인은 절대 선정 금지
-2. **최근 익절 종목 재선정 절대 금지** — 위 과거 거래 목록에서 【익절 직후】로 표시된 종목은 어떤 상황에서도 선정하지 마세요. 익절 후 같은 종목은 이미 모멘텀이 소진되어 되돌림 가능성이 높습니다
+1. **변동폭 vs 익절 현실성** — 변동폭이 목표 익절%의 1.5배 이상인 코인만 선정 (예: 익절 3% 목표 시 변동폭 4.5% 이상 필수). 변동폭이 작은 코인은 절대 선정 금지
+2. **최근 익절 종목 재선정 절대 금지** — 위 과거 거래 목록에서 【익절 직후】로 표시된 종목은 어떤 상황에서도 선정하지 마세요
 3. 강한 단기 상승 모멘텀 — 현재가위치가 50~80% 구간이고, 모멘텀이 양수인 코인 최우선. 스코어가 높은 코인을 우선 검토하세요
 4. 거래대금 충분 — 최소 50억원/24h 이상
 5. 하락 중인 코인은 절대 선정 금지 — 24h 변동률이 음수이거나 현재가위치가 20% 이하인 코인 제외
@@ -176,13 +191,14 @@ class TradingAgent:
 {rr_guide}
 {tp_guide}
 - 수수료(매수+매도 약 0.4%) 감안 후에도 순이익이 발생해야 함
-- **핵심: 익절은 낮고 빠르게, 손절은 넓고 느리게. 야금야금 손절 방지가 최우선.**
+- **핵심: 2단계 손절로 리스크를 줄였으니 익절은 크게! sl_2nd는 sl_1st보다 반드시 더 낮은 음수여야 함.**
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "symbol": "코인심볼(예:BTC)",
-  "take_profit_pct": 익절퍼센트(숫자, 예:3.5),
-  "stop_loss_pct": 손절퍼센트(음수숫자, 예:-1.5),
+  "take_profit_pct": 익절퍼센트(숫자, 예:4.0),
+  "sl_1st_pct": 1차손절퍼센트(음수숫자, 예:-2.0),
+  "sl_2nd_pct": 2차손절퍼센트(음수숫자, sl_1st보다 더낮은음수, 예:-2.5),
   "confidence": 확신도(0.0~1.0),
   "reason": "선정 이유 (한국어, 100자 이내) — 상승 모멘텀 근거 포함"
 }}"""
@@ -197,21 +213,27 @@ class TradingAgent:
 
             symbol = data["symbol"].upper()
             take_profit_pct = float(data["take_profit_pct"])
-            stop_loss_pct = float(data["stop_loss_pct"])
+            sl_1st = float(data.get("sl_1st_pct", data.get("stop_loss_pct", sl1_max)))
+            sl_2nd = float(data.get("sl_2nd_pct", data.get("stop_loss_pct", sl2_max)))
             confidence = float(data.get("confidence", 0.5))
             reason = data.get("reason", "")
 
-            # ── 안전장치: 전략 최적화 범위 clamp ──
-            # tp_min/tp_max, sl_min/sl_max는 StrategyOptimizer 또는 기본값
-            if stop_loss_pct > 0:
-                stop_loss_pct = -abs(stop_loss_pct)
-            if stop_loss_pct > sl_max:
-                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → {sl_max}% (범위 초과)")
-                stop_loss_pct = sl_max
-            if stop_loss_pct < sl_min:
-                logger.warning(f"[AI 보정] stop_loss {stop_loss_pct}% → {sl_min}% (범위 초과)")
-                stop_loss_pct = sl_min
+            # ── 안전장치: 음수 보장 ──
+            if sl_1st > 0:
+                sl_1st = -abs(sl_1st)
+            if sl_2nd > 0:
+                sl_2nd = -abs(sl_2nd)
 
+            # ── SL1 clamp ──
+            sl_1st = max(sl1_min, min(sl1_max, sl_1st))
+
+            # ── SL2 clamp: SL1보다 0.2% 이상 더 낮아야 함 ──
+            sl_2nd = max(sl2_min, min(sl2_max, sl_2nd))
+            if sl_2nd >= sl_1st - 0.2:
+                sl_2nd = round(sl_1st - 0.3, 2)
+                logger.warning(f"[AI 보정] sl_2nd를 sl_1st({sl_1st}%) - 0.3% → {sl_2nd}%로 보정")
+
+            # ── TP clamp ──
             if take_profit_pct < tp_min:
                 logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → {tp_min}% (범위 하한)")
                 take_profit_pct = tp_min
@@ -219,16 +241,18 @@ class TradingAgent:
                 logger.warning(f"[AI 보정] take_profit {take_profit_pct}% → {tp_max}% (범위 상한)")
                 take_profit_pct = tp_max
 
-            # R:R 최소 1:1 보정 (승률 중심 전략 — 2:1 요구 제거)
-            rr_ratio = take_profit_pct / abs(stop_loss_pct) if stop_loss_pct != 0 else 99
-            if rr_ratio < 1.0:
-                take_profit_pct = abs(stop_loss_pct) * 1.0
-                logger.warning(f"[AI 보정] R:R 1:1 미달 → take_profit={take_profit_pct}%")
+            # ── 실효 R:R 체크: TP / 실효손실(SL1×50%+SL2×50%) ──
+            effective_loss = abs(sl_1st) * 0.5 + abs(sl_2nd) * 0.5
+            rr_ratio = take_profit_pct / effective_loss if effective_loss > 0 else 99
+            if rr_ratio < 0.8:
+                take_profit_pct = round(effective_loss * 0.8, 2)
+                logger.warning(f"[AI 보정] R:R 0.8 미달 → take_profit={take_profit_pct}%")
 
             return AgentDecision(
                 symbol=symbol,
                 take_profit_pct=round(take_profit_pct, 2),
-                stop_loss_pct=round(stop_loss_pct, 2),
+                stop_loss_1st_pct=round(sl_1st, 2),
+                stop_loss_pct=round(sl_2nd, 2),
                 confidence=confidence,
                 reason=reason,
                 llm_provider=self.provider_name,
@@ -251,6 +275,8 @@ class TradingAgent:
         original_tp: float,
         original_sl: float,
         agent_reason: str,
+        original_sl_1st: float | None = None,
+        partial_sl_executed: bool = False,
         eval_stats: dict | None = None,
     ) -> TradeEvaluation:
         """매매 완료 후 성과를 평가하고 다음 전략 파라미터를 제안"""
@@ -261,35 +287,44 @@ class TradingAgent:
 최근 {eval_stats['count']}건 누적 성과:
 - 승률: {eval_stats['win_rate']:.0%}, 평균 수익률: {eval_stats['avg_pnl_pct']:+.2f}%
 - 평균 보유시간: {eval_stats['avg_hold_minutes']:.0f}분
-- 평균 익절 설정: +{eval_stats['avg_tp_set']:.1f}%, 평균 손절 설정: {eval_stats['avg_sl_set']:.1f}%"""
+- 평균 익절 설정: +{eval_stats['avg_tp_set']:.1f}%, 평균 2차 손절 설정: {eval_stats['avg_sl_set']:.1f}%"""
+
+        sl1_info = f"{original_sl_1st}%" if original_sl_1st else "미설정"
+        partial_info = "예 (1차 손절 50% 실행됨)" if partial_sl_executed else "아니오"
 
         prompt = f"""당신은 트레이딩 전략 평가 전문가입니다.
-아래 매매 결과를 분석하고, 다음 매매를 위한 전략 파라미터를 제안하세요.
+아래 매매 결과를 분석하고, 다음 매매를 위한 2단계 손절 파라미터를 제안하세요.
 
-**전략 방향 (준수):**
-- 익절은 낮고 빠르게 (1.0%~3.5%) — 달성 못 하면 결국 손절만 반복됨
-- 손절은 넓고 느리게 (2.0%~6.0%) — 반등 기회 충분히 대기
+**2단계 손절 전략:**
+- 1차 손절(sl_1st_pct): 도달 시 보유량 50% 매도 → 나머지 반등 대기
+- 2차 손절(sl_2nd_pct): 도달 시 나머지 전량 매도 (1차보다 더 낮은 음수)
+- 실효 최대 손실 = sl_1st × 50% + sl_2nd × 50%
+- 익절(take_profit_pct): 더 큰 목표 (2.0%~6.0%) — 손실 분산으로 더 큰 이익 추구
 
 **이번 매매 결과:**
 - 코인: {symbol}
 - 매수가: {buy_price:,.0f}원 → 매도가: {sell_price:,.0f}원
 - 실현 수익률: {pnl_pct:+.2f}%
 - 보유 시간: {held_minutes:.0f}분 ({held_minutes/60:.1f}시간)
-- 종료 유형: {"익절 달성" if exit_type == "take_profit" else "손절 발동"}
-- 원래 익절 기준: +{original_tp}%, 원래 손절 기준: {original_sl}%
+- 종료 유형: {"익절 달성" if exit_type == "take_profit" else "손절 발동" if exit_type == "stop_loss" else "시간초과"}
+- 1차 손절 실행 여부: {partial_info}
+- 원래 익절 기준: +{original_tp}%
+- 원래 1차 손절: {sl1_info}, 2차 손절: {original_sl}%
 - AI 선정 이유: {agent_reason}
 {history_summary}
 
 **평가 관점:**
-1. 익절이 너무 높아서 도달하지 못했는가? → 낮추기
-2. 손절이 너무 좁아서 야금야금 손절됐는가? → 넓히기
-3. 보유 시간이 길었다면 익절이 높았던 것 → 낮추기
+1. 익절이 너무 높아서 도달하지 못했는가? → 낮추기 (단, 최소 2.0% 유지)
+2. 1차 손절이 너무 좁아서 바로 50% 팔렸는가? → 넓히기 (-2.5%~-1.0% 범위)
+3. 2차 손절이 너무 좁아서 반등 없이 전부 팔렸는가? → 넓히기
+4. 보유 시간이 길었다면 익절을 낮춰 빠른 수익 실현 도모
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "evaluation": "이번 매매에 대한 평가 (한국어, 150자 이내)",
-  "suggested_tp_pct": 다음매매추천익절퍼센트(숫자, 1.0~4.0 범위),
-  "suggested_sl_pct": 다음매매추천손절퍼센트(음수숫자, -2.0~-6.0 범위),
+  "suggested_tp_pct": 다음매매추천익절퍼센트(숫자, 2.0~7.0 범위),
+  "suggested_sl_1st_pct": 다음매매추천1차손절퍼센트(음수, -1.0~-3.5 범위),
+  "suggested_sl_pct": 다음매매추천2차손절퍼센트(음수, -1.5~-5.0 범위, 1차보다 더낮은음수),
   "lesson": "핵심 교훈 한 줄 (한국어, 50자 이내)"
 }}"""
 
@@ -302,17 +337,26 @@ class TradingAgent:
             data = json.loads(clean)
 
             suggested_tp = float(data.get("suggested_tp_pct", original_tp))
+            suggested_sl_1st = float(data.get("suggested_sl_1st_pct",
+                                               original_sl_1st if original_sl_1st else -2.0))
             suggested_sl = float(data.get("suggested_sl_pct", original_sl))
 
-            # 범위 보정 (낮은 익절, 넓은 손절 전략)
-            suggested_tp = max(1.0, min(4.0, suggested_tp))
+            # 범위 보정
+            suggested_tp = max(2.0, min(7.0, suggested_tp))
+            if suggested_sl_1st > 0:
+                suggested_sl_1st = -abs(suggested_sl_1st)
             if suggested_sl > 0:
                 suggested_sl = -abs(suggested_sl)
-            suggested_sl = max(-6.0, min(-2.0, suggested_sl))
+            suggested_sl_1st = max(-3.5, min(-1.0, suggested_sl_1st))
+            suggested_sl = max(-5.0, min(-1.5, suggested_sl))
+            # SL2는 SL1보다 0.2% 이상 낮아야 함
+            if suggested_sl >= suggested_sl_1st - 0.2:
+                suggested_sl = suggested_sl_1st - 0.3
 
             return TradeEvaluation(
                 evaluation=data.get("evaluation", "평가 없음"),
                 suggested_tp_pct=round(suggested_tp, 2),
+                suggested_sl_1st_pct=round(suggested_sl_1st, 2),
                 suggested_sl_pct=round(suggested_sl, 2),
                 lesson=data.get("lesson", ""),
             )
@@ -321,6 +365,7 @@ class TradingAgent:
             return TradeEvaluation(
                 evaluation=f"파싱 실패 — 기존 전략 유지 ({e})",
                 suggested_tp_pct=round(original_tp, 2),
+                suggested_sl_1st_pct=round(original_sl_1st if original_sl_1st else -2.0, 2),
                 suggested_sl_pct=round(original_sl, 2),
                 lesson="",
             )
@@ -337,6 +382,8 @@ class TradingAgent:
         holding_minutes: int,
         original_tp: float,
         original_sl: float,
+        original_sl_1st: float | None = None,
+        sl1_executed: bool = False,
     ) -> dict:
         """포지션 보유 중 익절/손절 기준 조정 여부를 LLM에게 질의
 
@@ -359,35 +406,41 @@ class TradingAgent:
         else:
             time_guidance = (
                 "보유 시간이 6시간 이상으로 매우 깁니다. "
-                "현재 수익이 +1% 이상이면 즉시 익절을, 손실이면 손절선 상향을 강력히 권장합니다."
+                "현재 수익이 +1% 이상이면 즉시 익절을, 손실이면 2차 손절선 상향을 강력히 권장합니다."
             )
 
-        prompt = f"""현재 보유 포지션:
+        sl1_info = f"{original_sl_1st}%" if original_sl_1st else "미설정"
+        sl1_status = "1차 손절 이미 실행됨 (50% 매도 완료, 나머지 50% 보유 중)" if sl1_executed else "1차 손절 미실행"
+
+        prompt = f"""현재 보유 포지션 (2단계 손절 전략):
 - 코인: {symbol}
 - 매수가: {buy_price:,.0f}원
 - 현재가: {current_price:,.0f}원
 - 현재 수익률: {current_pnl_pct:+.2f}%
 - 보유 시간: {holding_minutes}분 ({holding_minutes/60:.1f}시간)
 - 원래 익절 기준: +{original_tp}%
-- 원래 손절 기준: {original_sl}%
+- 원래 1차 손절: {sl1_info} (50% 매도 포인트)
+- 원래 2차 손절: {original_sl}% (전량 매도 포인트)
+- 현재 상태: {sl1_status}
 
 **시간 기반 가이드라인:** {time_guidance}
 
 **조정 원칙:**
-- 익절은 낮추는 방향 — 오래 보유할수록 익절 낮추기
-- 손절은 유지 또는 살짝 넓히기 — 좁히지 마세요
+- 익절은 낮추는 방향 — 오래 보유할수록 익절 낮추기 (최소 +1.5% 유지)
+- 1차 손절은 현재 수익률보다 낮게 유지 (이미 실행됐다면 조정 불필요)
+- 2차 손절은 1차보다 0.3% 이상 더 낮아야 함
 - 현재 수익이 있다면 수익 확보 위해 익절 낮추기 검토
-- 수수료(0.4%) 감안 최소 +0.8% 이상의 익절선 유지
 
 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "adjust": true 또는 false,
   "new_take_profit_pct": 숫자(조정 불필요 시 원래값),
-  "new_stop_loss_pct": 숫자(조정 불필요 시 원래값),
+  "new_stop_loss_1st_pct": 음수숫자(1차손절, 조정 불필요 시 원래값),
+  "new_stop_loss_pct": 음수숫자(2차손절, 조정 불필요 시 원래값),
   "reason": "이유 (한국어, 50자 이내)"
 }}"""
 
-        raw = self._llm.chat(prompt, max_tokens=256)
+        raw = self._llm.chat(prompt, max_tokens=300)
         logger.info(f"AI 전략 조정 응답: {raw}")
         try:
             clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -395,13 +448,23 @@ class TradingAgent:
 
             if data.get("adjust"):
                 new_tp = float(data.get("new_take_profit_pct", original_tp))
+                new_sl_1st = float(data.get("new_stop_loss_1st_pct",
+                                             original_sl_1st if original_sl_1st else original_sl * 0.8))
                 new_sl = float(data.get("new_stop_loss_pct", original_sl))
-                # 안전장치 (익절 낮게, 손절 넓게)
-                new_tp = max(0.8, min(5.0, new_tp))
+
+                # 안전장치
+                new_tp = max(1.5, min(8.0, new_tp))
+                if new_sl_1st > 0:
+                    new_sl_1st = -abs(new_sl_1st)
                 if new_sl > 0:
                     new_sl = -abs(new_sl)
-                new_sl = max(-8.0, min(-0.5, new_sl))
+                new_sl_1st = max(-5.0, min(-0.8, new_sl_1st))
+                new_sl = max(-6.0, min(-1.0, new_sl))
+                if new_sl >= new_sl_1st - 0.2:
+                    new_sl = new_sl_1st - 0.3
+
                 data["new_take_profit_pct"] = round(new_tp, 2)
+                data["new_stop_loss_1st_pct"] = round(new_sl_1st, 2)
                 data["new_stop_loss_pct"] = round(new_sl, 2)
 
             return data
@@ -409,6 +472,7 @@ class TradingAgent:
             return {
                 "adjust": False,
                 "new_take_profit_pct": original_tp,
+                "new_stop_loss_1st_pct": original_sl_1st if original_sl_1st else original_sl * 0.8,
                 "new_stop_loss_pct": original_sl,
                 "reason": "파싱 실패, 기존 전략 유지",
             }
