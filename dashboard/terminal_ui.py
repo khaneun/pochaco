@@ -199,12 +199,19 @@ class Dashboard:
             )
         try:
             cur_price = self._client.get_current_price(pos.symbol)
+            # 실제 거래소 잔고 기준 (1차 손절 후 pos.units는 원래 수량이라 부정확)
+            actual_units = self._client.get_coin_balance(pos.symbol)
+            if actual_units <= 0:
+                actual_units = pos.units  # 조회 실패 시 fallback
             pnl_pct = (cur_price - pos.buy_price) / pos.buy_price * 100
-            pnl_krw = (cur_price - pos.buy_price) * pos.units
+            pnl_krw = (cur_price - pos.buy_price) * actual_units
             pnl_color = "green" if pnl_pct >= 0 else "red"
 
             held_min = (datetime.utcnow() - pos.opened_at).total_seconds() / 60
             held_str = f"{held_min / 60:.1f}시간" if held_min >= 60 else f"{held_min:.0f}분"
+
+            # 1차 손절 실행 여부 감지
+            sl1_executed = pos.units > 0 and (actual_units / pos.units) < 0.75
 
             # 익절 목표 대비 진행률 바
             progress = min(1.0, max(0.0, pnl_pct / pos.take_profit_pct)) if pos.take_profit_pct > 0 else 0.0
@@ -219,7 +226,10 @@ class Dashboard:
             tbl.add_column("항목", style="dim", ratio=2)
             tbl.add_column("값", ratio=3)
 
-            tbl.add_row("코인 / 수량", Text(f"{pos.symbol}  {pos.units:.6f}개", style="bold"))
+            units_label = f"{pos.symbol}  {actual_units:.6f}개"
+            if sl1_executed:
+                units_label += "  [yellow](1차손절 실행 — 50% 잔여)[/yellow]"
+            tbl.add_row("코인 / 수량", Text.from_markup(f"[bold]{units_label}[/bold]"))
             tbl.add_row(
                 "매수가 → 현재가",
                 f"{pos.buy_price:,.0f}  →  [bold]{cur_price:,.0f}[/bold] 원",
@@ -230,7 +240,15 @@ class Dashboard:
             pnl_val.append(f"  ({pnl_krw:+,.0f} 원)", style=pnl_color)
             tbl.add_row("평가 손익", pnl_val)
 
-            tbl.add_row("익절 / 손절 기준", f"[green]+{pos.take_profit_pct:.1f}%[/green]  /  [red]{pos.stop_loss_pct:.1f}%[/red]")
+            # 손절 기준: SL1 → SL2 형태로 표시
+            if pos.stop_loss_1st_pct:
+                sl_display = (
+                    f"[yellow]{pos.stop_loss_1st_pct:.1f}%[/yellow] 50%"
+                    f"  →  [red]{pos.stop_loss_pct:.1f}%[/red] 전량"
+                )
+            else:
+                sl_display = f"[red]{pos.stop_loss_pct:.1f}%[/red]"
+            tbl.add_row("익절 / 손절 기준", f"[green]+{pos.take_profit_pct:.1f}%[/green]  /  {sl_display}")
             tbl.add_row("보유 시간", held_str)
             tbl.add_row("익절 달성률", bar_text)
             tbl.add_row("AI 선정 이유", Text((pos.agent_reason or "")[:55], style="dim italic"))

@@ -61,22 +61,51 @@ def _build_json_status(client: "BithumbClient") -> dict:
         position_data = None
 
         pos: Position | None = repo.get_open_position()
+
+        # ── 거래소 실제 보유 코인 잔고 (1차 손절 후 실잔고 반영을 위해 먼저 조회) ──
+        pos_symbol = pos.symbol if pos else ""
+        holdings = []
+        actual_coin_units: dict[str, float] = {}  # sym → 실제 보유 수량
+        try:
+            bal_data = client.get_balance("ALL")
+            if bal_data.get("status") == "0000":
+                for key, value in bal_data["data"].items():
+                    if not key.startswith("available_"):
+                        continue
+                    sym = key.replace("available_", "").upper()
+                    if sym == "KRW":
+                        continue
+                    amt = float(value)
+                    if amt <= 0:
+                        continue
+                    actual_coin_units[sym] = amt
+        except Exception:
+            pass
+
         if pos:
             try:
                 cur = client.get_current_price(pos.symbol)
+                # 실제 보유 수량 사용 (1차 손절 후 pos.units는 원래 수량이라 부정확)
+                actual_units = actual_coin_units.get(pos.symbol, pos.units)
                 pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100
-                pnl_krw = (cur - pos.buy_price) * pos.units
-                pos_value = pos.units * cur
+                pnl_krw = (cur - pos.buy_price) * actual_units
+                pos_value = actual_units * cur
                 total = krw + pos_value
                 held_min = (datetime.now(tz=timezone.utc) - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60
+                # 1차 손절 여부: DB 원래 수량 대비 실잔고가 40~60% 사이면 부분 청산 상태
+                sl1_ratio = actual_units / pos.units if pos.units > 0 else 1.0
+                sl1_executed = sl1_ratio < 0.75  # 원래 수량의 75% 미만이면 1차 손절 실행됨
                 position_data = {
                     "symbol": pos.symbol,
-                    "units": round(pos.units, 2),
+                    "units": round(actual_units, 6),
+                    "units_original": round(pos.units, 6),
+                    "sl1_executed": sl1_executed,
                     "buy_price": pos.buy_price,
                     "current_price": cur,
                     "pnl_pct": round(pnl_pct, 2),
                     "pnl_krw": round(pnl_krw, 0),
                     "take_profit_pct": pos.take_profit_pct,
+                    "stop_loss_1st_pct": pos.stop_loss_1st_pct,
                     "stop_loss_pct": pos.stop_loss_pct,
                     "held_minutes": round(held_min, 1),
                     "agent_reason": pos.agent_reason or "",
@@ -84,6 +113,23 @@ def _build_json_status(client: "BithumbClient") -> dict:
                 }
             except Exception:
                 pass
+
+        # holdings 목록 구성 (position 코인은 이미 total에 합산 → 중복 방지)
+        for sym, amt in actual_coin_units.items():
+            try:
+                px = client.get_current_price(sym)
+                kv = amt * px
+                if kv >= 100:
+                    holdings.append({
+                        "symbol": sym,
+                        "units": amt,
+                        "price": px,
+                        "krw_value": round(kv, 0),
+                    })
+                    if sym != pos_symbol:
+                        total += kv
+            except Exception:
+                holdings.append({"symbol": sym, "units": amt, "price": 0, "krw_value": 0})
 
         stats = repo.get_total_stats()
         recent_trades = repo.get_all_trades(limit=100)
@@ -134,39 +180,6 @@ def _build_json_status(client: "BithumbClient") -> dict:
             }
             for ev in recent_evals
         ]
-
-        # 거래소 실제 보유 코인 (position 코인은 이미 total에 포함 → 중복 방지)
-        pos_symbol = pos.symbol if pos else ""
-        holdings = []
-        try:
-            bal_data = client.get_balance("ALL")
-            if bal_data.get("status") == "0000":
-                for key, value in bal_data["data"].items():
-                    if not key.startswith("available_"):
-                        continue
-                    sym = key.replace("available_", "").upper()
-                    if sym == "KRW":
-                        continue
-                    amt = float(value)
-                    if amt <= 0:
-                        continue
-                    try:
-                        px = client.get_current_price(sym)
-                        kv = amt * px
-                        if kv >= 100:
-                            holdings.append({
-                                "symbol": sym,
-                                "units": amt,
-                                "price": px,
-                                "krw_value": round(kv, 0),
-                            })
-                            # position 코인은 이미 위에서 total에 합산됨 → 건너뜀
-                            if sym != pos_symbol:
-                                total += kv
-                    except Exception:
-                        holdings.append({"symbol": sym, "units": amt, "price": 0, "krw_value": 0})
-        except Exception:
-            pass
 
         return {
             "updated_at": _kst_now().strftime("%m-%d %H:%M:%S"),
@@ -458,15 +471,16 @@ def _render_html(data: dict) -> str:
 
     total_pnl_color = "green" if perf["total_pnl_pct"] >= 0 else "red"
 
-    # 포지션 평가액 줄 (코인명 + 평가금액 + 개수)
+    # 포지션 평가액 줄 (코인명 + 평가금액 + 실보유 수량)
     pos_asset_line = ""
     pos_symbol = ""
     if pos:
         pos_symbol = pos["symbol"]
+        sl1_badge = ' <span style="font-size:0.75em; color:#fb923c;">[1차손절]</span>' if pos.get("sl1_executed") else ""
         pos_asset_line = (
             f'<div class="sub">'
             f'{pos["symbol"]} 평가: {fmt_krw(pos["units"] * pos["current_price"])}'
-            f' ({pos["units"]:.6g}개)'
+            f' ({pos["units"]:.6g}개){sl1_badge}'
             f'</div>'
         )
 
@@ -497,9 +511,21 @@ def _render_html(data: dict) -> str:
         held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
         progress = min(1.0, max(0.0, pnl_pct / pos["take_profit_pct"])) if pos["take_profit_pct"] > 0 else 0.0
         bar_color = "#4ade80" if pnl_pct >= 0 else "#f87171"
+        sl1_executed = pos.get("sl1_executed", False)
+        sl1_label = ' <span style="font-size:0.8em; color:#fb923c; font-weight:600;">[1차손절 실행]</span>' if sl1_executed else ""
+        units_label = f'{pos["units"]:.6g}개' + (' (50%)' if sl1_executed else '')
+        sl_display = ""
+        if pos.get("stop_loss_1st_pct"):
+            sl_display = (
+                f'<span style="color:#fb923c;">{pos["stop_loss_1st_pct"]}%</span>'
+                f'<span style="color:#64748b; font-size:0.85em;"> 50%→</span>'
+                f'<span class="red">{pos["stop_loss_pct"]}%</span>'
+            )
+        else:
+            sl_display = f'<span class="red">{pos["stop_loss_pct"]}%</span>'
         position_html = f"""
         <div class="big-num {pnl_color}">{pnl_pct:+.2f}%</div>
-        <div class="sub">{pos['symbol']} {pos['units']:.2f} 개</div>
+        <div class="sub">{pos['symbol']} {units_label}{sl1_label}</div>
         <br>
         <div class="stat-row">
           <span class="stat-label">매수가</span>
@@ -516,8 +542,7 @@ def _render_html(data: dict) -> str:
         <div class="stat-row">
           <span class="stat-label">익절 / 손절</span>
           <span class="stat-value">
-            <span class="green">+{pos['take_profit_pct']}%</span> /
-            <span class="red">{pos['stop_loss_pct']}%</span>
+            <span class="green">+{pos['take_profit_pct']}%</span> / {sl_display}
           </span>
         </div>
         <div class="stat-row">
