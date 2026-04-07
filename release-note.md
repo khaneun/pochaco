@@ -2,6 +2,37 @@
 
 ---
 
+## v2.3.0 (2026-04-07)
+
+### 2단계 손절 시스템 도입 + 익절 범위 상향
+
+#### 핵심 변경: 2단계 손절 (trading_engine.py · ai_agent.py)
+- **기존**: 단일 손절선(-2~-6%) 도달 시 전량 매도 → 실효 손실 최대 5~6%
+- **변경**: 1차 손절 도달 시 **50%만 매도**, 2차 도달 시 **나머지 전량 매도**
+  - 1차 손절(`stop_loss_1st_pct`, 기준 -2% 전후): AI 결정 / 도달 시 즉시 절반 청산
+  - 2차 손절(`stop_loss_pct`, 기준 -2.5% 전후): AI 결정 / 도달 시 잔여 전량 청산
+  - **실효 최대 손실 ≈ -2.25%** (기존 대비 절반 수준으로 감소)
+- `OBSERVING_SL` 상태(가짜 하락 관찰) 제거 — 2단계 구조가 노이즈 필터 역할 대체
+
+#### 익절 범위 상향 (ai_agent.py · strategy_optimizer.py)
+- 기존 1.0~3.5% → **2.0~6.0%** (손실 위험 감소로 더 큰 목표 추구 가능)
+- SL1·SL2·TP 포인트 모두 AI Agent가 시장 상황 분석 후 결정
+
+#### DB 스키마 확장 (database/models.py · repository.py)
+- `positions.stop_loss_1st_pct` 컬럼 추가 (1차 손절%)
+- `strategy_evaluations.original_sl_1st_pct` 컬럼 추가
+- 기동 시 자동 마이그레이션 (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`)
+
+#### AI 프롬프트 개선
+- `select_coin()`: SL1/SL2 이중 손절 JSON 반환, 실효 R:R 검증 로직 추가
+- `evaluate_trade()`: 1차 손절 실행 여부 컨텍스트 포함, SL1/SL2 독립 제안
+- `should_adjust_strategy()`: 2단계 손절 인식 후 각각 재조정
+
+#### 알림 개선 (telegram_bot.py)
+- 매수 알림: `1차SL -2.0% (50%) → 2차SL -2.5% (전량)` 형식으로 표시
+
+---
+
 ## v2.2.0 (2026-04-05)
 
 ### 익절·손절·수동 청산 후 동일 종목 재매수 방지 쿨다운

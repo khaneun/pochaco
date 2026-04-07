@@ -122,7 +122,7 @@ class Dashboard:
     def _build_header(self) -> Panel:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return Panel(
-            Text(f"pochaco  자동매매 대시보드   ·   {now}", justify="center", style="bold cyan"),
+            Text(f"pochaco  자동매매 대시보드  v2.3.0  ·   {now}", justify="center", style="bold cyan"),
             box=box.DOUBLE,
         )
 
