@@ -1,14 +1,15 @@
 """전략 최적화 Agent — 수익 극대화를 위한 즉각적 파라미터 결정
 
-철학 (2단계 손절 전략):
-- 1차 손절(SL1): -1.0%~-3.0% — 도달 시 50% 매도, 나머지 반등 대기
-- 2차 손절(SL2): -1.5%~-4.5% — 도달 시 나머지 전량 매도
-- 실효 최대 손실 = SL1×50% + SL2×50% ≈ -2.25% (단순 손절 대비 절반 수준)
-- 익절: 크게 가져가기 (2.0%~6.0%) — 손실 분산으로 더 큰 목표 가능
+철학 (타이트 손절 + 단계별 트레일링 익절):
+- 1차 손절(SL1): -0.5%~-1.5% — 빠르게 인지, 50% 매도 후 반등 대기
+- 2차 손절(SL2): -1.0%~-2.5% — 나머지 전량 매도 (신속 탈출)
+- 실효 최대 손실 = SL1×50% + SL2×50% ≈ -1.5% 수준 (타이트 리스크 관리)
+- 익절 진입: 4.0%+ 도달 시 트레일링 시작 (10%+ 수익 목표)
+  · 5~7%: 오프셋 0.8% | 7~10%: 오프셋 1.2% | 10~15%: 오프셋 1.8% | 15%+: 오프셋 2.5%
 - 즉각 반영: 매매 완료 즉시 분석 → 다음 파라미터 즉시 갱신
 
 StrategyOptimizer가 관리하는 클램프는 2차 손절(SL2) 기준입니다.
-1차 손절(SL1)은 AI Agent가 SL2 대비 0.3~1.5% 위에서 결정합니다.
+1차 손절(SL1)은 AI Agent가 SL2 대비 0.3~1.0% 위에서 결정합니다.
 """
 import json
 import logging
@@ -21,14 +22,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StrategyParams:
-    """전략 파라미터 묶음 — StrategyOptimizer가 결정 (2단계 손절 전략)"""
-    target_tp: float = 3.5       # 권고 익절% (AI가 이 값 근처로 결정)
-    target_sl: float = -2.5      # 권고 2차 손절% (음수)
-    tp_clamp_min: float = 2.0    # 익절 허용 최솟값
-    tp_clamp_max: float = 6.0    # 익절 허용 최댓값
-    sl_clamp_min: float = -4.5   # 2차 손절 허용 최솟값
-    sl_clamp_max: float = -1.5   # 2차 손절 허용 최댓값
-    rationale: str = "기본 파라미터 (2단계 손절: SL1≈-2%, SL2≈-2.5%, 익절 크게)"
+    """전략 파라미터 묶음 — StrategyOptimizer가 결정 (타이트 손절 + 트레일링 익절)"""
+    target_tp: float = 5.0       # 익절 진입% (트레일링 시작점)
+    target_sl: float = -1.5      # 권고 2차 손절% (음수, 타이트)
+    tp_clamp_min: float = 4.0    # 익절 허용 최솟값
+    tp_clamp_max: float = 10.0   # 익절 허용 최댓값
+    sl_clamp_min: float = -2.5   # 2차 손절 허용 최솟값 (타이트)
+    sl_clamp_max: float = -0.8   # 2차 손절 허용 최댓값 (타이트)
+    rationale: str = "기본 파라미터 (타이트 손절: SL1≈-0.8%, SL2≈-1.5%, 익절 5%+ 트레일링)"
     confidence: float = 0.5
 
 
@@ -110,13 +111,13 @@ class StrategyOptimizer:
         avg_hold = eval_stats.get("avg_hold_minutes", 60.0)
         avg_pnl = eval_stats.get("avg_pnl_pct", 0.0)
 
-        # repository의 suggested 기반 clamp (AI 제안의 가중평균) — 2단계 손절 전략 기준
-        repo_tp_min = eval_stats.get("tp_clamp_min", 2.0)
-        repo_tp_max = eval_stats.get("tp_clamp_max", 6.0)
-        repo_sl_min = eval_stats.get("sl_clamp_min", -4.5)   # 2차 손절 기준
-        repo_sl_max = eval_stats.get("sl_clamp_max", -1.5)
-        suggested_tp = eval_stats.get("avg_suggested_tp", 3.5)
-        suggested_sl = eval_stats.get("avg_suggested_sl", -2.5)
+        # repository의 suggested 기반 clamp (AI 제안의 가중평균) — 타이트 손절 전략 기준
+        repo_tp_min = eval_stats.get("tp_clamp_min", 4.0)
+        repo_tp_max = eval_stats.get("tp_clamp_max", 10.0)
+        repo_sl_min = eval_stats.get("sl_clamp_min", -2.5)   # 2차 손절 기준 (타이트)
+        repo_sl_max = eval_stats.get("sl_clamp_max", -0.8)
+        suggested_tp = eval_stats.get("avg_suggested_tp", 5.0)
+        suggested_sl = eval_stats.get("avg_suggested_sl", -1.5)
 
         # 최근 연속 손절 카운트 + 평균 손실 크기
         consecutive_losses = 0
@@ -135,50 +136,50 @@ class StrategyOptimizer:
         sl_min, sl_max = repo_sl_min, repo_sl_max
 
         if consecutive_losses >= 3:
-            if avg_loss_size > 2.0:
-                # 손실 크기가 큼 → SL2를 약간 넓히고 익절도 조정
-                target_sl = max(target_sl - 0.3, -4.5)
+            if avg_loss_size > 1.5:
+                # 손실 크기가 큼 → SL2 소폭 완화 (최대 -2.5% 이내 유지)
+                target_sl = max(target_sl - 0.2, -2.5)
                 rationale = f"연속 손절 {consecutive_losses}건(평균 -{avg_loss_size:.1f}%) — SL2 소폭 완화"
             else:
-                # 손실 크기가 작음 → SL1이 너무 좁은 것, SL2 범위 유지
-                target_sl = max(target_sl - 0.5, -4.0)
-                sl_min = max(sl_min - 0.5, -5.0)
+                # 손실 작음 → SL1이 너무 좁은 것, 범위 소폭 완화
+                target_sl = max(target_sl - 0.3, -2.5)
+                sl_min = max(sl_min - 0.3, -3.0)
                 rationale = f"연속 손절 {consecutive_losses}건(소폭) → SL2 완화"
         elif consecutive_losses == 2:
-            target_sl = max(target_sl - 0.3, -4.0)
+            target_sl = max(target_sl - 0.2, -2.5)
             rationale = f"연속 손절 2건 → SL2 소폭 완화"
         elif win_rate < 0.35:
-            target_sl = max(target_sl - 0.5, -4.0)
+            target_sl = max(target_sl - 0.3, -2.5)
             rationale = f"낮은 승률 {win_rate:.0%} → SL2 완화"
         else:
             rationale = f"suggested 기반 유지 (승률 {win_rate:.0%})"
 
         # ── 익절 파라미터 결정 ──────────────────────────────
-        # 기본: repository의 suggested 기반 (2단계 손절로 리스크 감소 → 더 큰 익절 목표)
+        # 기본: repository의 suggested 기반 (타이트 손절로 리스크 감소 → 더 큰 익절 목표)
         target_tp = round(suggested_tp, 1)
         tp_min, tp_max = repo_tp_min, repo_tp_max
 
-        if consecutive_losses >= 3 and avg_loss_size > 2.0:
+        if consecutive_losses >= 3 and avg_loss_size > 1.5:
             # 시장 악화 시 익절을 소폭 낮춰 빠른 수익 실현
-            target_tp = max(2.0, target_tp - 0.5)
-            tp_max = min(tp_max, 5.0)
+            target_tp = max(4.0, target_tp - 0.5)
+            tp_max = min(tp_max, 8.0)
         elif avg_hold > 240:
-            target_tp = max(2.0, target_tp - 1.0)
-            tp_max = min(tp_max, 4.5)
+            target_tp = max(4.0, target_tp - 1.0)
+            tp_max = min(tp_max, 7.0)
         elif avg_hold > 120:
-            target_tp = max(2.0, target_tp - 0.5)
-        elif win_rate >= 0.6 and avg_pnl > 1.0:
-            # 잘 되고 있으면 익절 목표 유지 또는 소폭 상향
-            target_tp = min(6.0, target_tp + 0.3)
-            tp_max = min(7.0, tp_max + 0.5)
+            target_tp = max(4.0, target_tp - 0.5)
+        elif win_rate >= 0.6 and avg_pnl > 2.0:
+            # 잘 되고 있으면 익절 목표 상향
+            target_tp = min(10.0, target_tp + 0.5)
+            tp_max = min(12.0, tp_max + 1.0)
 
         return StrategyParams(
-            target_tp=max(2.0, min(7.0, round(target_tp, 1))),
-            target_sl=max(-5.0, min(-1.5, round(target_sl, 1))),
-            tp_clamp_min=max(1.5, round(tp_min, 1)),
-            tp_clamp_max=min(7.0, round(tp_max, 1)),
-            sl_clamp_min=max(-5.5, round(sl_min, 1)),
-            sl_clamp_max=min(-1.0, round(sl_max, 1)),
+            target_tp=max(4.0, min(12.0, round(target_tp, 1))),
+            target_sl=max(-3.0, min(-0.5, round(target_sl, 1))),
+            tp_clamp_min=max(3.0, round(tp_min, 1)),
+            tp_clamp_max=min(12.0, round(tp_max, 1)),
+            sl_clamp_min=max(-3.0, round(sl_min, 1)),
+            sl_clamp_max=min(-0.5, round(sl_max, 1)),
             rationale=rationale,
             confidence=0.7,
         )
@@ -203,11 +204,11 @@ class StrategyOptimizer:
 
         prompt = f"""당신은 단기 변동성 매매 전략 최적화 전문가입니다.
 
-**전략 철학 — 2단계 손절 (반드시 준수):**
-- 1차 손절(SL1): -1.0%~-3.0% → 도달 시 50% 매도, 나머지 반등 대기
-- 2차 손절(SL2): -1.5%~-4.5% → 도달 시 나머지 전량 매도 (SL1보다 0.3~1.5% 더 낮음)
-- 실효 최대 손실 ≈ SL1×50% + SL2×50% (단순 손절보다 훨씬 유리)
-- 익절: 더 큰 목표 (2.0%~6.0%) — 손실 분산으로 R:R 대폭 개선
+**전략 철학 — 타이트 손절 + 트레일링 익절 (반드시 준수):**
+- 1차 손절(SL1): -0.5%~-1.5% → 빠르게 인지, 50% 매도 후 반등 대기
+- 2차 손절(SL2): -1.0%~-2.5% → 나머지 전량 매도 (SL1보다 0.3~1.0% 더 낮음)
+- 실효 최대 손실 ≈ SL1×50% + SL2×50% ≈ -1.5% 수준 (타이트 리스크 관리)
+- 익절: 4.0%+ 진입 후 단계별 트레일링으로 10%+ 목표 (5~7%: 0.8%, 7~10%: 1.2%, 10~15%: 1.8%, 15%+: 2.5% 오프셋)
 - 이 파라미터는 2차 손절(SL2) 범위를 결정합니다
 
 **최근 {eval_stats['count']}건 매매 성과:**
@@ -225,18 +226,18 @@ class StrategyOptimizer:
 
 **지시:**
 위 데이터를 분석해 다음 매매에 즉시 적용할 파라미터를 결정하세요.
-- 연속 손절이 있으면 SL2 범위를 소폭 완화하세요 (단, -4.5% 이상 넓히지 마세요)
-- 익절은 2단계 손절 덕분에 더 크게 가져갈 수 있음 — 승률보다 기대수익 중심
-- 보유 시간이 길수록 익절을 낮추세요 (기회비용 방지)
+- 손절은 항상 타이트하게 유지 (-2.5% 이내). 빠른 탈출이 핵심
+- 연속 손절이 있어도 SL2는 -2.5% 이상 넓히지 마세요
+- 익절은 크게 (4%+ 진입 후 트레일링으로 10%+ 목표). 보유 시간이 길면 진입점을 낮추세요
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이):
 {{
-  "target_tp": 권고익절%(숫자, 2.0~6.0 범위),
-  "target_sl": 권고2차손절%(음수숫자, -1.5~-4.5 범위),
-  "tp_clamp_min": 익절허용최솟값(숫자, 1.5~3.5),
-  "tp_clamp_max": 익절허용최댓값(숫자, 3.5~7.0),
-  "sl_clamp_min": 2차손절허용최솟값(음수, -2.5~-5.5),
-  "sl_clamp_max": 2차손절허용최댓값(음수, -1.0~-2.5),
+  "target_tp": 권고익절%(숫자, 4.0~10.0 범위),
+  "target_sl": 권고2차손절%(음수숫자, -0.5~-2.5 범위),
+  "tp_clamp_min": 익절허용최솟값(숫자, 3.0~5.0),
+  "tp_clamp_max": 익절허용최댓값(숫자, 7.0~12.0),
+  "sl_clamp_min": 2차손절허용최솟값(음수, -1.5~-3.0),
+  "sl_clamp_max": 2차손절허용최댓값(음수, -0.5~-1.5),
   "rationale": "결정 이유 (한국어, 80자 이내)",
   "confidence": 확신도(0.0~1.0)
 }}"""
@@ -247,14 +248,14 @@ class StrategyOptimizer:
         clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         data = json.loads(clean)
 
-        target_tp = max(2.0, min(7.0, float(data["target_tp"])))
+        target_tp = max(4.0, min(12.0, float(data["target_tp"])))
         target_sl = float(data["target_sl"])
         if target_sl > 0:
             target_sl = -abs(target_sl)
-        target_sl = max(-5.0, min(-1.5, target_sl))
+        target_sl = max(-3.0, min(-0.5, target_sl))
 
-        tp_min = max(1.5, min(4.0, float(data["tp_clamp_min"])))
-        tp_max = max(tp_min + 1.0, min(7.5, float(data["tp_clamp_max"])))
+        tp_min = max(3.0, min(6.0, float(data["tp_clamp_min"])))
+        tp_max = max(tp_min + 2.0, min(12.0, float(data["tp_clamp_max"])))
 
         sl_min = float(data["sl_clamp_min"])
         sl_max = float(data["sl_clamp_max"])
@@ -262,8 +263,8 @@ class StrategyOptimizer:
             sl_min = -abs(sl_min)
         if sl_max > 0:
             sl_max = -abs(sl_max)
-        sl_min = max(-6.0, min(-2.0, sl_min))
-        sl_max = max(sl_min + 0.5, min(-1.0, sl_max))
+        sl_min = max(-3.0, min(-1.0, sl_min))
+        sl_max = max(sl_min + 0.3, min(-0.5, sl_max))
 
         return StrategyParams(
             target_tp=round(target_tp, 1),

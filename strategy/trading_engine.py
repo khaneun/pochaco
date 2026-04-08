@@ -46,9 +46,9 @@ class _ExitTracker:
 
     # ── 트레일링 익절 ──
     peak_pnl_pct: float = 0.0          # 트레일링 진입 후 최고 수익률
-    trail_offset_pct: float = 0.4      # 고점 대비 이만큼 하락하면 매도
+    trail_offset_pct: float = 0.8      # 고점 대비 이만큼 하락하면 매도
     trailing_since: float = 0.0        # 트레일링 진입 시각 (epoch)
-    trailing_timeout: float = 600.0    # 트레일링 최대 유지 시간 (초, 기본 10분)
+    trailing_timeout: float = 1800.0   # 트레일링 최대 유지 시간 (초, 30분)
 
     # ── 2단계 손절 ──
     sl1_executed: bool = False         # 1차 손절(50% 매도) 완료 여부
@@ -511,11 +511,11 @@ class TradingEngine:
             )
             self._exit_trackers.pop(position.id, None)
 
-        elif pnl_pct < position.take_profit_pct * 0.5:
-            # ── TP 이하로 크게 하락 → 즉시 매도 (모멘텀 상실) ──
+        elif pnl_pct < position.take_profit_pct * 0.2:
+            # ── TP 이하로 급락 → 즉시 매도 (모멘텀 완전 상실 안전망) ──
             self._execute_sell(
                 position, current_price, pnl_pct,
-                f"트레일링 모멘텀 상실 ({pnl_pct:+.2f}% < TP의 50%)",
+                f"트레일링 모멘텀 상실 ({pnl_pct:+.2f}% < TP의 20%)",
             )
             self._exit_trackers.pop(position.id, None)
 
@@ -584,16 +584,19 @@ class TradingEngine:
 
     @staticmethod
     def _calc_trail_offset(current_pnl: float, original_tp: float) -> float:
-        """트레일링 오프셋 계산 — 오버슈트가 클수록 여유를 줌"""
-        overshoot = current_pnl - original_tp
-        if overshoot > 2.0:
-            return 1.0    # 2%+ 초과 → 넉넉하게 (큰 수익 보존)
-        elif overshoot > 1.0:
-            return 0.7
-        elif overshoot > 0.3:
-            return 0.5
+        """구간별 드랍포인트 — 수익 구간에 따라 단계적 오프셋 조정
+        목표: 5% 진입 후 10%+ 수익 추적
+        """
+        if current_pnl >= 15.0:
+            return 2.5    # 15%+ — 대형 수익, 충분히 달림
+        elif current_pnl >= 10.0:
+            return 1.8    # 10~15% — 넉넉하게
+        elif current_pnl >= 7.0:
+            return 1.2    # 7~10% — 중간
+        elif current_pnl >= 5.0:
+            return 0.8    # 5~7% — 진입 초기, 수익 보호
         else:
-            return 0.3    # 갓 돌파 → 타이트하게 (수익 확보)
+            return 0.5    # 5% 미만 — 타이트 (수익 지킴)
 
     def _maybe_adjust_strategy(
         self, position: Position, current_price: float, pnl_pct: float,

@@ -155,15 +155,15 @@ class TradingAgent:
             )
             rr_guide = "- 2단계 손절 전략: 최대 실효 손실을 줄여 더 큰 익절 목표 가능. 수익이 클수록 전략 성과 극대화."
         else:
-            tp_min, tp_max = 2.0, 6.0
-            sl1_min, sl1_max = -3.0, -1.0
-            sl2_min, sl2_max = -4.5, -1.5
+            tp_min, tp_max = 4.0, 10.0
+            sl1_min, sl1_max = -1.5, -0.5
+            sl2_min, sl2_max = -2.5, -0.8
             tp_guide = (
-                "- 익절(take_profit_pct): 2.0%~6.0% 범위에서 달성 가능하게 설정 (더 큰 익절이 더 큰 수익)\n"
-                "- 1차 손절(sl_1st_pct): -1.0%~-3.0% 범위 — 도달 시 보유량의 50%만 매도 (기준: -2% 전후)\n"
-                "- 2차 손절(sl_2nd_pct): -1.5%~-4.5% 범위 — 도달 시 나머지 전량 매도 (기준: -2.5% 전후, 1차보다 반드시 더 낮은 음수)"
+                "- 익절(take_profit_pct): 4.0%~10.0% 범위에서 설정 (트레일링으로 10%+ 목표)\n"
+                "- 1차 손절(sl_1st_pct): -0.5%~-1.5% 범위 — 빠르게 인지, 50%만 매도 (기준: -1% 전후)\n"
+                "- 2차 손절(sl_2nd_pct): -0.8%~-2.5% 범위 — 나머지 전량 매도 (기준: -1.5% 전후, 1차보다 반드시 더 낮은 음수)"
             )
-            rr_guide = "- 2단계 손절 전략: 1차에서 50% 자른 뒤 반등 기회 유지. 익절은 크게 노려 수익 극대화."
+            rr_guide = "- 타이트 손절 전략: 빠르게 손실 인지·탈출. 익절은 5%+ 진입 후 트레일링으로 크게 수익 극대화."
 
         prompt = f"""당신은 단기 변동성 매매 전문 트레이더입니다.
 전략: 코인 1개를 전액 매수 → 2단계 손절 또는 익절 시 매도 → 즉시 반복.
@@ -299,7 +299,7 @@ class TradingAgent:
 - 1차 손절(sl_1st_pct): 도달 시 보유량 50% 매도 → 나머지 반등 대기
 - 2차 손절(sl_2nd_pct): 도달 시 나머지 전량 매도 (1차보다 더 낮은 음수)
 - 실효 최대 손실 = sl_1st × 50% + sl_2nd × 50%
-- 익절(take_profit_pct): 더 큰 목표 (2.0%~6.0%) — 손실 분산으로 더 큰 이익 추구
+- 익절(take_profit_pct): 4.0%+ 진입 후 트레일링으로 10%+ 목표 — 손실 타이트, 수익 극대화
 
 **이번 매매 결과:**
 - 코인: {symbol}
@@ -314,17 +314,17 @@ class TradingAgent:
 {history_summary}
 
 **평가 관점:**
-1. 익절이 너무 높아서 도달하지 못했는가? → 낮추기 (단, 최소 2.0% 유지)
-2. 1차 손절이 너무 좁아서 바로 50% 팔렸는가? → 넓히기 (-2.5%~-1.0% 범위)
-3. 2차 손절이 너무 좁아서 반등 없이 전부 팔렸는가? → 넓히기
-4. 보유 시간이 길었다면 익절을 낮춰 빠른 수익 실현 도모
+1. 익절이 너무 높아서 도달하지 못했는가? → 낮추기 (단, 최소 4.0% 유지)
+2. 1차 손절이 너무 좁아서 바로 50% 팔렸는가? → 소폭 넓히기 (최대 -1.5% 유지, 타이트 원칙)
+3. 2차 손절이 너무 좁아서 반등 없이 전부 팔렸는가? → 소폭 넓히기 (최대 -2.5% 유지)
+4. 보유 시간이 길었다면 익절 진입점을 낮춰 빠른 트레일링 진입 도모
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "evaluation": "이번 매매에 대한 평가 (한국어, 150자 이내)",
-  "suggested_tp_pct": 다음매매추천익절퍼센트(숫자, 2.0~7.0 범위),
-  "suggested_sl_1st_pct": 다음매매추천1차손절퍼센트(음수, -1.0~-3.5 범위),
-  "suggested_sl_pct": 다음매매추천2차손절퍼센트(음수, -1.5~-5.0 범위, 1차보다 더낮은음수),
+  "suggested_tp_pct": 다음매매추천익절퍼센트(숫자, 4.0~12.0 범위),
+  "suggested_sl_1st_pct": 다음매매추천1차손절퍼센트(음수, -0.5~-1.5 범위),
+  "suggested_sl_pct": 다음매매추천2차손절퍼센트(음수, -0.8~-2.5 범위, 1차보다 더낮은음수),
   "lesson": "핵심 교훈 한 줄 (한국어, 50자 이내)"
 }}"""
 
@@ -342,13 +342,13 @@ class TradingAgent:
             suggested_sl = float(data.get("suggested_sl_pct", original_sl))
 
             # 범위 보정
-            suggested_tp = max(2.0, min(7.0, suggested_tp))
+            suggested_tp = max(4.0, min(12.0, suggested_tp))
             if suggested_sl_1st > 0:
                 suggested_sl_1st = -abs(suggested_sl_1st)
             if suggested_sl > 0:
                 suggested_sl = -abs(suggested_sl)
-            suggested_sl_1st = max(-3.5, min(-1.0, suggested_sl_1st))
-            suggested_sl = max(-5.0, min(-1.5, suggested_sl))
+            suggested_sl_1st = max(-1.5, min(-0.5, suggested_sl_1st))
+            suggested_sl = max(-2.5, min(-0.8, suggested_sl))
             # SL2는 SL1보다 0.2% 이상 낮아야 함
             if suggested_sl >= suggested_sl_1st - 0.2:
                 suggested_sl = suggested_sl_1st - 0.3
@@ -453,13 +453,13 @@ class TradingAgent:
                 new_sl = float(data.get("new_stop_loss_pct", original_sl))
 
                 # 안전장치
-                new_tp = max(1.5, min(8.0, new_tp))
+                new_tp = max(3.0, min(12.0, new_tp))
                 if new_sl_1st > 0:
                     new_sl_1st = -abs(new_sl_1st)
                 if new_sl > 0:
                     new_sl = -abs(new_sl)
-                new_sl_1st = max(-5.0, min(-0.8, new_sl_1st))
-                new_sl = max(-6.0, min(-1.0, new_sl))
+                new_sl_1st = max(-2.0, min(-0.5, new_sl_1st))
+                new_sl = max(-3.0, min(-0.8, new_sl))
                 if new_sl >= new_sl_1st - 0.2:
                     new_sl = new_sl_1st - 0.3
 
