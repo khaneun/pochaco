@@ -310,14 +310,15 @@ class Dashboard:
             summaries = self._repo.get_daily_activity_summary(days=7)
 
             tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold blue", expand=True)
-            tbl.add_column("날짜",     width=11)
-            tbl.add_column("선정 코인",  width=22)
-            tbl.add_column("매매수", justify="center", width=6)
-            tbl.add_column("익절",   justify="center", width=5, style="green")
-            tbl.add_column("손절",   justify="center", width=5, style="red")
-            tbl.add_column("승률",   justify="right",  width=7)
-            tbl.add_column("일 수익률", justify="right", width=10)
-            tbl.add_column("LLM",    width=14, style="dim")
+            tbl.add_column("날짜",       width=11)
+            tbl.add_column("선정 코인",  width=20)
+            tbl.add_column("매매수", justify="center", width=5)
+            tbl.add_column("익절",   justify="center", width=4, style="green")
+            tbl.add_column("손절",   justify="center", width=4, style="red")
+            tbl.add_column("승률",   justify="right",  width=6)
+            tbl.add_column("손익(원)",   justify="right", width=11)
+            tbl.add_column("수익률",     justify="right", width=8)
+            tbl.add_column("LLM",      width=13, style="dim")
 
             for s in summaries:
                 total_decided = s["wins"] + s["losses"]
@@ -328,14 +329,23 @@ class Dashboard:
                 else:
                     wr_text.append("-", style="dim")
 
-                pnl = s["pnl_pct"]
-                pnl_text = Text()
-                if pnl > 0:
-                    pnl_text.append(f"+{pnl:.2f}%", style="green")
-                elif pnl < 0:
-                    pnl_text.append(f"{pnl:.2f}%", style="red")
+                pnl_krw = s.get("pnl_krw", 0.0)
+                pnl_krw_text = Text()
+                if pnl_krw > 0:
+                    pnl_krw_text.append(f"+{pnl_krw:,.0f}", style="green")
+                elif pnl_krw < 0:
+                    pnl_krw_text.append(f"{pnl_krw:,.0f}", style="red")
                 else:
-                    pnl_text.append(f"{pnl:.2f}%", style="dim")
+                    pnl_krw_text.append("-", style="dim")
+
+                pnl = s["pnl_pct"]
+                pnl_pct_text = Text()
+                if pnl > 0:
+                    pnl_pct_text.append(f"+{pnl:.2f}%", style="green")
+                elif pnl < 0:
+                    pnl_pct_text.append(f"{pnl:.2f}%", style="red")
+                else:
+                    pnl_pct_text.append(f"{pnl:.2f}%", style="dim")
 
                 coins = ", ".join(s["symbols"][:4])
                 if len(s["symbols"]) > 4:
@@ -349,12 +359,13 @@ class Dashboard:
                     str(s["wins"]) if s["wins"] else "-",
                     str(s["losses"]) if s["losses"] else "-",
                     wr_text,
-                    pnl_text,
+                    pnl_krw_text,
+                    pnl_pct_text,
                     llm_short,
                 )
 
             if not summaries:
-                tbl.add_row("—", "거래 데이터 없음", "", "", "", "", "", "")
+                tbl.add_row("—", "거래 데이터 없음", "", "", "", "", "", "", "")
 
             return Panel(tbl, title="[bold]AI 일별 행동 보고서[/bold]  (최근 7일)", box=box.ROUNDED)
         except Exception as e:

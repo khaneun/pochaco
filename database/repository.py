@@ -144,6 +144,7 @@ class TradeRepository:
         ending_krw: float,
         trade_count: int,
         win_count: int,
+        total_fee: float = 0.0,
     ) -> DailyReport:
         with self._session() as db:
             report = db.query(DailyReport).filter(DailyReport.date == date_str).first()
@@ -156,10 +157,15 @@ class TradeRepository:
                 report.pnl_pct = pnl_pct
                 report.trade_count = trade_count
                 report.win_count = win_count
+                report.total_fee = total_fee
+                # starting_krw는 최초 기록값 유지 (하루 시작 기준점)
+                if report.starting_krw == 0.0 and starting_krw > 0:
+                    report.starting_krw = starting_krw
             else:
                 report = DailyReport(
                     date=date_str, starting_krw=starting_krw,
                     ending_krw=ending_krw, pnl_krw=pnl_krw, pnl_pct=pnl_pct,
+                    total_fee=total_fee,
                     trade_count=trade_count, win_count=win_count,
                 )
                 db.add(report)
@@ -201,7 +207,9 @@ class TradeRepository:
                 if d_key not in by_date:
                     by_date[d_key] = {
                         "date": d_key, "symbols": [], "total": 0,
-                        "wins": 0, "losses": 0, "llm": "", "pnl_pct": 0.0,
+                        "wins": 0, "losses": 0, "llm": "",
+                        "pnl_pct": 0.0, "pnl_krw": 0.0,
+                        "starting_krw": 0.0, "total_fee": 0.0,
                     }
                 entry = by_date[d_key]
                 entry["total"] += 1
@@ -222,6 +230,9 @@ class TradeRepository:
                 r = reports.get(d_key)
                 if r:
                     entry["pnl_pct"] = r.pnl_pct
+                    entry["pnl_krw"] = r.pnl_krw
+                    entry["starting_krw"] = r.starting_krw
+                    entry["total_fee"] = getattr(r, "total_fee", 0.0) or 0.0
 
             return sorted(by_date.values(), key=lambda x: x["date"], reverse=True)
 

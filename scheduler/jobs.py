@@ -57,19 +57,34 @@ class TradingScheduler:
     def _job_save_daily_report(self) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
         try:
+            # 종료 총자산 = KRW + 보유 코인 평가액
             ending_krw = self._client.get_krw_balance()
+            open_pos = self._repo.get_open_position()
+            if open_pos:
+                try:
+                    cur_price = self._client.get_current_price(open_pos.symbol)
+                    ending_krw += open_pos.units * cur_price
+                except Exception as pe:
+                    logger.warning(f"포지션 평가액 조회 실패: {pe}")
+
             starting_krw = self._get_daily_start_krw()
 
-            recent = self._repo.get_recent_trades(100)
+            recent = self._repo.get_recent_trades(200)
             today_trades = [
                 t for t in recent
                 if t.created_at.strftime("%Y-%m-%d") == today
             ]
             sell_trades = [t for t in today_trades if t.side == "sell"]
-            buy_trades  = [t for t in today_trades if t.side == "buy"]
 
             # 익절로 끝난 매도 수 (note에 "익절" 포함)
             win_count = sum(1 for t in sell_trades if "익절" in (t.note or ""))
+
+            # 수수료 추정: 거래 금액 × 0.25% (빗썸 기본 수수료)
+            # Trade.fee가 0으로 저장되는 경우 krw_amount 기반 추정값 사용
+            total_fee = sum(
+                (t.fee if t.fee and t.fee > 0 else t.krw_amount * 0.0025)
+                for t in today_trades
+            )
 
             report = self._repo.upsert_daily_report(
                 date_str=today,
@@ -77,6 +92,7 @@ class TradingScheduler:
                 ending_krw=ending_krw,
                 trade_count=len(today_trades),
                 win_count=win_count,
+                total_fee=round(total_fee, 0),
             )
             logger.info(f"[일별 리포트] {today} 저장 완료 (거래 {len(today_trades)}건, 익절 {win_count}건)")
 

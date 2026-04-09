@@ -104,7 +104,16 @@ class TradingEngine:
         self._running = True
         logger.info("=== TradingEngine 시작 ===")
 
-        self.daily_start_krw = self._client.get_krw_balance()
+        # 시작 총자산 = KRW + 보유 코인 평가액
+        _start_krw = self._client.get_krw_balance()
+        _start_pos = self._repo.get_open_position()
+        if _start_pos:
+            try:
+                _start_cur = self._client.get_current_price(_start_pos.symbol)
+                _start_krw += _start_pos.units * _start_cur
+            except Exception:
+                pass
+        self.daily_start_krw = _start_krw
 
         # StrategyOptimizer 초기화 (기존 평가 데이터로 즉시 파라미터 결정)
         if self._optimizer:

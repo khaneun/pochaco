@@ -150,8 +150,11 @@ def _build_json_status(client: "BithumbClient") -> dict:
         reports_data = [
             {
                 "date": r.date,
+                "starting_krw": round(r.starting_krw, 0),
+                "ending_krw": round(r.ending_krw, 0),
                 "pnl_krw": round(r.pnl_krw, 0),
                 "pnl_pct": round(r.pnl_pct, 2),
+                "total_fee": round(getattr(r, "total_fee", 0.0) or 0.0, 0),
                 "trade_count": r.trade_count,
                 "win_count": r.win_count,
             }
@@ -571,23 +574,57 @@ def _render_html(data: dict) -> str:
     # 일별 성과 HTML
     if data["daily_reports"]:
         rows = ""
+        total_pnl_sum = 0.0
+        total_fee_sum = 0.0
         for r in reversed(data["daily_reports"]):
-            sign = "+" if r["pnl_pct"] >= 0 else ""
-            color = "green" if r["pnl_pct"] >= 0 else "red"
-            badge_cls = "badge-green" if r["pnl_pct"] >= 0 else "badge-red"
-            total_d = r["trade_count"] // 2 if r["trade_count"] > 0 else 0
+            sign = "+" if r["pnl_krw"] >= 0 else ""
+            color = "green" if r["pnl_krw"] >= 0 else "red"
+            badge_cls = "badge-green" if r["pnl_krw"] >= 0 else "badge-red"
+            # 매수/매도 쌍 → 사이클 수 (trade_count // 2)
+            cycle_count = r["trade_count"] // 2 if r["trade_count"] > 0 else 0
+            win_c = r["win_count"]
+            loss_c = max(0, cycle_count - win_c)
+            total_pnl_sum += r["pnl_krw"]
+            total_fee_sum += r["total_fee"]
+            start_str = f'{r["starting_krw"]:,.0f}' if r["starting_krw"] > 0 else "-"
+            end_str   = f'{r["ending_krw"]:,.0f}'   if r["ending_krw"] > 0 else "-"
+            fee_str   = f'{r["total_fee"]:,.0f}'     if r["total_fee"] > 0 else "-"
             rows += (
                 f"<tr>"
-                f"<td>{r['date'][5:]}</td>"
-                f'<td class="{color}">{sign}{r["pnl_pct"]:.2f}%</td>'
-                f'<td class="{color}">{sign}{r["pnl_krw"]:,.0f}</td>'
-                f'<td><span class="badge {badge_cls}">'
-                f'{r["win_count"]}/{total_d}승</span></td>'
+                f"<td><b>{r['date'][5:]}</b></td>"
+                f"<td style='text-align:right; color:#94a3b8; font-size:0.8rem'>{start_str}</td>"
+                f"<td style='text-align:right; color:#94a3b8; font-size:0.8rem'>{end_str}</td>"
+                f'<td style="text-align:right" class="{color}">{sign}{r["pnl_krw"]:,.0f}</td>'
+                f'<td style="text-align:right" class="{color}">{sign}{r["pnl_pct"]:.2f}%</td>'
+                f'<td style="text-align:right; color:#f59e0b; font-size:0.8rem">▼{fee_str}</td>'
+                f'<td style="text-align:center"><span class="badge {badge_cls}">'
+                f'{win_c}승/{loss_c}패</span></td>'
                 f"</tr>"
             )
+        # 합계 행
+        sum_color = "green" if total_pnl_sum >= 0 else "red"
+        sum_sign  = "+" if total_pnl_sum >= 0 else ""
+        rows += (
+            f"<tr style='border-top:2px solid #475569; background:#0f172a;'>"
+            f"<td><b>합계</b></td>"
+            f"<td></td><td></td>"
+            f'<td style="text-align:right; font-weight:700" class="{sum_color}">'
+            f'{sum_sign}{total_pnl_sum:,.0f}</td>'
+            f"<td></td>"
+            f'<td style="text-align:right; color:#f59e0b; font-weight:700">▼{total_fee_sum:,.0f}</td>'
+            f"<td></td>"
+            f"</tr>"
+        )
         reports_html = (
-            "<table><tr>"
-            "<th>날짜</th><th>수익률</th><th>손익(원)</th><th>승</th>"
+            "<table>"
+            "<tr>"
+            "<th>날짜</th>"
+            "<th style='text-align:right'>시작자산</th>"
+            "<th style='text-align:right'>종료자산</th>"
+            "<th style='text-align:right'>손익(원)</th>"
+            "<th style='text-align:right'>수익률</th>"
+            "<th style='text-align:right'>수수료</th>"
+            "<th style='text-align:center'>승/패</th>"
             f"</tr>{rows}</table>"
         )
     else:

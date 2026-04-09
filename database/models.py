@@ -67,10 +67,11 @@ class DailyReport(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     date = Column(String(10), unique=True, nullable=False)
-    starting_krw = Column(Float, default=0.0)
-    ending_krw = Column(Float, default=0.0)
-    pnl_krw = Column(Float, default=0.0)
+    starting_krw = Column(Float, default=0.0)   # 하루 시작 총자산 (KRW + 코인평가액)
+    ending_krw = Column(Float, default=0.0)      # 하루 종료 총자산 (KRW + 코인평가액)
+    pnl_krw = Column(Float, default=0.0)         # 당일 손익 (ending - starting)
     pnl_pct = Column(Float, default=0.0)
+    total_fee = Column(Float, default=0.0)       # 당일 수수료 합계 (추정)
     trade_count = Column(Integer, default=0)
     win_count = Column(Integer, default=0)
     llm_provider = Column(String(50), default="")
@@ -168,6 +169,7 @@ def _migrate_schema() -> None:
     migrations = [
         ("positions", "stop_loss_1st_pct", "REAL"),
         ("strategy_evaluations", "original_sl_1st_pct", "REAL"),
+        ("daily_reports", "total_fee", "REAL DEFAULT 0"),
     ]
     with engine.connect() as conn:
         for table, col, coltype in migrations:
