@@ -67,6 +67,37 @@ class AgentCoordinator:
         """전체 Agent dict 반환"""
         return self._agents
 
+    def get_agent_prompt(self, role: str) -> dict | None:
+        """대시보드용 — Agent 프롬프트 반환"""
+        agent = self._agents.get(role)
+        if not agent:
+            return None
+        return {
+            "role": role,
+            "base_prompt": agent.base_prompt,
+            "feedback_prompt": agent.feedback_prompt,
+        }
+
+    def chat_with_agent(self, role: str, message: str, history: list[dict]) -> str:
+        """특정 Agent와 자유 대화"""
+        agent = self._agents.get(role)
+        if not agent:
+            return f"에이전트 '{role}'을 찾을 수 없습니다."
+        try:
+            return agent.chat(message, history)
+        except Exception as e:
+            logger.error(f"[대화 오류] {role}: {e}")
+            return f"대화 처리 중 오류 발생: {e}"
+
+    def update_agent_prompt(self, role: str, new_prompt: str) -> bool:
+        """특정 Agent의 기본 역할 프롬프트 업데이트"""
+        agent = self._agents.get(role)
+        if not agent:
+            return False
+        agent.update_base_prompt(new_prompt)
+        logger.info(f"[프롬프트 업데이트] {role}: {len(new_prompt)}자")
+        return True
+
     # ------------------------------------------------------------------ #
     #  DB에서 피드백 복원 (재시작 시)                                         #
     # ------------------------------------------------------------------ #

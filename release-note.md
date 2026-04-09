@@ -2,6 +2,37 @@
 
 ---
 
+## v3.1.0 (2026-04-09)
+
+### 전문가 실적표 — 프롬프트 확인·수정 및 Agent 직접 대화 기능
+
+#### 전문가 실적표 (/experts) UI 개선
+- **[📝 프롬프트] 버튼**: 각 전문가 카드에 버튼 추가 → 클릭 시 모달 팝업
+  - 기본 역할 프롬프트를 textarea에서 직접 수정 후 저장 가능
+  - MetaEvaluator 주입 피드백 프롬프트도 읽기 전용으로 확인 가능
+- **[💬 대화] 버튼**: 해당 전문가 Agent와 직접 채팅 인터페이스
+  - 역할 특화 시스템 프롬프트 기반으로 전문적 답변 제공
+  - 대화 이력 유지 (멀티턴 지원)
+  - Enter: 전송 / Shift+Enter: 줄바꿈
+
+#### 신규 API 엔드포인트
+- `GET /api/agent/prompt?role=...` — 특정 Agent의 base_prompt + feedback_prompt 반환
+- `POST /api/agent/chat` — `{role, message, history}` → Agent LLM 응답 반환 (멀티턴)
+- `POST /api/agent/update_prompt` — `{role, new_prompt}` → base_prompt 즉시 업데이트
+
+#### LLM 레이어 개선 (core/llm_provider.py)
+- `BaseLLMProvider.chat_with_system(system, messages, max_tokens)` 추상 메서드 추가
+- Anthropic: `system` 파라미터 + `messages` 배열로 멀티턴 지원
+- OpenAI: system role 메시지 prepend 방식
+- Gemini: 시스템 지침 + 대화 이력 단일 텍스트 구성
+
+#### Agent 기반 클래스 확장 (strategy/agents/base_agent.py)
+- `base_prompt` / `feedback_prompt` 프로퍼티 노출
+- `update_base_prompt(new_prompt)` — 기본 프롬프트 런타임 수정
+- `chat(message, history)` — 대화 모드 (역할 프롬프트 기반 자유 대화)
+
+---
+
 ## v3.0.0 (2026-04-09)
 
 ### 6개 전문가 Agent 시스템 도입 — 멀티 에이전트 아키텍처

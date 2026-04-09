@@ -36,10 +36,34 @@ class BaseSpecialistAgent(ABC):
     def score(self) -> float:
         return self._score
 
+    @property
+    def base_prompt(self) -> str:
+        return self._base_prompt
+
+    @property
+    def feedback_prompt(self) -> str:
+        return self._feedback_prompt
+
     def update_feedback(self, feedback: str, score: float) -> None:
         """총괄 평가가의 피드백을 프롬프트에 반영"""
         self._feedback_prompt = feedback
         self._score = max(0.0, min(100.0, score))
+
+    def update_base_prompt(self, new_prompt: str) -> None:
+        """기본 역할 프롬프트를 업데이트 (대시보드 수동 수정)"""
+        self._base_prompt = new_prompt
+
+    def chat(self, message: str, history: list[dict] | None = None) -> str:
+        """대화 모드 — 역할에 맞게 운영자와 자유롭게 대화"""
+        system = (
+            self._build_system_context()
+            + "\n\n[대화 모드] 지금은 운영자와 직접 대화하는 시간입니다. "
+            "당신의 전문 역할과 현재까지의 판단 기준을 바탕으로 솔직하고 유익하게 답변하세요. "
+            "전략 개선 방향, 현재 설정의 문제점 등 어떤 주제든 솔직하게 이야기하세요."
+        )
+        messages = list(history or [])
+        messages.append({"role": "user", "content": message})
+        return self._llm.chat_with_system(system, messages, max_tokens=1024)
 
     def _build_system_context(self) -> str:
         """기본 프롬프트 + 피드백 프롬프트 조합"""

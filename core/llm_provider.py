@@ -22,6 +22,19 @@ class BaseLLMProvider(ABC):
         """단일 사용자 메시지를 보내고 텍스트 응답을 반환"""
         ...
 
+    @abstractmethod
+    def chat_with_system(
+        self,
+        system: str,
+        messages: list[dict],
+        max_tokens: int = 1024,
+    ) -> str:
+        """시스템 프롬프트 + 멀티턴 메시지로 LLM 호출
+
+        messages: [{"role": "user"|"assistant", "content": "..."}]
+        """
+        ...
+
     @property
     @abstractmethod
     def provider_name(self) -> str: ...
@@ -53,6 +66,17 @@ class AnthropicProvider(BaseLLMProvider):
         )
         return message.content[0].text.strip()
 
+    def chat_with_system(
+        self, system: str, messages: list[dict], max_tokens: int = 1024
+    ) -> str:
+        msg = self._client.messages.create(
+            model=self._model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+        )
+        return msg.content[0].text.strip()
+
 
 # ------------------------------------------------------------------ #
 #  OpenAI (ChatGPT)                                                    #
@@ -77,6 +101,17 @@ class OpenAIProvider(BaseLLMProvider):
             model=self._model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content.strip()
+
+    def chat_with_system(
+        self, system: str, messages: list[dict], max_tokens: int = 1024
+    ) -> str:
+        all_msgs = [{"role": "system", "content": system}] + messages
+        response = self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=max_tokens,
+            messages=all_msgs,
         )
         return response.choices[0].message.content.strip()
 
@@ -105,6 +140,21 @@ class GeminiProvider(BaseLLMProvider):
     def chat(self, prompt: str, max_tokens: int = 1024) -> str:
         response = self._model.generate_content(
             prompt,
+            generation_config={"max_output_tokens": max_tokens},
+        )
+        return response.text.strip()
+
+    def chat_with_system(
+        self, system: str, messages: list[dict], max_tokens: int = 1024
+    ) -> str:
+        # Gemini: 시스템 지침 + 대화 이력을 단일 텍스트로 구성
+        parts = [f"[시스템 지침]\n{system}\n\n[대화 내역]"]
+        for m in messages:
+            label = "사용자" if m["role"] == "user" else "AI"
+            parts.append(f"{label}: {m['content']}")
+        full_prompt = "\n\n".join(parts)
+        response = self._model.generate_content(
+            full_prompt,
             generation_config={"max_output_tokens": max_tokens},
         )
         return response.text.strip()

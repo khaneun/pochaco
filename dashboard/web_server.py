@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse, parse_qs
 
 _APP_DIR = Path(__file__).parent.parent
 
@@ -860,16 +861,18 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
     data = _build_experts_data(coordinator)
     version = _VERSION
 
-    # 카드 HTML
+    # 카드 HTML 빌드
     cards = ""
     for a in data["agents"]:
+        role = a["role"]
+        name = a["display_name"]
         sc = a["current_score"]
         if sc >= 70:
-            sc_color, sc_bg = "#4ade80", "#14532d"
+            sc_color = "#4ade80"
         elif sc >= 40:
-            sc_color, sc_bg = "#facc15", "#422006"
+            sc_color = "#facc15"
         else:
-            sc_color, sc_bg = "#f87171", "#450a0a"
+            sc_color = "#f87171"
 
         prev = a.get("previous_score")
         delta_str = ""
@@ -890,7 +893,10 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
                 h = max(2, int(val / max_s * 40))
                 c = "#4ade80" if val >= 70 else "#facc15" if val >= 40 else "#f87171"
                 bars += f'<div style="width:6px; height:{h}px; background:{c}; border-radius:2px;"></div>'
-            trend_html = f'<div style="display:flex; gap:2px; align-items:flex-end; justify-content:center; height:45px; margin-top:8px;">{bars}</div>'
+            trend_html = (
+                f'<div style="display:flex; gap:2px; align-items:flex-end; '
+                f'justify-content:center; height:45px; margin-top:8px;">{bars}</div>'
+            )
 
         # 피드백
         fb = a.get("last_feedback")
@@ -916,11 +922,19 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
                 fb_html += f'<div style="margin-top:4px; color:#94a3b8; font-style:italic;">→ {fb["directive"]}</div>'
             fb_html += "</div>"
 
+        # 액션 버튼
+        action_btns = (
+            f'<div style="display:flex; gap:6px; margin-top:14px; padding-top:10px; border-top:1px solid #334155;">'
+            f'<button onclick="showPromptModal(\'{role}\')" class="btn-action">📝 프롬프트</button>'
+            f'<button onclick="showChatModal(\'{role}\', \'{name}\')" class="btn-action">💬 대화</button>'
+            f'</div>'
+        )
+
         cards += (
             f'<div style="background:#1e293b; border-radius:12px; padding:20px; '
             f'border:1px solid #334155; flex:1; min-width:280px;">'
             f'<div style="display:flex; justify-content:space-between; align-items:center;">'
-            f'<span style="font-size:1rem;">{a["emoji"]} {a["display_name"]}</span>'
+            f'<span style="font-size:1rem;">{a["emoji"]} {name}</span>'
             f'{delta_str}'
             f'</div>'
             f'<div style="text-align:center; margin:12px 0;">'
@@ -929,10 +943,255 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
             f'</div>'
             f'{trend_html}'
             f'{fb_html}'
+            f'{action_btns}'
             f'</div>'
         )
 
     updated_at = data["updated_at"]
+
+    # CSS — 일반 문자열로 정의 (f-string 이중 중괄호 불필요)
+    _extra_css = """
+    .btn-action {
+        background: #162032; color: #38bdf8; border: 1px solid #1d4ed8;
+        padding: 5px 12px; border-radius: 6px; font-size: 0.78rem; cursor: pointer;
+        transition: background 0.15s; font-weight: 500;
+    }
+    .btn-action:hover { background: #1d3a6a; }
+    .modal-overlay {
+        display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75);
+        z-index: 1000; align-items: center; justify-content: center;
+    }
+    .modal-box {
+        background: #1e293b; border-radius: 12px; border: 1px solid #334155;
+        width: 90%; max-width: 760px; max-height: 90vh;
+        display: flex; flex-direction: column; overflow: hidden;
+    }
+    .modal-header {
+        padding: 16px 20px; border-bottom: 1px solid #334155;
+        display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
+    }
+    .modal-title { font-size: 1rem; font-weight: 600; color: #e2e8f0; }
+    .modal-close {
+        background: none; border: none; color: #64748b;
+        font-size: 1.5rem; cursor: pointer; line-height: 1; padding: 2px 6px;
+    }
+    .modal-close:hover { color: #e2e8f0; }
+    .modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; min-height: 0; }
+    .modal-footer {
+        padding: 12px 20px; border-top: 1px solid #334155;
+        display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0;
+    }
+    .mbtn { padding: 8px 18px; border-radius: 6px; border: none; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
+    .mbtn-primary { background: #38bdf8; color: #0f172a; }
+    .mbtn-primary:hover { background: #7dd3fc; }
+    .mbtn-secondary { background: #334155; color: #e2e8f0; }
+    .mbtn-secondary:hover { background: #475569; }
+    .prompt-textarea {
+        width: 100%; min-height: 280px; background: #0f172a; color: #e2e8f0;
+        border: 1px solid #334155; border-radius: 8px; padding: 12px;
+        font-family: 'Courier New', monospace; font-size: 0.82rem; line-height: 1.5; resize: vertical;
+    }
+    .prompt-textarea:focus { outline: none; border-color: #38bdf8; }
+    .sect-label { font-size: 0.8rem; color: #94a3b8; margin-bottom: 6px; margin-top: 14px; display: block; }
+    .sect-label:first-child { margin-top: 0; }
+    .feedback-readonly {
+        background: #0f172a; border: 1px solid #1e293b; border-radius: 8px;
+        padding: 12px; font-size: 0.82rem; color: #64748b; white-space: pre-wrap;
+        max-height: 150px; overflow-y: auto; font-family: monospace;
+    }
+    .chat-messages {
+        height: 380px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 4px 0;
+    }
+    .chat-msg { padding: 10px 14px; border-radius: 8px; font-size: 0.85rem; max-width: 88%; word-break: break-word; }
+    .chat-msg.user { background: #1d4ed8; color: #fff; align-self: flex-end; border-radius: 8px 8px 2px 8px; }
+    .chat-msg.assistant {
+        background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+        align-self: flex-start; border-radius: 8px 8px 8px 2px; white-space: pre-wrap;
+    }
+    .chat-msg.system-notice { color: #64748b; font-size: 0.78rem; text-align: center; align-self: center; font-style: italic; }
+    .chat-input-row { display: flex; gap: 8px; margin-top: 10px; align-items: flex-end; }
+    .chat-textarea {
+        flex: 1; background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+        border-radius: 8px; padding: 8px 12px; font-size: 0.85rem; resize: none;
+        height: 42px; font-family: 'Segoe UI', sans-serif;
+    }
+    .chat-textarea:focus { outline: none; border-color: #38bdf8; }
+    .btn-send {
+        background: #38bdf8; color: #0f172a; border: none; border-radius: 8px;
+        padding: 0 18px; font-weight: 700; cursor: pointer; height: 42px; font-size: 0.9rem;
+    }
+    .btn-send:hover { background: #7dd3fc; }
+    .btn-send:disabled { opacity: 0.5; cursor: default; }
+    """
+
+    # JavaScript — 일반 문자열로 정의 (f-string 중괄호 충돌 없음)
+    _js = """
+    var _chatHist = [];
+    var _chatRole = '';
+
+    function showPromptModal(role) {
+        var modal = document.getElementById('prompt-modal');
+        modal.style.display = 'flex';
+        document.getElementById('pm-title').textContent = '프롬프트 로딩 중...';
+        document.getElementById('pm-base').value = '';
+        document.getElementById('pm-feedback').textContent = '';
+        document.getElementById('pm-role').value = role;
+        fetch('/api/agent/prompt?role=' + encodeURIComponent(role))
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                document.getElementById('pm-title').textContent = d.role + ' — 프롬프트 설정';
+                document.getElementById('pm-base').value = d.base_prompt || '';
+                document.getElementById('pm-feedback').textContent = d.feedback_prompt || '(MetaEvaluator 피드백 없음)';
+            })
+            .catch(function(e) {
+                document.getElementById('pm-title').textContent = '오류';
+                document.getElementById('pm-base').value = '프롬프트 로드 실패: ' + e;
+            });
+    }
+
+    function closePromptModal() {
+        document.getElementById('prompt-modal').style.display = 'none';
+    }
+
+    function savePrompt() {
+        var role = document.getElementById('pm-role').value;
+        var newPrompt = document.getElementById('pm-base').value.trim();
+        if (!newPrompt) { alert('프롬프트를 입력해주세요.'); return; }
+        var btn = document.getElementById('pm-save-btn');
+        btn.disabled = true; btn.textContent = '저장 중...';
+        fetch('/api/agent/update_prompt', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({role: role, new_prompt: newPrompt})
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            btn.disabled = false; btn.textContent = '저장';
+            if (d.success) {
+                alert('프롬프트가 업데이트되었습니다.');
+                closePromptModal();
+            } else {
+                alert('업데이트 실패: ' + (d.error || '알 수 없는 오류'));
+            }
+        })
+        .catch(function(e) {
+            btn.disabled = false; btn.textContent = '저장';
+            alert('오류: ' + e);
+        });
+    }
+
+    function showChatModal(role, displayName) {
+        _chatRole = role;
+        _chatHist = [];
+        document.getElementById('cm-title').textContent = displayName + '와 대화';
+        var msgs = document.getElementById('cm-messages');
+        msgs.innerHTML = '<div class="chat-msg system-notice">안녕하세요! ' + displayName + '입니다. 무엇이든 질문해 주세요.</div>';
+        document.getElementById('cm-input').value = '';
+        document.getElementById('chat-modal').style.display = 'flex';
+        setTimeout(function() { document.getElementById('cm-input').focus(); }, 100);
+    }
+
+    function closeChatModal() {
+        document.getElementById('chat-modal').style.display = 'none';
+    }
+
+    function sendMessage() {
+        var input = document.getElementById('cm-input');
+        var msg = input.value.trim();
+        if (!msg) return;
+        input.value = '';
+        var msgs = document.getElementById('cm-messages');
+        var userDiv = document.createElement('div');
+        userDiv.className = 'chat-msg user';
+        userDiv.textContent = msg;
+        msgs.appendChild(userDiv);
+        var lid = 'ld' + Date.now();
+        var waitDiv = document.createElement('div');
+        waitDiv.className = 'chat-msg assistant';
+        waitDiv.id = lid;
+        waitDiv.textContent = '...';
+        msgs.appendChild(waitDiv);
+        msgs.scrollTop = msgs.scrollHeight;
+        var sendBtn = document.getElementById('cm-send');
+        sendBtn.disabled = true;
+        fetch('/api/agent/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({role: _chatRole, message: msg, history: _chatHist})
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            sendBtn.disabled = false;
+            var resp = d.response || '응답 없음';
+            _chatHist.push({role: 'user', content: msg});
+            _chatHist.push({role: 'assistant', content: resp});
+            var el = document.getElementById(lid);
+            if (el) el.textContent = resp;
+            msgs.scrollTop = msgs.scrollHeight;
+        })
+        .catch(function(e) {
+            sendBtn.disabled = false;
+            var el = document.getElementById(lid);
+            if (el) el.textContent = '오류: ' + e;
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        var cinput = document.getElementById('cm-input');
+        if (cinput) {
+            cinput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                }
+            });
+        }
+        var pm = document.getElementById('prompt-modal');
+        if (pm) pm.addEventListener('click', function(e) { if (e.target === this) closePromptModal(); });
+        var cm = document.getElementById('chat-modal');
+        if (cm) cm.addEventListener('click', function(e) { if (e.target === this) closeChatModal(); });
+    });
+    """
+
+    # 모달 HTML — 일반 문자열
+    _modals = """
+<div id="prompt-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span id="pm-title" class="modal-title">프롬프트 설정</span>
+      <button class="modal-close" onclick="closePromptModal()">&#215;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="pm-role">
+      <span class="sect-label">기본 역할 프롬프트 (수정 가능)</span>
+      <textarea id="pm-base" class="prompt-textarea" placeholder="로딩 중..."></textarea>
+      <span class="sect-label">MetaEvaluator 피드백 (읽기 전용)</span>
+      <div id="pm-feedback" class="feedback-readonly"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="mbtn mbtn-secondary" onclick="closePromptModal()">닫기</button>
+      <button id="pm-save-btn" class="mbtn mbtn-primary" onclick="savePrompt()">저장</button>
+    </div>
+  </div>
+</div>
+
+<div id="chat-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span id="cm-title" class="modal-title">대화</span>
+      <button class="modal-close" onclick="closeChatModal()">&#215;</button>
+    </div>
+    <div class="modal-body">
+      <div id="cm-messages" class="chat-messages"></div>
+      <div class="chat-input-row">
+        <textarea id="cm-input" class="chat-textarea"
+          placeholder="메시지 입력... (Enter: 전송, Shift+Enter: 줄바꿈)" rows="1"></textarea>
+        <button id="cm-send" class="btn-send" onclick="sendMessage()">전송</button>
+      </div>
+    </div>
+  </div>
+</div>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
@@ -955,7 +1214,11 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
                  animation: pulse 2s infinite; vertical-align: middle; }}
   @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.5; }} }}
   footer {{ text-align: center; padding: 12px; color: #334155; font-size: 0.75rem; }}
+{_extra_css}
 </style>
+<script>
+{_js}
+</script>
 </head>
 <body>
 <header>
@@ -982,6 +1245,8 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
     {cards}
   </div>
 </div>
+
+{_modals}
 
 <footer>pochaco — AI 자동매매 시스템 &nbsp;|&nbsp; 데이터는 30초마다 갱신됩니다</footer>
 </body>
@@ -1080,6 +1345,22 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._respond(500, "application/json", json.dumps({"error": str(e)}).encode())
 
+        elif self.path.startswith("/api/agent/prompt"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            role = params.get("role", [None])[0]
+            if not role or not self.coordinator:
+                body = json.dumps({"error": "role 파라미터 또는 coordinator 없음"}).encode()
+                self._respond(400, "application/json; charset=utf-8", body)
+            else:
+                data = self.coordinator.get_agent_prompt(role)
+                if data is None:
+                    body = json.dumps({"error": f"에이전트 '{role}' 없음"}).encode()
+                    self._respond(404, "application/json; charset=utf-8", body)
+                else:
+                    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                    self._respond(200, "application/json; charset=utf-8", body)
+
         elif self.path == "/profile.png":
             img_path = _APP_DIR / "profile.png"
             if img_path.exists():
@@ -1100,6 +1381,42 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 body = json.dumps({"success": False, "error": str(e)}).encode()
                 self._respond(500, "application/json; charset=utf-8", body)
+
+        elif self.path == "/api/agent/chat":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length)) if length > 0 else {}
+                role = req.get("role", "")
+                message = req.get("message", "")
+                history = req.get("history", [])
+                if not self.coordinator or not role or not message:
+                    body = json.dumps({"error": "coordinator/role/message 필수"}).encode()
+                    self._respond(400, "application/json; charset=utf-8", body)
+                else:
+                    response = self.coordinator.chat_with_agent(role, message, history)
+                    body = json.dumps({"response": response}, ensure_ascii=False).encode("utf-8")
+                    self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+                self._respond(500, "application/json; charset=utf-8", body)
+
+        elif self.path == "/api/agent/update_prompt":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length)) if length > 0 else {}
+                role = req.get("role", "")
+                new_prompt = req.get("new_prompt", "")
+                if not self.coordinator or not role or not new_prompt:
+                    body = json.dumps({"error": "coordinator/role/new_prompt 필수"}).encode()
+                    self._respond(400, "application/json; charset=utf-8", body)
+                else:
+                    success = self.coordinator.update_agent_prompt(role, new_prompt)
+                    body = json.dumps({"success": success}, ensure_ascii=False).encode("utf-8")
+                    self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                body = json.dumps({"success": False, "error": str(e)}).encode()
+                self._respond(500, "application/json; charset=utf-8", body)
+
         else:
             self._respond(404, "text/plain", b"Not Found")
 
