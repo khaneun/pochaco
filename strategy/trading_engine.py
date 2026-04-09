@@ -17,6 +17,7 @@ from core import BithumbClient
 from database import TradeRepository
 from database.models import Position
 from strategy.ai_agent import TradingAgent
+from strategy.agent_coordinator import AgentCoordinator
 from strategy.market_analyzer import MarketAnalyzer
 from strategy.strategy_optimizer import StrategyOptimizer
 from strategy.coin_selector import CoinSelector
@@ -61,7 +62,7 @@ class TradingEngine:
         self,
         client: BithumbClient,
         repo: TradeRepository,
-        agent: TradingAgent,
+        agent: TradingAgent | AgentCoordinator,
         analyzer: MarketAnalyzer,
         optimizer: StrategyOptimizer | None = None,
         selector: CoinSelector | None = None,
@@ -309,7 +310,9 @@ class TradingEngine:
             f"확신도={decision.confidence:.0%} | {decision.reason}"
         )
 
-        buy_amount = krw * 0.95
+        # 투자 비율: AgentCoordinator 사용 시 자산 운용가 결정값, 아니면 95%
+        invest_ratio = getattr(self._agent, "last_invest_ratio", 0.95)
+        buy_amount = krw * invest_ratio
         result = self._client.market_buy(decision.symbol, buy_amount)
         if result.get("status") != "0000":
             logger.error(f"[매수 실패] {result}")
@@ -317,7 +320,7 @@ class TradingEngine:
             time.sleep(2)
             krw = self._client.get_krw_balance()
             if krw >= settings.MIN_ORDER_KRW:
-                buy_amount = krw * 0.95
+                buy_amount = krw * invest_ratio
                 result = self._client.market_buy(decision.symbol, buy_amount)
                 if result.get("status") != "0000":
                     logger.error(f"[매수 재시도 실패] {result} — 30초 후 재시도")

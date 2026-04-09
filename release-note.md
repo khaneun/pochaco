@@ -2,6 +2,56 @@
 
 ---
 
+## v3.0.0 (2026-04-09)
+
+### 6개 전문가 Agent 시스템 도입 — 멀티 에이전트 아키텍처
+
+#### 아키텍처 전환: 단일 Agent → 6개 전문가 분업
+- **기존**: `TradingAgent` 1개가 코인 선정·전략 조정·성과 평가를 모두 담당
+- **변경**: 역할별 전문 Agent 6개 + `AgentCoordinator` 오케스트레이터 구조
+  | Agent | 역할 |
+  |-------|------|
+  | MarketAnalyst (시장 분석가) | 시장 전반 흐름·리스크·투자 적합성 판단 |
+  | AssetManager (자산 운용가) | 시장 상태 기반 투자 비율 결정 (0.3~0.95) |
+  | BuyStrategist (매수 전문가) | 코인 선정 + TP/SL 초기값 결정 |
+  | SellStrategist (매도 전문가) | 보유 중 TP/SL 동적 조정 |
+  | PortfolioEvaluator (포트폴리오 평가가) | 매매 후 성과 분석·파라미터 제안 |
+  | MetaEvaluator (총괄 평가가) | 6시간 주기 전체 전문가 평가·피드백·점수화 |
+
+#### 매매 파이프라인 변경 (strategy/agent_coordinator.py)
+- **코인 선정**: MarketAnalyst → AssetManager → BuyStrategist 3단계 파이프라인
+  - 시장 분석 결과가 자산 배분에, 자산 배분이 매수 전략에 반영
+  - AssetManager가 `should_invest=False` 판단 시 매수 보류 가능
+- **투자 비율**: 기존 고정 95% → AssetManager가 시장 상태에 따라 30~95% 동적 결정
+- **전략 조정**: SellStrategist 전담 (기존 프롬프트 구조 유지 + 피드백 반영)
+- **성과 평가**: PortfolioEvaluator 전담 (기존 프롬프트 구조 유지 + 피드백 반영)
+
+#### 총괄 평가 시스템 (strategy/agents/meta_evaluator.py · scheduler/jobs.py)
+- 6시간 주기(0, 6, 12, 18시) 5개 전문가를 종합 평가
+- 각 Agent에 0~100 점수 + 강점/약점/개선 지시(directive) 부여
+- **잘하는 부분**: 구체적 칭찬 + 강화 방향 제시 (priority: reinforce)
+- **못하는 부분**: 강한 피드백 + 즉시 개선 지시 (priority: critical)
+- directive가 각 Agent 프롬프트에 동적 주입 → 지속 개선 루프
+- 재시작 시 DB에서 최신 피드백 자동 복원
+
+#### DB 스키마 확장 (database/models.py)
+- `agent_scores` 테이블: 전문가별 점수·피드백·트렌드 기록
+- `agent_decision_logs` 테이블: 의사결정 기록 (MetaEvaluator 입력용)
+- 기존 테이블 변경 없음 (하위호환)
+
+#### 웹 대시보드 개편 (dashboard/web_server.py)
+- **상단 메뉴**: 종합 대시보드 / 전문가 실적표 탭 네비게이션
+- **종합 대시보드**: Agent 점수 요약 카드 추가 (5개 전문가 점수 배지)
+- **전문가 실적표** (`/experts`): 각 전문가별 점수 카드 + 트렌드 차트 + 피드백 내역
+- **JSON API** (`/api/experts`): 전문가 데이터 엔드포인트 추가
+
+#### 의존성 주입 변경 (main.py)
+- 6개 전문가 Agent 생성 → AgentCoordinator로 조립 → TradingEngine에 주입
+- LLM 공급자 1개를 6개 Agent가 공유 (토큰 효율)
+- scheduler·web dashboard에도 coordinator 주입
+
+---
+
 ## v2.5.0 (2026-04-09)
 
 ### 일별 성과 정확화 — 총자산 기반 손익 + 수수료 표시

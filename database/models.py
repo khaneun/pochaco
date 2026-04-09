@@ -112,6 +112,36 @@ class StrategyEvaluation(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class AgentScore(Base):
+    """전문가별 점수 기록 (6시간 주기 총괄 평가)"""
+    __tablename__ = "agent_scores"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_role = Column(String(30), nullable=False, index=True)
+    # market_analyst | asset_manager | buy_strategist | sell_strategist | portfolio_evaluator
+    score = Column(Float, nullable=False)           # 0~100
+    previous_score = Column(Float, nullable=True)   # 직전 점수 (트렌드)
+    strengths = Column(Text, default="")
+    weaknesses = Column(Text, default="")
+    directive = Column(Text, default="")            # 개선 지시
+    priority = Column(String(20), default="")       # reinforce | improve | critical
+    eval_period = Column(String(20), nullable=False) # "2026-04-09_06" (날짜_시)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AgentDecisionLog(Base):
+    """전문가별 의사결정 기록 (MetaEvaluator 입력용)"""
+    __tablename__ = "agent_decision_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_role = Column(String(30), nullable=False, index=True)
+    decision_type = Column(String(30), nullable=False)  # market_analysis | allocation | coin_select | exit_adjust | evaluate
+    input_summary = Column(Text, default="")       # 입력 요약
+    output_summary = Column(Text, default="")      # 출력 요약
+    position_id = Column(Integer, nullable=True)   # 관련 포지션
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 # ------------------------------------------------------------------ #
 #  엔진 팩토리                                                          #
 # ------------------------------------------------------------------ #

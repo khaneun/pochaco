@@ -1,7 +1,9 @@
 """간단한 HTTP 웹 대시보드 서버
 
-GET /           — HTML 상태 페이지 (30초 자동 갱신)
+GET /           — HTML 종합 대시보드 (30초 자동 갱신)
+GET /experts    — HTML 전문가 실적표
 GET /api/status — JSON 상태 데이터
+GET /api/experts — JSON 전문가 데이터
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from strategy import cooldown as cooldown_registry
 
 if TYPE_CHECKING:
     from core import BithumbClient
+    from strategy.agent_coordinator import AgentCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +55,7 @@ def _get_version() -> str:
 _VERSION = _get_version()
 
 
-def _build_json_status(client: "BithumbClient") -> dict:
+def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator | None" = None) -> dict:
     """현재 상태를 JSON 직렬화 가능한 dict로 반환"""
     repo = TradeRepository()
     try:
@@ -202,6 +205,7 @@ def _build_json_status(client: "BithumbClient") -> dict:
             "daily_reports": reports_data,
             "evaluations": evals_data,
             "eval_stats": eval_stats,
+            "agent_scores": coordinator.get_agent_scores() if coordinator else {},
         }
     finally:
         repo.close()
@@ -359,8 +363,16 @@ document.addEventListener('DOMContentLoaded', function() {{
 </head>
 <body>
 <header>
-  <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
-    <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
+  <div>
+    <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
+      <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
+    <nav style="margin-top:6px; display:flex; gap:8px;">
+      <a href="/" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
+         border-radius:6px; background:{nav_dashboard_bg};">종합 대시보드</a>
+      <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
+         border-radius:6px; background:{nav_experts_bg};">전문가 실적표</a>
+    </nav>
+  </div>
   <span><span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
 </header>
 
@@ -430,6 +442,14 @@ document.addEventListener('DOMContentLoaded', function() {{
       <span class="pg-info">1 / 1</span>
       <button class="pg-next">다음 &raquo;</button>
     </div>
+  </div>
+</div>
+
+<!-- 전문가 점수 요약 -->
+<div style="padding: 0 20px 16px;">
+  <div class="card">
+    <h2>🤖 전문가 Agent 점수</h2>
+    {agent_scores_html}
   </div>
 </div>
 
@@ -722,9 +742,44 @@ def _render_html(data: dict) -> str:
     else:
         evals_html = '<div class="no-data">성과 평가 데이터 없음<br>(매매 완료 후 자동 기록)</div>'
 
+    # 전문가 점수 요약 HTML
+    agent_scores = data.get("agent_scores", {})
+    _role_names = {
+        "market_analyst": "시장 분석가",
+        "asset_manager": "자산 운용가",
+        "buy_strategist": "매수 전문가",
+        "sell_strategist": "매도 전문가",
+        "portfolio_evaluator": "포트폴리오 평가가",
+    }
+    if agent_scores:
+        score_cards = '<div style="display:flex; gap:10px; flex-wrap:wrap;">'
+        for role, name in _role_names.items():
+            sc = agent_scores.get(role, 50.0)
+            if sc >= 70:
+                sc_color = "#4ade80"
+            elif sc >= 40:
+                sc_color = "#facc15"
+            else:
+                sc_color = "#f87171"
+            score_cards += (
+                f'<div style="flex:1; min-width:120px; background:#0f172a; border-radius:8px; '
+                f'padding:12px; text-align:center; border:1px solid #334155;">'
+                f'<div style="font-size:0.75rem; color:#94a3b8;">{name}</div>'
+                f'<div style="font-size:1.6rem; font-weight:700; color:{sc_color};">{sc:.0f}</div>'
+                f'<div style="font-size:0.7rem; color:#475569;">/ 100</div>'
+                f'</div>'
+            )
+        score_cards += '</div>'
+        score_cards += '<div style="text-align:center; margin-top:8px; font-size:0.75rem; color:#475569;">상세: <a href="/experts" style="color:#38bdf8;">전문가 실적표 →</a></div>'
+        agent_scores_html = score_cards
+    else:
+        agent_scores_html = '<div class="no-data">전문가 평가 데이터 없음<br>(6시간 주기 평가 후 표시)</div>'
+
     return _HTML_TEMPLATE.format(
         updated_at=data["updated_at"],
         version=data.get("version", ""),
+        nav_dashboard_bg="#334155",
+        nav_experts_bg="transparent",
         total_assets_fmt=fmt_krw(bal["total_assets"]),
         krw_fmt=fmt_krw(bal["krw"]),
         pos_asset_line=pos_asset_line,
@@ -741,7 +796,196 @@ def _render_html(data: dict) -> str:
         trades_html=trades_html,
         eval_summary_html=eval_summary_html,
         evals_html=evals_html,
+        agent_scores_html=agent_scores_html,
     )
+
+
+_ROLE_DISPLAY = {
+    "market_analyst": ("시장 분석가", "📊"),
+    "asset_manager": ("자산 운용가", "💰"),
+    "buy_strategist": ("매수 전문가", "🎯"),
+    "sell_strategist": ("매도 전문가", "📉"),
+    "portfolio_evaluator": ("포트폴리오 평가가", "📋"),
+}
+
+
+def _build_experts_data(coordinator: "AgentCoordinator | None") -> dict:
+    """전문가 실적표 JSON 데이터"""
+    repo = TradeRepository()
+    try:
+        agents_data = []
+        all_history = repo.get_all_agent_score_history(limit=28)
+        latest_scores = repo.get_latest_agent_scores()
+        latest_map = {s.agent_role: s for s in latest_scores}
+
+        for role, (name, emoji) in _ROLE_DISPLAY.items():
+            latest = latest_map.get(role)
+            history = all_history.get(role, [])
+            score_trend = [round(h.score, 1) for h in reversed(history[:16])]
+
+            agent_info = {
+                "role": role,
+                "display_name": name,
+                "emoji": emoji,
+                "current_score": round(latest.score, 1) if latest else 50.0,
+                "previous_score": round(latest.previous_score, 1) if latest and latest.previous_score else None,
+                "score_trend": score_trend,
+                "last_feedback": None,
+            }
+            if latest:
+                agent_info["last_feedback"] = {
+                    "strengths": latest.strengths or "",
+                    "weaknesses": latest.weaknesses or "",
+                    "directive": latest.directive or "",
+                    "priority": latest.priority or "",
+                    "evaluated_at": _to_kst(latest.created_at).strftime("%m-%d %H:%M"),
+                }
+            # 라이브 점수 (coordinator에서 메모리 기반)
+            if coordinator:
+                live = coordinator.get_agent_scores()
+                agent_info["current_score"] = round(live.get(role, agent_info["current_score"]), 1)
+
+            agents_data.append(agent_info)
+
+        return {
+            "updated_at": _kst_now().strftime("%m-%d %H:%M:%S"),
+            "agents": agents_data,
+        }
+    finally:
+        repo.close()
+
+
+def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
+    """전문가 실적표 HTML 페이지 렌더링"""
+    data = _build_experts_data(coordinator)
+    version = _VERSION
+
+    # 카드 HTML
+    cards = ""
+    for a in data["agents"]:
+        sc = a["current_score"]
+        if sc >= 70:
+            sc_color, sc_bg = "#4ade80", "#14532d"
+        elif sc >= 40:
+            sc_color, sc_bg = "#facc15", "#422006"
+        else:
+            sc_color, sc_bg = "#f87171", "#450a0a"
+
+        prev = a.get("previous_score")
+        delta_str = ""
+        if prev is not None:
+            delta = sc - prev
+            if delta > 0:
+                delta_str = f'<span style="color:#4ade80; font-size:0.8rem;">+{delta:.1f}</span>'
+            elif delta < 0:
+                delta_str = f'<span style="color:#f87171; font-size:0.8rem;">{delta:.1f}</span>'
+
+        # 트렌드 바 차트
+        trend = a.get("score_trend", [])
+        trend_html = ""
+        if trend:
+            max_s = max(trend) if trend else 100
+            bars = ""
+            for val in trend:
+                h = max(2, int(val / max_s * 40))
+                c = "#4ade80" if val >= 70 else "#facc15" if val >= 40 else "#f87171"
+                bars += f'<div style="width:6px; height:{h}px; background:{c}; border-radius:2px;"></div>'
+            trend_html = f'<div style="display:flex; gap:2px; align-items:flex-end; justify-content:center; height:45px; margin-top:8px;">{bars}</div>'
+
+        # 피드백
+        fb = a.get("last_feedback")
+        fb_html = ""
+        if fb and (fb["strengths"] or fb["weaknesses"]):
+            priority_badge = ""
+            p = fb.get("priority", "")
+            if p == "critical":
+                priority_badge = '<span style="background:#450a0a; color:#f87171; padding:2px 6px; border-radius:4px; font-size:0.7rem; font-weight:600;">개선 시급</span>'
+            elif p == "improve":
+                priority_badge = '<span style="background:#422006; color:#facc15; padding:2px 6px; border-radius:4px; font-size:0.7rem; font-weight:600;">개선 필요</span>'
+            elif p == "reinforce":
+                priority_badge = '<span style="background:#14532d; color:#4ade80; padding:2px 6px; border-radius:4px; font-size:0.7rem; font-weight:600;">강화 유지</span>'
+            fb_html = (
+                f'<div style="margin-top:10px; padding-top:10px; border-top:1px solid #334155; font-size:0.78rem;">'
+                f'{priority_badge} <span style="color:#475569; font-size:0.7rem;">{fb.get("evaluated_at", "")}</span>'
+            )
+            if fb["strengths"]:
+                fb_html += f'<div style="margin-top:6px; color:#4ade80;">✓ {fb["strengths"]}</div>'
+            if fb["weaknesses"]:
+                fb_html += f'<div style="margin-top:4px; color:#f87171;">✗ {fb["weaknesses"]}</div>'
+            if fb.get("directive"):
+                fb_html += f'<div style="margin-top:4px; color:#94a3b8; font-style:italic;">→ {fb["directive"]}</div>'
+            fb_html += "</div>"
+
+        cards += (
+            f'<div style="background:#1e293b; border-radius:12px; padding:20px; '
+            f'border:1px solid #334155; flex:1; min-width:280px;">'
+            f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+            f'<span style="font-size:1rem;">{a["emoji"]} {a["display_name"]}</span>'
+            f'{delta_str}'
+            f'</div>'
+            f'<div style="text-align:center; margin:12px 0;">'
+            f'<div style="font-size:2.5rem; font-weight:700; color:{sc_color};">{sc:.0f}</div>'
+            f'<div style="font-size:0.75rem; color:#475569;">/ 100</div>'
+            f'</div>'
+            f'{trend_html}'
+            f'{fb_html}'
+            f'</div>'
+        )
+
+    updated_at = data["updated_at"]
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="30">
+<title>Pochaco - 전문가 실적표</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }}
+  header {{ background: #1e293b; padding: 16px 24px; border-bottom: 1px solid #334155;
+            display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }}
+  header h1 {{ font-size: 1.4rem; color: #38bdf8; font-weight: 700; }}
+  .profile-img {{ width: 2rem; height: 2rem; border-radius: 50%;
+                  object-fit: cover; margin-right: 10px; vertical-align: middle;
+                  border: 2px solid #334155; }}
+  .health-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                 background: #4ade80; box-shadow: 0 0 6px #4ade80; margin-right: 6px;
+                 animation: pulse 2s infinite; vertical-align: middle; }}
+  @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.5; }} }}
+  footer {{ text-align: center; padding: 12px; color: #334155; font-size: 0.75rem; }}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
+      <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
+    <nav style="margin-top:6px; display:flex; gap:8px;">
+      <a href="/" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
+         border-radius:6px; background:transparent;">종합 대시보드</a>
+      <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
+         border-radius:6px; background:#334155;">전문가 실적표</a>
+    </nav>
+  </div>
+  <span><span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
+</header>
+
+<div style="padding:20px;">
+  <h2 style="color:#e2e8f0; margin-bottom:16px; font-size:1.1rem;">전문가 Agent 실적표</h2>
+  <p style="color:#64748b; font-size:0.82rem; margin-bottom:20px;">
+    6시간 주기(0·6·12·18시) 총괄 평가가가 각 전문가를 평가합니다.
+    잘하는 부분은 강화, 못하는 부분은 강한 피드백을 부여합니다.
+  </p>
+  <div style="display:flex; gap:16px; flex-wrap:wrap;">
+    {cards}
+  </div>
+</div>
+
+<footer>pochaco — AI 자동매매 시스템 &nbsp;|&nbsp; 데이터는 30초마다 갱신됩니다</footer>
+</body>
+</html>"""
 
 
 def _liquidate_position(client: "BithumbClient") -> dict:
@@ -799,6 +1043,7 @@ def _liquidate_position(client: "BithumbClient") -> dict:
 
 class _Handler(BaseHTTPRequestHandler):
     client: "BithumbClient"
+    coordinator: "AgentCoordinator | None" = None
 
     def log_message(self, fmt, *args):
         pass  # 액세스 로그 억제
@@ -806,15 +1051,30 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             try:
-                data = _build_json_status(self.client)
+                data = _build_json_status(self.client, self.coordinator)
                 body = _render_html(data).encode("utf-8")
+                self._respond(200, "text/html; charset=utf-8", body)
+            except Exception as e:
+                self._respond(500, "text/plain", f"Error: {e}".encode())
+
+        elif self.path == "/experts":
+            try:
+                body = _render_experts_page(self.coordinator).encode("utf-8")
                 self._respond(200, "text/html; charset=utf-8", body)
             except Exception as e:
                 self._respond(500, "text/plain", f"Error: {e}".encode())
 
         elif self.path == "/api/status":
             try:
-                data = _build_json_status(self.client)
+                data = _build_json_status(self.client, self.coordinator)
+                body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+                self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                self._respond(500, "application/json", json.dumps({"error": str(e)}).encode())
+
+        elif self.path == "/api/experts":
+            try:
+                data = _build_experts_data(self.coordinator)
                 body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
                 self._respond(200, "application/json; charset=utf-8", body)
             except Exception as e:
@@ -854,14 +1114,24 @@ class _Handler(BaseHTTPRequestHandler):
 class WebDashboard:
     """백그라운드 HTTP 대시보드 서버"""
 
-    def __init__(self, client: "BithumbClient", host: str, port: int):
+    def __init__(
+        self,
+        client: "BithumbClient",
+        host: str,
+        port: int,
+        coordinator: "AgentCoordinator | None" = None,
+    ):
         self._client = client
         self._host = host
         self._port = port
+        self._coordinator = coordinator
         self._server: ThreadingHTTPServer | None = None
 
     def start(self) -> None:
-        handler = type("Handler", (_Handler,), {"client": self._client})
+        handler = type("Handler", (_Handler,), {
+            "client": self._client,
+            "coordinator": self._coordinator,
+        })
         self._server = ThreadingHTTPServer((self._host, self._port), handler)
 
         thread = threading.Thread(

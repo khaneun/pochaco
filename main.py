@@ -13,9 +13,14 @@ import time
 
 from config import settings
 from core import BithumbClient
+from core.llm_provider import get_llm_provider
 from core.telegram_bot import TelegramBot
 from database import TradeRepository
-from strategy import TradingAgent, MarketAnalyzer, TradingEngine, StrategyOptimizer, CoinSelector
+from strategy import MarketAnalyzer, TradingEngine, StrategyOptimizer, CoinSelector, AgentCoordinator
+from strategy.agents import (
+    MarketAnalyst, AssetManager, BuyStrategist,
+    SellStrategist, PortfolioEvaluator, MetaEvaluator,
+)
 from scheduler import TradingScheduler
 from dashboard import Dashboard
 from dashboard.web_server import WebDashboard
@@ -60,14 +65,40 @@ def check_config() -> None:
 def main() -> None:
     check_config()
 
-    # 의존성 주입
+    # 인프라 의존성
     client    = BithumbClient()
     repo      = TradeRepository()
-    agent     = TradingAgent()
     analyzer  = MarketAnalyzer(client)
-    optimizer = StrategyOptimizer()   # 수익 극대화 전략 최적화 Agent
-    selector  = CoinSelector()       # 변동성·모멘텀 기반 종목 필터링 Agent
-    engine    = TradingEngine(client, repo, agent, analyzer, optimizer, selector)
+    optimizer = StrategyOptimizer()
+    selector  = CoinSelector()
+
+    # LLM 공급자 (공유)
+    llm = get_llm_provider()
+
+    # 6개 전문가 Agent 생성
+    market_analyst      = MarketAnalyst(llm=llm)
+    asset_manager       = AssetManager(llm=llm)
+    buy_strategist      = BuyStrategist(llm=llm)
+    sell_strategist     = SellStrategist(llm=llm)
+    portfolio_evaluator = PortfolioEvaluator(llm=llm)
+    meta_evaluator      = MetaEvaluator(llm=llm)
+
+    # 코디네이터 (기존 TradingAgent 대체)
+    coordinator = AgentCoordinator(
+        market_analyst=market_analyst,
+        asset_manager=asset_manager,
+        buy_strategist=buy_strategist,
+        sell_strategist=sell_strategist,
+        portfolio_evaluator=portfolio_evaluator,
+        meta_evaluator=meta_evaluator,
+        repo=repo,
+    )
+
+    # DB에서 최신 피드백 로드 → Agent에 주입 (재시작 시 피드백 유지)
+    coordinator.restore_feedbacks_from_db()
+
+    # 매매 엔진 (coordinator로 교체)
+    engine = TradingEngine(client, repo, coordinator, analyzer, optimizer, selector)
 
     # 텔레그램 봇 초기화 (TELEGRAM_ENABLED=true 시)
     telegram: TelegramBot | None = None
@@ -88,13 +119,17 @@ def main() -> None:
         repo=repo,
         get_daily_start_krw=lambda: engine.daily_start_krw,
         notifier=telegram,
+        coordinator=coordinator,
     )
     dashboard = Dashboard(client, repo)
 
     # 웹 대시보드 초기화 (DASHBOARD_ENABLED=true 시)
     web: WebDashboard | None = None
     if settings.DASHBOARD_ENABLED:
-        web = WebDashboard(client, settings.DASHBOARD_HOST, settings.DASHBOARD_PORT)
+        web = WebDashboard(
+            client, settings.DASHBOARD_HOST, settings.DASHBOARD_PORT,
+            coordinator=coordinator,
+        )
 
     # Graceful shutdown
     def handle_signal(sig, frame):
@@ -120,7 +155,7 @@ def main() -> None:
         telegram.start()
         telegram.notify_start()
 
-    # 스케줄러 시작 (백그라운드: 백업·리포트)
+    # 스케줄러 시작 (백그라운드: 백업·리포트·총괄평가)
     scheduler.start()
 
     # 매매 엔진 시작 (백그라운드 스레드)
@@ -133,9 +168,9 @@ def main() -> None:
 
     logger.info(f"pochaco 시작 (HEADLESS={settings.HEADLESS})")
     logger.info(f"LLM 공급자: {settings.LLM_PROVIDER} / 감시 주기: {settings.POSITION_CHECK_INTERVAL}초")
+    logger.info("6개 전문가 Agent 시스템 활성화")
 
     if settings.HEADLESS:
-        # 서비스 모드: 터미널 UI 없이 실행, SIGINT/SIGTERM으로 종료
         logger.info("헤드리스 모드 — 웹 대시보드 및 텔레그램으로 모니터링하세요.")
         try:
             while True:
@@ -143,7 +178,6 @@ def main() -> None:
         except (KeyboardInterrupt, SystemExit):
             pass
     else:
-        # 터미널 모드: Rich Live 대시보드 실행 (블로킹)
         dashboard.run()
 
     # 종료 정리

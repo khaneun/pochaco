@@ -1,4 +1,4 @@
-"""APScheduler — 일별 리포트 및 DB 백업 전용
+"""APScheduler — 일별 리포트, DB 백업, 총괄 전문가 평가
 
 매매 로직(현금화·코인선정·매수)은 TradingEngine이 담당합니다.
 """
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class TradingScheduler:
-    """일별 성과 기록 및 SQLite 백업 스케줄러"""
+    """일별 성과 기록, SQLite 백업, 6시간 총괄 평가 스케줄러"""
 
     def __init__(
         self,
@@ -23,11 +23,13 @@ class TradingScheduler:
         repo: TradeRepository,
         get_daily_start_krw,          # callable: () -> float
         notifier=None,                # TelegramBot (선택)
+        coordinator=None,             # AgentCoordinator (선택)
     ):
         self._client = client
         self._repo = repo
         self._get_daily_start_krw = get_daily_start_krw
         self._notifier = notifier
+        self._coordinator = coordinator
         self._scheduler = BackgroundScheduler(timezone="Asia/Seoul")
 
     def start(self) -> None:
@@ -45,8 +47,17 @@ class TradingScheduler:
             id="db_backup",
             replace_existing=True,
         )
+        # 6시간마다 총괄 전문가 평가 (0, 6, 12, 18시)
+        if self._coordinator:
+            self._scheduler.add_job(
+                self._job_meta_evaluation,
+                CronTrigger(hour="0,6,12,18", minute=0),
+                id="meta_evaluation",
+                replace_existing=True,
+            )
         self._scheduler.start()
-        logger.info("스케줄러 시작 (23:50 백업 / 23:55 리포트)")
+        meta_str = " / 0·6·12·18시 총괄평가" if self._coordinator else ""
+        logger.info(f"스케줄러 시작 (23:50 백업 / 23:55 리포트{meta_str})")
 
     def stop(self) -> None:
         self._scheduler.shutdown(wait=False)
@@ -80,7 +91,6 @@ class TradingScheduler:
             win_count = sum(1 for t in sell_trades if "익절" in (t.note or ""))
 
             # 수수료 추정: 거래 금액 × 0.25% (빗썸 기본 수수료)
-            # Trade.fee가 0으로 저장되는 경우 krw_amount 기반 추정값 사용
             total_fee = sum(
                 (t.fee if t.fee and t.fee > 0 else t.krw_amount * 0.0025)
                 for t in today_trades
@@ -111,3 +121,27 @@ class TradingScheduler:
                     logger.warning(f"텔레그램 일별 리포트 알림 실패: {ne}")
         except Exception as e:
             logger.error(f"일별 리포트 저장 실패: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  총괄 전문가 평가 (6시간 주기)                                         #
+    # ------------------------------------------------------------------ #
+    def _job_meta_evaluation(self) -> None:
+        """0, 6, 12, 18시에 실행 — 5개 전문가를 종합 평가"""
+        try:
+            feedbacks = self._coordinator.run_meta_evaluation()
+            logger.info(f"[총괄 평가] {len(feedbacks)}개 Agent 평가 완료")
+            for fb in feedbacks:
+                logger.info(
+                    f"  {fb.agent_role}: {fb.score:.0f}점 ({fb.priority})"
+                )
+
+            if self._notifier and feedbacks:
+                try:
+                    lines = [f"  {fb.agent_role}: {fb.score:.0f}점" for fb in feedbacks]
+                    self._notifier.send(
+                        f"📋 <b>총괄 전문가 평가 완료</b>\n" + "\n".join(lines)
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"[총괄 평가 오류] {e}", exc_info=True)

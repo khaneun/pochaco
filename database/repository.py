@@ -1,11 +1,16 @@
 """DB CRUD 레이어 (thread-safe)"""
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional, Generator
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from .models import SessionLocal, Trade, Position, DailyReport, StrategyEvaluation
+from .models import (
+    SessionLocal, Trade, Position, DailyReport, StrategyEvaluation,
+    AgentScore, AgentDecisionLog,
+)
 
 
 class TradeRepository:
@@ -422,3 +427,116 @@ class TradeRepository:
                 "sl_clamp_min": sl_clamp_min,
                 "sl_clamp_max": sl_clamp_max,
             }
+
+    # ------------------------------------------------------------------ #
+    #  AgentScore                                                          #
+    # ------------------------------------------------------------------ #
+    def save_agent_scores(self, scores: list[dict]) -> None:
+        """총괄 평가 결과 일괄 저장
+        scores: [{"agent_role": "market_analyst", "score": 75, "previous_score": 70,
+                   "strengths": "...", "weaknesses": "...", "directive": "...",
+                   "priority": "reinforce", "eval_period": "2026-04-09_06"}]
+        """
+        with self._session() as db:
+            for s in scores:
+                record = AgentScore(
+                    agent_role=s["agent_role"],
+                    score=s["score"],
+                    previous_score=s.get("previous_score"),
+                    strengths=s.get("strengths", ""),
+                    weaknesses=s.get("weaknesses", ""),
+                    directive=s.get("directive", ""),
+                    priority=s.get("priority", ""),
+                    eval_period=s["eval_period"],
+                )
+                db.add(record)
+
+    def get_latest_agent_scores(self) -> list[AgentScore]:
+        """각 agent_role별 최신 점수 1건씩 반환 (5개)"""
+        with self._session() as db:
+            # 서브쿼리: 각 role별 max(created_at)
+            subq = (
+                db.query(
+                    AgentScore.agent_role,
+                    func.max(AgentScore.created_at).label("max_created"),
+                )
+                .group_by(AgentScore.agent_role)
+                .subquery()
+            )
+            rows = (
+                db.query(AgentScore)
+                .join(
+                    subq,
+                    (AgentScore.agent_role == subq.c.agent_role)
+                    & (AgentScore.created_at == subq.c.max_created),
+                )
+                .all()
+            )
+            db.expunge_all()
+            return rows
+
+    def get_agent_score_history(self, agent_role: str, limit: int = 28) -> list[AgentScore]:
+        """특정 전문가의 점수 이력 (최근 28건 = 7일 x 4회/일)"""
+        with self._session() as db:
+            rows = (
+                db.query(AgentScore)
+                .filter(AgentScore.agent_role == agent_role)
+                .order_by(AgentScore.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            db.expunge_all()
+            return rows
+
+    def get_all_agent_score_history(self, limit: int = 28) -> dict[str, list[AgentScore]]:
+        """전체 전문가의 점수 이력을 role별 dict로 반환"""
+        with self._session() as db:
+            # 전체 role 목록 조회
+            roles = [r[0] for r in db.query(AgentScore.agent_role).distinct().all()]
+            result: dict[str, list[AgentScore]] = {}
+            for role in roles:
+                rows = (
+                    db.query(AgentScore)
+                    .filter(AgentScore.agent_role == role)
+                    .order_by(AgentScore.created_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+                result[role] = rows
+            db.expunge_all()
+            return result
+
+    # ------------------------------------------------------------------ #
+    #  AgentDecisionLog                                                    #
+    # ------------------------------------------------------------------ #
+    def save_decision_log(
+        self,
+        agent_role: str,
+        decision_type: str,
+        input_summary: str,
+        output_summary: str,
+        position_id: int | None = None,
+    ) -> None:
+        """의사결정 기록 저장"""
+        with self._session() as db:
+            log = AgentDecisionLog(
+                agent_role=agent_role,
+                decision_type=decision_type,
+                input_summary=input_summary,
+                output_summary=output_summary,
+                position_id=position_id,
+            )
+            db.add(log)
+
+    def get_recent_decision_logs(self, hours: int = 6) -> list[AgentDecisionLog]:
+        """최근 N시간 내 의사결정 기록 (MetaEvaluator 입력용)"""
+        with self._session() as db:
+            since = datetime.utcnow() - timedelta(hours=hours)
+            rows = (
+                db.query(AgentDecisionLog)
+                .filter(AgentDecisionLog.created_at >= since)
+                .order_by(AgentDecisionLog.created_at.desc())
+                .all()
+            )
+            db.expunge_all()
+            return rows
