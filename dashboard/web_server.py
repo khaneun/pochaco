@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -54,6 +55,21 @@ def _get_version() -> str:
 
 
 _VERSION = _get_version()
+
+
+def _parse_manual_note(note: str) -> tuple[float | None, float | None, float | None]:
+    """대시보드 청산 노트에서 (pnl_pct, pnl_krw, held_min) 파싱"""
+    pnl_pct = pnl_krw = held_min = None
+    m = re.search(r'([+-]?\d+\.?\d*)%', note)
+    if m:
+        pnl_pct = float(m.group(1))
+    m = re.search(r'([+-]?[\d,]+)원', note)
+    if m:
+        pnl_krw = float(m.group(1).replace(',', ''))
+    m = re.search(r'(\d+\.?\d*)분', note)
+    if m:
+        held_min = float(m.group(1))
+    return pnl_pct, pnl_krw, held_min
 
 
 def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator | None" = None) -> dict:
@@ -137,7 +153,6 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
 
         stats = repo.get_total_stats()
         recent_trades = repo.get_all_trades(limit=100)
-        recent_reports = repo.get_recent_reports(7)
 
         trades_data = [
             {
@@ -151,32 +166,26 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
             }
             for t in recent_trades
         ]
-        reports_data = [
-            {
-                "date": r.date,
-                "starting_krw": round(r.starting_krw, 0),
-                "ending_krw": round(r.ending_krw, 0),
-                "pnl_krw": round(r.pnl_krw, 0),
-                "pnl_pct": round(r.pnl_pct, 2),
-                "total_fee": round(getattr(r, "total_fee", 0.0) or 0.0, 0),
-                "trade_count": r.trade_count,
-                "win_count": r.win_count,
-            }
-            for r in reversed(recent_reports)
-        ]
 
         initial = stats["initial_krw"]
         total_pnl_pct = (total - initial) / initial * 100 if initial > 0 else 0.0
 
-        # 성과 평가 데이터
+        # 성과 평가 데이터 (pnl_krw: position.buy_krw 기반 추정)
         recent_evals = repo.get_recent_evaluations(limit=10)
         eval_stats = repo.get_evaluation_stats(last_n=10)
-        evals_data = [
-            {
+        pos_history = repo.get_position_history(limit=100)
+        pos_map = {p.id: p for p in pos_history}
+        evals_data = []
+        for ev in recent_evals:
+            p_rec = pos_map.get(ev.position_id)
+            buy_krw = p_rec.buy_krw if p_rec else 0
+            pnl_krw_est = round(buy_krw * ev.pnl_pct / 100, 0) if buy_krw else None
+            evals_data.append({
                 "time": _to_kst(ev.created_at).strftime("%m-%d %H:%M:%S"),
                 "symbol": ev.symbol,
                 "exit_type": ev.exit_type,
                 "pnl_pct": round(ev.pnl_pct, 2),
+                "pnl_krw": pnl_krw_est,
                 "held_minutes": round(ev.held_minutes, 1),
                 "original_tp": ev.original_tp_pct,
                 "original_sl": ev.original_sl_pct,
@@ -184,9 +193,22 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                 "suggested_sl": ev.suggested_sl_pct,
                 "evaluation": ev.evaluation,
                 "lesson": ev.lesson or "",
-            }
-            for ev in recent_evals
-        ]
+            })
+
+        # 수동 청산 이력 (대시보드 청산 버튼)
+        manual_trades_data = []
+        for t in recent_trades:
+            note = t.note or ""
+            if "대시보드 청산" in note:
+                pnl_pct_m, pnl_krw_m, held_m = _parse_manual_note(note)
+                manual_trades_data.append({
+                    "time": _to_kst(t.created_at).strftime("%m-%d %H:%M:%S"),
+                    "symbol": t.symbol,
+                    "sell_krw": round(t.krw_amount, 0),
+                    "pnl_pct": pnl_pct_m,
+                    "pnl_krw": pnl_krw_m,
+                    "held_min": held_m,
+                })
 
         return {
             "updated_at": _kst_now().strftime("%m-%d %H:%M:%S"),
@@ -203,8 +225,8 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
             },
             "position": position_data,
             "recent_trades": trades_data,
-            "daily_reports": reports_data,
             "evaluations": evals_data,
+            "manual_trades": manual_trades_data,
             "eval_stats": eval_stats,
             "agent_scores": coordinator.get_agent_scores() if coordinator else {},
         }
@@ -281,6 +303,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   footer {{ text-align: center; padding: 12px; color: #334155; font-size: 0.75rem; }}
   .no-data {{ color: #475569; font-style: italic; text-align: center;
               padding: 20px; }}
+  .pnl-link {{ cursor: pointer; text-decoration: underline dotted; }}
+  .pnl-link:hover {{ opacity: 0.8; }}
+{extra_css}
 </style>
 <script>
 function liquidatePosition() {{
@@ -319,16 +344,18 @@ function toggleMore(btn) {{
   }}
 }}
 
-/* 페이지네이션: 2줄씩 묶인 tr 그룹 단위로 페이징 */
-function initPager(tableId, pagerId, rowsPerPage) {{
+/* 페이지네이션 — rowStep: 1=단일행, 2=2행묶음(기본) */
+function initPager(tableId, pagerId, rowsPerPage, rowStep) {{
+  var step = rowStep || 2;
   var table = document.getElementById(tableId);
   if (!table) return;
   var tbody = table.querySelector('tbody') || table;
   var allRows = Array.from(tbody.querySelectorAll('tr:not(:first-child)'));
-  /* 2줄(main+sub)이 한 그룹 */
   var groups = [];
-  for (var i = 0; i < allRows.length; i += 2) {{
-    groups.push([allRows[i], allRows[i+1]]);
+  for (var i = 0; i < allRows.length; i += step) {{
+    var grp = [];
+    for (var k = 0; k < step; k++) {{ if (allRows[i+k]) grp.push(allRows[i+k]); }}
+    groups.push(grp);
   }}
   var totalPages = Math.ceil(groups.length / rowsPerPage) || 1;
   var page = 0;
@@ -357,9 +384,10 @@ function initPager(tableId, pagerId, rowsPerPage) {{
 }}
 
 document.addEventListener('DOMContentLoaded', function() {{
-  initPager('eval-table', 'eval-pager', 3);
+  initPager('eval-table', 'eval-pager', 5, 1);
   initPager('trade-table', 'trade-pager', 10);
 }});
+{extra_js}
 </script>
 </head>
 <body>
@@ -367,14 +395,16 @@ document.addEventListener('DOMContentLoaded', function() {{
   <div>
     <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
       <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
-    <nav style="margin-top:6px; display:flex; gap:8px;">
-      <a href="/" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
-         border-radius:6px; background:{nav_dashboard_bg};">종합 대시보드</a>
-      <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
-         border-radius:6px; background:{nav_experts_bg};">전문가 실적표</a>
-    </nav>
+    <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
+      <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침
+    </div>
   </div>
-  <span><span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
+  <nav style="display:flex; gap:8px; align-items:center;">
+    <a href="/" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:{nav_dashboard_bg};">종합 대시보드</a>
+    <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:{nav_experts_bg};">전문가 실적표</a>
+  </nav>
 </header>
 
 <div class="grid">
@@ -411,12 +441,6 @@ document.addEventListener('DOMContentLoaded', function() {{
     {position_html}
   </div>
 
-  <!-- 일별 성과 -->
-  <div class="card">
-    <h2>📅 일별 성과 (최근 7일)</h2>
-    {reports_html}
-  </div>
-
 </div>
 
 <!-- AI 성과 평가 & 전략 조정 -->
@@ -432,6 +456,8 @@ document.addEventListener('DOMContentLoaded', function() {{
     </div>
   </div>
 </div>
+
+{manual_trades_section}
 
 <!-- 거래 내역 -->
 <div style="padding: 0 20px 20px;">
@@ -454,6 +480,8 @@ document.addEventListener('DOMContentLoaded', function() {{
   </div>
 </div>
 
+<script>var _evalPopup = {eval_js_data};</script>
+{eval_detail_modal}
 <footer>pochaco — AI 자동매매 시스템 &nbsp;|&nbsp; 데이터는 30초마다 갱신됩니다</footer>
 </body>
 </html>"""
@@ -592,65 +620,6 @@ def _render_html(data: dict) -> str:
     else:
         position_html = '<div class="no-data">현재 보유 포지션 없음<br>AI 코인 선정 대기 중...</div>'
 
-    # 일별 성과 HTML
-    if data["daily_reports"]:
-        rows = ""
-        total_pnl_sum = 0.0
-        total_fee_sum = 0.0
-        for r in reversed(data["daily_reports"]):
-            sign = "+" if r["pnl_krw"] >= 0 else ""
-            color = "green" if r["pnl_krw"] >= 0 else "red"
-            badge_cls = "badge-green" if r["pnl_krw"] >= 0 else "badge-red"
-            # 매수/매도 쌍 → 사이클 수 (trade_count // 2)
-            cycle_count = r["trade_count"] // 2 if r["trade_count"] > 0 else 0
-            win_c = r["win_count"]
-            loss_c = max(0, cycle_count - win_c)
-            total_pnl_sum += r["pnl_krw"]
-            total_fee_sum += r["total_fee"]
-            start_str = f'{r["starting_krw"]:,.0f}' if r["starting_krw"] > 0 else "-"
-            end_str   = f'{r["ending_krw"]:,.0f}'   if r["ending_krw"] > 0 else "-"
-            fee_str   = f'{r["total_fee"]:,.0f}'     if r["total_fee"] > 0 else "-"
-            rows += (
-                f"<tr>"
-                f"<td><b>{r['date'][5:]}</b></td>"
-                f"<td style='text-align:right; color:#94a3b8; font-size:0.8rem'>{start_str}</td>"
-                f"<td style='text-align:right; color:#94a3b8; font-size:0.8rem'>{end_str}</td>"
-                f'<td style="text-align:right" class="{color}">{sign}{r["pnl_krw"]:,.0f}</td>'
-                f'<td style="text-align:right" class="{color}">{sign}{r["pnl_pct"]:.2f}%</td>'
-                f'<td style="text-align:right; color:#f59e0b; font-size:0.8rem">▼{fee_str}</td>'
-                f'<td style="text-align:center"><span class="badge {badge_cls}">'
-                f'{win_c}승/{loss_c}패</span></td>'
-                f"</tr>"
-            )
-        # 합계 행
-        sum_color = "green" if total_pnl_sum >= 0 else "red"
-        sum_sign  = "+" if total_pnl_sum >= 0 else ""
-        rows += (
-            f"<tr style='border-top:2px solid #475569; background:#0f172a;'>"
-            f"<td><b>합계</b></td>"
-            f"<td></td><td></td>"
-            f'<td style="text-align:right; font-weight:700" class="{sum_color}">'
-            f'{sum_sign}{total_pnl_sum:,.0f}</td>'
-            f"<td></td>"
-            f'<td style="text-align:right; color:#f59e0b; font-weight:700">▼{total_fee_sum:,.0f}</td>'
-            f"<td></td>"
-            f"</tr>"
-        )
-        reports_html = (
-            "<table>"
-            "<tr>"
-            "<th>날짜</th>"
-            "<th style='text-align:right'>시작자산</th>"
-            "<th style='text-align:right'>종료자산</th>"
-            "<th style='text-align:right'>손익(원)</th>"
-            "<th style='text-align:right'>수익률</th>"
-            "<th style='text-align:right'>수수료</th>"
-            "<th style='text-align:center'>승/패</th>"
-            f"</tr>{rows}</table>"
-        )
-    else:
-        reports_html = '<div class="no-data">성과 데이터 없음<br>(매일 23:55 기록)</div>'
-
     # 거래 내역 HTML — 2줄 레이아웃
     # 1행: 시간(2줄) / 심볼 / 가격 / 수량 / 금액
     # 2행: 구분 배지 / 비고 [more 확장]
@@ -708,40 +677,50 @@ def _render_html(data: dict) -> str:
         eval_summary_html = ""
 
     evals_list = data.get("evaluations", [])
+    eval_popup_list: list[dict] = []
     if evals_list:
         erows = ""
-        for ev in evals_list:
-            exit_cls = "green" if ev["exit_type"] == "take_profit" else "red"
-            exit_label = "익절" if ev["exit_type"] == "take_profit" else "손절"
-            held = ev["held_minutes"]
-            held_str = f"{held/60:.1f}h" if held >= 60 else f"{held:.0f}m"
+        for idx, ev in enumerate(evals_list):
+            pnl_color = "green" if ev["pnl_pct"] >= 0 else "red"
             t_parts = ev["time"].split(" ")
-            t_date = t_parts[0] if len(t_parts) > 0 else ev["time"]  # mm-dd
+            t_date = t_parts[0] if len(t_parts) > 0 else ev["time"]
             t_hms  = t_parts[1] if len(t_parts) > 1 else ""
-            lesson_html = _expandable(ev.get("lesson", ""), 35)
+            pnl_krw_str = f'{ev["pnl_krw"]:+,.0f}원' if ev.get("pnl_krw") is not None else "—"
             erows += (
-                f"<tr class='eval-row-main'>"
+                f"<tr>"
                 f"<td><span class='time-date'>{t_date}</span>"
                 f"<span class='time-hms'>{t_hms}</span></td>"
                 f"<td><b>{ev['symbol']}</b></td>"
-                f'<td class="{exit_cls}">{ev["pnl_pct"]:+.2f}%</td>'
-                f"<td>{held_str}</td>"
-                f"<td>+{ev['original_tp']:.1f} / {ev['original_sl']:.1f}</td>"
-                f"<td><b>+{ev['suggested_tp']:.1f} / {ev['suggested_sl']:.1f}</b></td>"
-                f"</tr>"
-                f"<tr class='eval-row-sub'>"
-                f'<td><span class="badge {"badge-green" if ev["exit_type"] == "take_profit" else "badge-red"}">{exit_label}</span></td>'
-                f"<td colspan='5'>{lesson_html}</td>"
+                f'<td class="{pnl_color} pnl-link" onclick="showEvalDetail({idx})">'
+                f'{ev["pnl_pct"]:+.2f}%</td>'
+                f'<td class="{pnl_color}">{pnl_krw_str}</td>'
                 f"</tr>"
             )
+            held = ev["held_minutes"]
+            held_str_popup = f"{held/60:.1f}시간" if held >= 60 else f"{held:.0f}분"
+            exit_label = "익절" if ev["exit_type"] == "take_profit" else "손절"
+            eval_popup_list.append({
+                "symbol": ev["symbol"],
+                "time": ev["time"],
+                "exit": exit_label,
+                "pnl_pct": ev["pnl_pct"],
+                "held": held_str_popup,
+                "orig_tp": ev.get("original_tp") or "",
+                "orig_sl": ev.get("original_sl") or "",
+                "sug_tp": ev.get("suggested_tp") or "",
+                "sug_sl": ev.get("suggested_sl") or "",
+                "evaluation": ev.get("evaluation") or "",
+                "lesson": ev.get("lesson") or "",
+            })
         evals_html = (
             "<table id='eval-table'>"
-            "<tr><th>시간</th><th>코인</th><th>수익률</th>"
-            "<th>보유</th><th>설정 TP/SL</th><th>제안 TP/SL</th></tr>"
+            "<tr><th>시간</th><th>코인</th><th>수익률</th><th>수익금액</th></tr>"
             f"{erows}</table>"
         )
     else:
         evals_html = '<div class="no-data">성과 평가 데이터 없음<br>(매매 완료 후 자동 기록)</div>'
+
+    eval_js_data = json.dumps(eval_popup_list, ensure_ascii=False)
 
     # 전문가 점수 요약 HTML
     agent_scores = data.get("agent_scores", {})
@@ -776,6 +755,95 @@ def _render_html(data: dict) -> str:
     else:
         agent_scores_html = '<div class="no-data">전문가 평가 데이터 없음<br>(6시간 주기 평가 후 표시)</div>'
 
+    # 수동 청산 이력 HTML
+    manual_list = data.get("manual_trades", [])
+    if manual_list:
+        mrows = ""
+        for m in manual_list:
+            pnl_c = "green" if (m.get("pnl_pct") or 0) >= 0 else "red"
+            t_parts = m["time"].split(" ")
+            t_date = t_parts[0] if len(t_parts) > 0 else m["time"]
+            t_hms  = t_parts[1] if len(t_parts) > 1 else ""
+            pnl_str = f'{m["pnl_pct"]:+.2f}%' if m.get("pnl_pct") is not None else "—"
+            pnl_krw_str = f'{m["pnl_krw"]:+,.0f}원' if m.get("pnl_krw") is not None else "—"
+            held_str = f'{m["held_min"]:.0f}분' if m.get("held_min") is not None else "—"
+            mrows += (
+                f"<tr>"
+                f"<td><span class='time-date'>{t_date}</span>"
+                f"<span class='time-hms'>{t_hms}</span></td>"
+                f"<td><b>{m['symbol']}</b></td>"
+                f'<td class="{pnl_c}">{pnl_str}</td>'
+                f'<td class="{pnl_c}">{pnl_krw_str}</td>'
+                f"<td>{held_str}</td>"
+                f"</tr>"
+            )
+        manual_trades_section = (
+            '<div style="padding: 0 20px 16px;">'
+            '<div class="card">'
+            '<h2>🖐 수동 청산 이력</h2>'
+            "<table><tr><th>시간</th><th>코인</th><th>수익률</th>"
+            "<th>수익금액</th><th>보유</th></tr>"
+            f"{mrows}</table></div></div>"
+        )
+    else:
+        manual_trades_section = ""
+
+    # eval 상세 팝업 JS (extra_js에 삽입 — 일반 문자열, 중괄호 이스케이프 불필요)
+    extra_css = ""
+    extra_js = """
+function showEvalDetail(idx) {
+  var d = _evalPopup[idx];
+  if (!d) return;
+  var pnlColor = d.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+  var sign = d.pnl_pct >= 0 ? '+' : '';
+  document.getElementById('edm-content').innerHTML =
+    '<div class="stat-row"><span class="stat-label">코인 / 결과</span>' +
+    '<span class="stat-value">' + d.symbol + ' \u2014 ' + d.exit + '</span></div>' +
+    '<div class="stat-row"><span class="stat-label">수익률</span>' +
+    '<span class="stat-value" style="color:' + pnlColor + '">' + sign + d.pnl_pct.toFixed(2) + '%</span></div>' +
+    '<div class="stat-row"><span class="stat-label">보유 시간</span>' +
+    '<span class="stat-value">' + d.held + '</span></div>' +
+    '<div class="stat-row"><span class="stat-label">설정 TP / SL</span>' +
+    '<span class="stat-value"><span style="color:#4ade80">+' + d.orig_tp + '%</span>' +
+    ' / <span style="color:#f87171">' + d.orig_sl + '%</span></span></div>' +
+    '<div class="stat-row"><span class="stat-label">제안 TP / SL</span>' +
+    '<span class="stat-value"><b><span style="color:#4ade80">+' + d.sug_tp + '%</span>' +
+    ' / <span style="color:#f87171">' + d.sug_sl + '%</span></b></span></div>' +
+    (d.evaluation ? '<div style="margin-top:10px;padding:10px;background:#0f172a;' +
+    'border-radius:6px;font-size:0.82rem;color:#94a3b8;white-space:pre-wrap;">' +
+    d.evaluation + '</div>' : '') +
+    (d.lesson ? '<div style="margin-top:8px;font-size:0.78rem;color:#64748b;' +
+    'font-style:italic;">' + d.lesson + '</div>' : '');
+  document.getElementById('eval-detail-modal').style.display = 'flex';
+}
+function closeEvalDetail() {
+  document.getElementById('eval-detail-modal').style.display = 'none';
+}
+document.addEventListener('DOMContentLoaded', function() {
+  var edm = document.getElementById('eval-detail-modal');
+  if (edm) edm.addEventListener('click', function(e) { if (e.target === this) closeEvalDetail(); });
+});
+"""
+    eval_detail_modal = (
+        '<div id="eval-detail-modal" style="display:none;position:fixed;inset:0;'
+        'background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center;">'
+        '<div style="background:#1e293b;border-radius:12px;border:1px solid #334155;'
+        'width:90%;max-width:500px;overflow:hidden;">'
+        '<div style="padding:16px 20px;border-bottom:1px solid #334155;'
+        'display:flex;justify-content:space-between;align-items:center;">'
+        '<span style="font-size:1rem;font-weight:600;color:#e2e8f0;">📊 상세 평가</span>'
+        '<button onclick="closeEvalDetail()" style="background:none;border:none;'
+        'color:#64748b;font-size:1.5rem;cursor:pointer;line-height:1;padding:2px 6px;">&#215;</button>'
+        '</div>'
+        '<div id="edm-content" style="padding:16px 20px;font-size:0.85rem;"></div>'
+        '<div style="padding:12px 20px;border-top:1px solid #334155;'
+        'display:flex;justify-content:flex-end;">'
+        '<button onclick="closeEvalDetail()" style="background:#334155;color:#e2e8f0;'
+        'border:none;border-radius:6px;padding:8px 18px;font-size:0.85rem;'
+        'font-weight:600;cursor:pointer;">닫기</button>'
+        '</div></div></div>'
+    )
+
     return _HTML_TEMPLATE.format(
         updated_at=data["updated_at"],
         version=data.get("version", ""),
@@ -793,11 +861,15 @@ def _render_html(data: dict) -> str:
         total_cycles=perf["total_cycles"],
         avg_hold=avg_hold,
         position_html=position_html,
-        reports_html=reports_html,
         trades_html=trades_html,
         eval_summary_html=eval_summary_html,
         evals_html=evals_html,
         agent_scores_html=agent_scores_html,
+        eval_js_data=eval_js_data,
+        eval_detail_modal=eval_detail_modal,
+        manual_trades_section=manual_trades_section,
+        extra_css=extra_css,
+        extra_js=extra_js,
     )
 
 
@@ -1225,14 +1297,16 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
   <div>
     <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
       <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
-    <nav style="margin-top:6px; display:flex; gap:8px;">
-      <a href="/" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
-         border-radius:6px; background:transparent;">종합 대시보드</a>
-      <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.85rem; padding:4px 12px;
-         border-radius:6px; background:#334155;">전문가 실적표</a>
-    </nav>
+    <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
+      <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침
+    </div>
   </div>
-  <span><span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침</span>
+  <nav style="display:flex; gap:8px; align-items:center;">
+    <a href="/" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:transparent;">종합 대시보드</a>
+    <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:#334155;">전문가 실적표</a>
+  </nav>
 </header>
 
 <div style="padding:20px;">
@@ -1275,11 +1349,15 @@ def _liquidate_position(client: "BithumbClient") -> dict:
             return {"success": False, "error": f"매도 실패: {sell_result}"}
 
         pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
+        pnl_krw_liq = round((current_price - pos.buy_price) * units, 0)
+        held_min_liq = round(
+            (datetime.now(tz=timezone.utc) - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60, 0
+        )
         repo.save_trade(
             symbol=symbol, side="sell",
             price=current_price, units=units,
             krw_amount=krw_value,
-            note=f"대시보드 청산 ({pnl_pct:+.2f}%)",
+            note=f"대시보드 청산 ({pnl_pct:+.2f}%, {pnl_krw_liq:+,.0f}원, {held_min_liq:.0f}분)",
         )
         repo.close_position(pos.id)
 
