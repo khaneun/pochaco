@@ -73,19 +73,20 @@ def _parse_manual_note(note: str) -> tuple[float | None, float | None, float | N
 
 
 def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator | None" = None) -> dict:
-    """현재 상태를 JSON 직렬화 가능한 dict로 반환"""
+    """현재 상태를 JSON 직렬화 가능한 dict로 반환 (포트폴리오 기반)"""
+    from database.models import Portfolio
     repo = TradeRepository()
     try:
         krw = client.get_krw_balance()
         total = krw
-        position_data = None
+        portfolio_data = None
 
-        pos: Position | None = repo.get_open_position()
+        pf: Portfolio | None = repo.get_open_portfolio()
 
-        # ── 거래소 실제 보유 코인 잔고 (1차 손절 후 실잔고 반영을 위해 먼저 조회) ──
-        pos_symbol = pos.symbol if pos else ""
+        # ── 거래소 실제 보유 코인 잔고 ──
+        pf_symbols: set[str] = set()
         holdings = []
-        actual_coin_units: dict[str, float] = {}  # sym → 실제 보유 수량
+        actual_coin_units: dict[str, float] = {}
         try:
             bal_data = client.get_balance("ALL")
             if bal_data.get("status") == "0000":
@@ -102,52 +103,82 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
         except Exception:
             pass
 
-        if pos:
-            try:
-                cur = client.get_current_price(pos.symbol)
-                # 실제 보유 수량 사용 (1차 손절 후 pos.units는 원래 수량이라 부정확)
-                actual_units = actual_coin_units.get(pos.symbol, pos.units)
-                pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100
-                pnl_krw = (cur - pos.buy_price) * actual_units
-                pos_value = actual_units * cur
-                total = krw + pos_value
-                held_min = (datetime.now(tz=timezone.utc) - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60
-                # 1차 손절 여부: DB 원래 수량 대비 실잔고가 40~60% 사이면 부분 청산 상태
-                sl1_ratio = actual_units / pos.units if pos.units > 0 else 1.0
-                sl1_executed = sl1_ratio < 0.75  # 원래 수량의 75% 미만이면 1차 손절 실행됨
-                position_data = {
-                    "symbol": pos.symbol,
-                    "units": round(actual_units, 6),
-                    "units_original": round(pos.units, 6),
-                    "sl1_executed": sl1_executed,
-                    "buy_price": pos.buy_price,
-                    "current_price": cur,
-                    "pnl_pct": round(pnl_pct, 2),
-                    "pnl_krw": round(pnl_krw, 0),
-                    "take_profit_pct": pos.take_profit_pct,
-                    "stop_loss_1st_pct": pos.stop_loss_1st_pct,
-                    "stop_loss_pct": pos.stop_loss_pct,
-                    "held_minutes": round(held_min, 1),
-                    "agent_reason": pos.agent_reason or "",
-                    "llm_provider": pos.llm_provider or "",
-                }
-            except Exception:
-                pass
+        if pf:
+            positions = repo.get_portfolio_positions(pf.id)
+            pf_symbols = {p.symbol for p in positions}
+            total_buy = 0.0
+            total_current = 0.0
+            coins_data = []
 
-        # holdings 목록 구성 (position 코인은 이미 total에 합산 → 중복 방지)
+            for pos in positions:
+                try:
+                    cur = client.get_current_price(pos.symbol)
+                    actual_units = actual_coin_units.get(pos.symbol, pos.units)
+                    coin_value = actual_units * cur
+                    coin_pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100 if pos.buy_price > 0 else 0
+                    coin_pnl_krw = (cur - pos.buy_price) * actual_units
+                    total_buy += pos.buy_krw
+                    total_current += coin_value
+                    coins_data.append({
+                        "symbol": pos.symbol,
+                        "units": round(actual_units, 6),
+                        "buy_price": pos.buy_price,
+                        "buy_krw": round(pos.buy_krw, 0),
+                        "current_price": cur,
+                        "current_value": round(coin_value, 0),
+                        "pnl_pct": round(coin_pnl_pct, 2),
+                        "pnl_krw": round(coin_pnl_krw, 0),
+                        "reason": pos.agent_reason or "",
+                    })
+                except Exception:
+                    coins_data.append({
+                        "symbol": pos.symbol,
+                        "units": round(pos.units, 6),
+                        "buy_price": pos.buy_price,
+                        "buy_krw": round(pos.buy_krw, 0),
+                        "current_price": pos.buy_price,
+                        "current_value": round(pos.buy_krw, 0),
+                        "pnl_pct": 0.0,
+                        "pnl_krw": 0.0,
+                        "reason": pos.agent_reason or "",
+                    })
+                    total_buy += pos.buy_krw
+                    total_current += pos.buy_krw
+
+            pf_pnl_pct = (total_current - total_buy) / total_buy * 100 if total_buy > 0 else 0
+            pf_pnl_krw = total_current - total_buy
+            total = krw + total_current
+            held_min = (datetime.now(tz=timezone.utc) - pf.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60
+
+            portfolio_data = {
+                "id": pf.id,
+                "name": pf.name,
+                "total_buy_krw": round(total_buy, 0),
+                "total_current_value": round(total_current, 0),
+                "pnl_pct": round(pf_pnl_pct, 2),
+                "pnl_krw": round(pf_pnl_krw, 0),
+                "take_profit_pct": pf.take_profit_pct,
+                "stop_loss_pct": pf.stop_loss_pct,
+                "held_minutes": round(held_min, 1),
+                "agent_reason": pf.agent_reason or "",
+                "llm_provider": pf.llm_provider or "",
+                "coin_count": len(coins_data),
+                "coins": coins_data,
+            }
+
+        # holdings — 포트폴리오 외 보유 코인
         for sym, amt in actual_coin_units.items():
+            if sym in pf_symbols:
+                continue
             try:
                 px = client.get_current_price(sym)
                 kv = amt * px
                 if kv >= 100:
                     holdings.append({
-                        "symbol": sym,
-                        "units": amt,
-                        "price": px,
-                        "krw_value": round(kv, 0),
+                        "symbol": sym, "units": amt,
+                        "price": px, "krw_value": round(kv, 0),
                     })
-                    if sym != pos_symbol:
-                        total += kv
+                    total += kv
             except Exception:
                 holdings.append({"symbol": sym, "units": amt, "price": 0, "krw_value": 0})
 
@@ -163,6 +194,7 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                 "units": round(t.units, 2),
                 "krw_amount": round(t.krw_amount, 0),
                 "note": t.note or "",
+                "portfolio_id": t.portfolio_id,
             }
             for t in recent_trades
         ]
@@ -170,19 +202,15 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
         initial = stats["initial_krw"]
         total_pnl_pct = (total - initial) / initial * 100 if initial > 0 else 0.0
 
-        # 성과 평가 데이터 (pnl_krw: position.buy_krw 기반 추정)
+        # 성과 평가 데이터 (포트폴리오 단위)
         recent_evals = repo.get_recent_evaluations(limit=10)
         eval_stats = repo.get_evaluation_stats(last_n=10)
-        pos_history = repo.get_position_history(limit=100)
-        pos_map = {p.id: p for p in pos_history}
         evals_data = []
         for ev in recent_evals:
-            p_rec = pos_map.get(ev.position_id)
-            buy_krw = p_rec.buy_krw if p_rec else 0
-            pnl_krw_est = round(buy_krw * ev.pnl_pct / 100, 0) if buy_krw else None
+            pnl_krw_est = round(ev.total_buy_krw * ev.pnl_pct / 100, 0) if ev.total_buy_krw else None
             evals_data.append({
                 "time": _to_kst(ev.created_at).strftime("%m-%d %H:%M:%S"),
-                "symbol": ev.symbol,
+                "portfolio_name": ev.portfolio_name,
                 "exit_type": ev.exit_type,
                 "pnl_pct": round(ev.pnl_pct, 2),
                 "pnl_krw": pnl_krw_est,
@@ -193,9 +221,27 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                 "suggested_sl": ev.suggested_sl_pct,
                 "evaluation": ev.evaluation,
                 "lesson": ev.lesson or "",
+                "coins_summary": ev.coins_summary or "",
             })
 
-        # 수동 청산 이력 (대시보드 청산 버튼)
+        # 포트폴리오 히스토리
+        pf_history = repo.get_portfolio_history(limit=20)
+        portfolio_history = []
+        for ph in pf_history:
+            if ph.is_open:
+                continue
+            ph_held = (ph.closed_at - ph.opened_at).total_seconds() / 60 if ph.closed_at and ph.opened_at else 0
+            portfolio_history.append({
+                "name": ph.name,
+                "total_buy_krw": round(ph.total_buy_krw, 0),
+                "opened_at": _to_kst(ph.opened_at).strftime("%m-%d %H:%M"),
+                "closed_at": _to_kst(ph.closed_at).strftime("%m-%d %H:%M") if ph.closed_at else "",
+                "held_minutes": round(ph_held, 1),
+                "tp_pct": ph.take_profit_pct,
+                "sl_pct": ph.stop_loss_pct,
+            })
+
+        # 수동 청산 이력
         manual_trades_data = []
         for t in recent_trades:
             note = t.note or ""
@@ -223,7 +269,8 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                 "total_cycles": stats["total_cycles"],
                 "avg_hold_minutes": round(stats["avg_hold_minutes"], 1),
             },
-            "position": position_data,
+            "portfolio": portfolio_data,
+            "portfolio_history": portfolio_history,
             "recent_trades": trades_data,
             "evaluations": evals_data,
             "manual_trades": manual_trades_data,
@@ -511,7 +558,7 @@ def _expandable(text: str, limit: int = 35) -> str:
 def _render_html(data: dict) -> str:
     bal = data["balance"]
     perf = data["performance"]
-    pos = data["position"]
+    pf = data.get("portfolio")
 
     def fmt_krw(v: float) -> str:
         av = abs(v)
@@ -523,25 +570,22 @@ def _render_html(data: dict) -> str:
 
     total_pnl_color = "green" if perf["total_pnl_pct"] >= 0 else "red"
 
-    # 포지션 평가액 줄 (코인명 + 평가금액 + 실보유 수량)
+    # 포트폴리오 평가액 줄
     pos_asset_line = ""
-    pos_symbol = ""
-    if pos:
-        pos_symbol = pos["symbol"]
-        sl1_badge = ' <span style="font-size:0.75em; color:#fb923c;">[1차손절]</span>' if pos.get("sl1_executed") else ""
+    pos_symbol = ""  # 호환용 (빈 문자열)
+    if pf:
         pos_asset_line = (
             f'<div class="sub">'
-            f'{pos["symbol"]} 평가: {fmt_krw(pos["units"] * pos["current_price"])}'
-            f' ({pos["units"]:.6g}개){sl1_badge}'
+            f'포트폴리오 평가: {fmt_krw(pf["total_current_value"])} '
+            f'({pf["coin_count"]}개 코인)'
             f'</div>'
         )
 
     avg_h = perf["avg_hold_minutes"]
     avg_hold = f"{avg_h / 60:.1f}시간" if avg_h >= 60 else f"{avg_h:.0f}분"
 
-    # 보유 코인 (1000원 이상, 포지션 코인 제외 — 중복 방지)
-    holdings = [h for h in data.get("holdings", [])
-                if h["krw_value"] >= 1000 and h["symbol"] != pos_symbol]
+    # 보유 코인 (포트폴리오 외)
+    holdings = [h for h in data.get("holdings", []) if h["krw_value"] >= 1000]
     if holdings:
         h_lines = []
         for h in holdings:
@@ -555,46 +599,53 @@ def _render_html(data: dict) -> str:
     else:
         holdings_html = ""
 
-    # 포지션 HTML
-    if pos:
-        pnl_pct = pos["pnl_pct"]
+    # 포트폴리오 HTML
+    if pf:
+        pnl_pct = pf["pnl_pct"]
         pnl_color = "green" if pnl_pct >= 0 else "red"
-        held = pos["held_minutes"]
+        held = pf["held_minutes"]
         held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
-        progress = min(1.0, max(0.0, pnl_pct / pos["take_profit_pct"])) if pos["take_profit_pct"] > 0 else 0.0
+        progress = min(1.0, max(0.0, pnl_pct / pf["take_profit_pct"])) if pf["take_profit_pct"] > 0 else 0.0
         bar_color = "#4ade80" if pnl_pct >= 0 else "#f87171"
-        sl1_executed = pos.get("sl1_executed", False)
-        sl1_label = ' <span style="font-size:0.8em; color:#fb923c; font-weight:600;">[1차손절 실행]</span>' if sl1_executed else ""
-        units_label = f'{pos["units"]:.6g}개' + (' (50%)' if sl1_executed else '')
-        sl_display = ""
-        if pos.get("stop_loss_1st_pct"):
-            sl_display = (
-                f'<span style="color:#fb923c;">{pos["stop_loss_1st_pct"]}%</span>'
-                f'<span style="color:#64748b; font-size:0.85em;"> 50%→</span>'
-                f'<span class="red">{pos["stop_loss_pct"]}%</span>'
+
+        # 개별 코인 테이블
+        coin_rows = ""
+        for c in pf.get("coins", []):
+            c_color = "green" if c["pnl_pct"] >= 0 else "red"
+            coin_rows += (
+                f'<tr>'
+                f'<td><b>{c["symbol"]}</b></td>'
+                f'<td style="text-align:right">{c["buy_price"]:,.0f}</td>'
+                f'<td style="text-align:right">{c["current_price"]:,.0f}</td>'
+                f'<td style="text-align:right" class="{c_color}">{c["pnl_pct"]:+.2f}%</td>'
+                f'<td style="text-align:right" class="{c_color}">{c["pnl_krw"]:+,.0f}</td>'
+                f'</tr>'
             )
-        else:
-            sl_display = f'<span class="red">{pos["stop_loss_pct"]}%</span>'
+
+        coins_table = (
+            '<table style="margin-top:10px;">'
+            '<tr><th>코인</th><th style="text-align:right">매수가</th>'
+            '<th style="text-align:right">현재가</th>'
+            '<th style="text-align:right">수익률</th>'
+            '<th style="text-align:right">손익(원)</th></tr>'
+            f'{coin_rows}</table>'
+        )
+
         position_html = f"""
         <div class="big-num {pnl_color}">{pnl_pct:+.2f}%</div>
-        <div class="sub">{pos['symbol']} {units_label}{sl1_label}</div>
+        <div class="sub" style="font-size:1.1em; font-weight:600;">{pf['name']}</div>
+        <div class="sub">{pf['coin_count']}개 코인 | 투입 {pf['total_buy_krw']:,.0f}원</div>
         <br>
         <div class="stat-row">
-          <span class="stat-label">매수가</span>
-          <span class="stat-value">{pos['buy_price']:,.0f} 원</span>
-        </div>
-        <div class="stat-row">
-          <span class="stat-label">현재가</span>
-          <span class="stat-value">{pos['current_price']:,.0f} 원</span>
-        </div>
-        <div class="stat-row">
           <span class="stat-label">평가 손익</span>
-          <span class="stat-value {pnl_color}">{pos['pnl_krw']:+,.0f} 원</span>
+          <span class="stat-value {pnl_color}">{pf['pnl_krw']:+,.0f} 원</span>
         </div>
         <div class="stat-row">
           <span class="stat-label">익절 / 손절</span>
           <span class="stat-value">
-            <span class="green">+{pos['take_profit_pct']}%</span> / {sl_display}
+            <span class="green">+{pf['take_profit_pct']}%</span> /
+            <span class="red">{pf['stop_loss_pct']}%</span>
+            <span style="color:#64748b; font-size:0.8em;"> (분할: -1%/-1.5%/-2%)</span>
           </span>
         </div>
         <div class="stat-row">
@@ -606,19 +657,20 @@ def _render_html(data: dict) -> str:
           <div style="background:{bar_color}; width:{progress*100:.0f}%; height:100%; border-radius:4px;"></div>
         </div>
         <div style="font-size:0.75rem; color:#64748b; margin-top:4px;">{progress:.0%} / 100%</div>
+        {coins_table}
         <div style="margin-top:10px; font-size:0.78rem; color:#64748b; font-style:italic;">
-          {pos['agent_reason'][:80]}
+          {(pf.get('agent_reason') or '')[:120]}
         </div>
         <div style="margin-top:12px;">
           <button id="liq-btn" onclick="liquidatePosition()"
             style="background:#dc2626; color:#fff; border:none; border-radius:8px;
             padding:8px 16px; font-size:0.85rem; font-weight:600; cursor:pointer;
             width:100%;">
-            🔥 포지션 청산</button>
+            🔥 포트폴리오 청산</button>
         </div>
         """
     else:
-        position_html = '<div class="no-data">현재 보유 포지션 없음<br>AI 코인 선정 대기 중...</div>'
+        position_html = '<div class="no-data">현재 활성 포트폴리오 없음<br>AI 포트폴리오 구성 대기 중...</div>'
 
     # 거래 내역 HTML — 2줄 레이아웃
     # 1행: 시간(2줄) / 심볼 / 가격 / 수량 / 금액
@@ -686,11 +738,12 @@ def _render_html(data: dict) -> str:
             t_date = t_parts[0] if len(t_parts) > 0 else ev["time"]
             t_hms  = t_parts[1] if len(t_parts) > 1 else ""
             pnl_krw_str = f'{ev["pnl_krw"]:+,.0f}원' if ev.get("pnl_krw") is not None else "—"
+            ev_label = ev.get("portfolio_name") or ev.get("symbol", "")
             erows += (
                 f"<tr>"
                 f"<td><span class='time-date'>{t_date}</span>"
                 f"<span class='time-hms'>{t_hms}</span></td>"
-                f"<td><b>{ev['symbol']}</b></td>"
+                f"<td><b>{ev_label}</b></td>"
                 f'<td class="{pnl_color} pnl-link" onclick="showEvalDetail({idx})">'
                 f'{ev["pnl_pct"]:+.2f}%</td>'
                 f'<td class="{pnl_color}">{pnl_krw_str}</td>'
@@ -700,7 +753,7 @@ def _render_html(data: dict) -> str:
             held_str_popup = f"{held/60:.1f}시간" if held >= 60 else f"{held:.0f}분"
             exit_label = "익절" if ev["exit_type"] == "take_profit" else "손절"
             eval_popup_list.append({
-                "symbol": ev["symbol"],
+                "symbol": ev_label,
                 "time": ev["time"],
                 "exit": exit_label,
                 "pnl_pct": ev["pnl_pct"],
@@ -714,7 +767,7 @@ def _render_html(data: dict) -> str:
             })
         evals_html = (
             "<table id='eval-table'>"
-            "<tr><th>시간</th><th>코인</th><th>수익률</th><th>수익금액</th></tr>"
+            "<tr><th>시간</th><th>포트폴리오</th><th>수익률</th><th>수익금액</th></tr>"
             f"{erows}</table>"
         )
     else:
@@ -1360,54 +1413,72 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
 
 
 def _liquidate_position(client: "BithumbClient") -> dict:
-    """현재 오픈 포지션을 시장가 매도 + DB 포지션 종료"""
+    """현재 활성 포트폴리오를 일괄 청산 (8개 코인 전량 매도)"""
+    from database.models import Portfolio
     repo = TradeRepository()
     try:
-        pos = repo.get_open_position()
-        if not pos:
-            return {"success": False, "error": "오픈 포지션 없음"}
+        pf = repo.get_open_portfolio()
+        if not pf:
+            return {"success": False, "error": "활성 포트폴리오 없음"}
 
-        symbol = pos.symbol
-        units = client.get_coin_balance(symbol)
-        if units <= 0:
-            repo.close_position(pos.id)
-            return {"success": False, "error": f"{symbol} 실제 잔고 0 — 포지션만 종료"}
+        positions = repo.get_portfolio_positions(pf.id)
+        if not positions:
+            repo.close_portfolio(pf.id)
+            return {"success": False, "error": "포트폴리오 내 포지션 없음 — 종료 처리"}
 
-        current_price = client.get_current_price(symbol)
-        krw_value = units * current_price
+        total_krw_received = 0.0
+        total_buy_krw = 0.0
+        sold_coins = []
 
-        sell_result = client.market_sell(symbol, units)
-        if sell_result.get("status") != "0000":
-            return {"success": False, "error": f"매도 실패: {sell_result}"}
+        for pos in positions:
+            try:
+                units = client.get_coin_balance(pos.symbol)
+                if units <= 0:
+                    repo.close_position(pos.id)
+                    continue
 
-        pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
-        pnl_krw_liq = round((current_price - pos.buy_price) * units, 0)
-        held_min_liq = round(
-            (datetime.now(tz=timezone.utc) - pos.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60, 0
-        )
-        repo.save_trade(
-            symbol=symbol, side="sell",
-            price=current_price, units=units,
-            krw_amount=krw_value,
-            note=f"대시보드 청산 ({pnl_pct:+.2f}%, {pnl_krw_liq:+,.0f}원, {held_min_liq:.0f}분)",
-        )
-        repo.close_position(pos.id)
+                current_price = client.get_current_price(pos.symbol)
+                krw_value = units * current_price
 
-        # ── 수동 청산도 쿨다운 적용 (60분) ──
-        cooldown_registry.record_sell(symbol, "manual")
+                sell_result = client.market_sell(pos.symbol, units)
+                if sell_result.get("status") != "0000":
+                    logger.warning(f"[포트폴리오 청산] {pos.symbol} 매도 실패: {sell_result}")
+                    repo.close_position(pos.id)
+                    continue
 
+                coin_pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100 if pos.buy_price > 0 else 0
+                repo.save_trade(
+                    symbol=pos.symbol, side="sell",
+                    price=current_price, units=units,
+                    krw_amount=krw_value,
+                    note=f"대시보드 포트폴리오 청산 ({coin_pnl_pct:+.2f}%)",
+                    portfolio_id=pf.id,
+                )
+                repo.close_position(pos.id)
+                cooldown_registry.record_sell(pos.symbol, "manual")
+
+                total_krw_received += krw_value
+                total_buy_krw += pos.buy_krw
+                sold_coins.append({"symbol": pos.symbol, "pnl_pct": round(coin_pnl_pct, 2)})
+            except Exception as e:
+                logger.error(f"[포트폴리오 청산] {pos.symbol} 오류: {e}")
+                repo.close_position(pos.id)
+
+        repo.close_portfolio(pf.id)
+
+        pnl_pct = (total_krw_received - total_buy_krw) / total_buy_krw * 100 if total_buy_krw > 0 else 0
         krw = client.get_krw_balance()
         logger.info(
-            f"[대시보드 청산] {symbol} {units}개 @ {current_price:,.0f}원 "
-            f"→ {krw_value:,.0f}원 ({pnl_pct:+.2f}%)"
+            f"[대시보드 포트폴리오 청산] '{pf.name}' "
+            f"{len(sold_coins)}개 코인 → {total_krw_received:,.0f}원 ({pnl_pct:+.2f}%)"
         )
         return {
             "success": True,
-            "symbol": symbol,
-            "units": round(units, 6),
-            "price": current_price,
+            "portfolio_name": pf.name,
+            "coins_sold": len(sold_coins),
+            "coin_details": sold_coins,
             "pnl_pct": round(pnl_pct, 2),
-            "krw_received": round(krw_value, 0),
+            "krw_received": round(total_krw_received, 0),
             "krw_balance": round(krw, 0),
         }
     except Exception as e:

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # 필터링 기준
 _MIN_VOLUME_KRW     = 5_000_000_000  # 50억원 — 유동성 하한
-_TOP_CANDIDATES     = 10             # AI에 전달할 최대 후보 수
+_TOP_CANDIDATES     = 20             # AI에 전달할 최대 후보 수 (8개 포트폴리오 구성용)
 
 # 하락 추세 판정 임계값
 _DOWN_24H_STRONG    = -2.0   # 24h 이 이하면 무조건 제외

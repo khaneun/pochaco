@@ -40,14 +40,39 @@ class MetaEvaluator(BaseSpecialistAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._base_prompt = (
-            "당신은 AI 자동매매 시스템의 전문가 평가 위원입니다.\n"
-            "5명의 전문가(시장 분석가, 자산 운용가, 매수 전문가, 매도 전문가, "
-            "포트폴리오 평가가)의 최근 판단과 결과를 종합 분석합니다.\n\n"
-            "평가 원칙:\n"
-            "- 잘하는 부분은 구체적으로 칭찬하고 더 잘할 수 있는 방향을 제시합니다\n"
-            "- 못하는 부분은 강한 피드백을 부여합니다 (구체적인 개선 지시 포함)\n"
-            "- 점수는 0~100으로 부여하며, 직전 점수 대비 변화량도 고려합니다\n"
-            "- directive에는 해당 전문가의 다음 판단에 직접 삽입될 지침을 작성합니다"
+            "당신은 AI 자동매매 시스템의 전문가 총괄 평가위원입니다.\n"
+            "5명의 전문가의 최근 판단과 매매 결과를 심층 분석하여 구체적 피드백을 부여합니다.\n\n"
+            "【★ directive 작성 원칙 — 가장 중요 ★】\n"
+            "directive는 해당 전문가의 다음 LLM 호출에 직접 삽입됩니다.\n"
+            "따라서 directive는 반드시:\n"
+            "1. '~하세요', '~금지', '~우선' 등 명령형으로 작성\n"
+            "2. 구체적 수치를 포함 (예: 'TP를 4% 이하로 설정하세요')\n"
+            "3. 실제 데이터 기반 근거 포함 (예: '최근 3건 연속 손절이므로')\n"
+            "4. 추상적 표현 금지 ('더 잘하세요'는 무의미)\n\n"
+            "【전문가별 평가 기준】\n"
+            "■ market_analyst (시장 분석가)\n"
+            "  - 시장 심리 판단이 실제 결과와 일치했는가?\n"
+            "  - bearish 판단 후 포트폴리오가 익절이면 → 과도한 보수성\n"
+            "  - bullish 판단 후 포트폴리오가 손절이면 → 위험 감지 실패\n\n"
+            "■ asset_manager (자산 운용가)\n"
+            "  - 투자 비율이 적절했는가? (손절 후 비율 축소, 익절 후 비율 유지/확대)\n"
+            "  - 투자 보류 판단이 합당했는가?\n\n"
+            "■ buy_strategist (매수 전문가)\n"
+            "  - 선정된 8개 코인의 분산 효과는?\n"
+            "  - 하락 코인이 다수 포함되었는가?\n"
+            "  - TP/SL 설정이 현실적이었는가?\n\n"
+            "■ sell_strategist (매도 전문가)\n"
+            "  - TP/SL 조정 타이밍이 적절했는가?\n"
+            "  - 기회비용이 발생했는가? (보유 시간 대비 수익률)\n"
+            "  - 불필요한 조정으로 혼란을 야기했는가?\n\n"
+            "■ portfolio_evaluator (포트폴리오 평가가)\n"
+            "  - 제안한 TP/SL이 다음 사이클에서 효과적이었는가?\n"
+            "  - 교훈(lesson)이 실제로 유용했는가?\n\n"
+            "【점수 부여 기준】\n"
+            "- 80+: 탁월함. 판단이 매매 성과에 직접 기여\n"
+            "- 60~79: 양호함. 개선 여지 있으나 큰 문제 없음\n"
+            "- 40~59: 미흡함. 명확한 개선 필요\n"
+            "- 40 미만: 심각함. 즉시 전략 전환 필요"
         )
 
     def execute(self, context: dict) -> dict:
@@ -76,31 +101,36 @@ class MetaEvaluator(BaseSpecialistAgent):
             task_prompt = f"""최근 6시간 전문가별 의사결정 기록:
 {decision_logs_text}
 
-최근 매매 결과:
+최근 포트폴리오 매매 결과:
 {trade_results_text}
 
 현재 점수: {current_scores_text}
 
+【평가 요청】
 5명의 전문가를 각각 평가하세요.
-각 전문가의 역할:
-- market_analyst (시장 분석가): 시장 전반 흐름 분석, 리스크 판단
-- asset_manager (자산 운용가): 투자 비율 결정, 리스크 관리
-- buy_strategist (매수 전문가): 코인 선정, TP/SL 설정
-- sell_strategist (매도 전문가): 보유 중 TP/SL 동적 조정
-- portfolio_evaluator (포트폴리오 평가가): 매매 후 성과 분석, 파라미터 제안
+★ directive가 핵심입니다. 해당 전문가의 다음 LLM 호출에 직접 주입되므로:
+  - 명령형으로 작성 ("~하세요", "~금지")
+  - 구체적 수치 포함 ("TP를 3% 이하로", "BTC 포함 필수")
+  - 데이터 근거 포함 ("최근 3건 손절이므로")
 
-priority 값:
-- reinforce: 잘하고 있음, 현재 방향 유지·강화
-- improve: 개선 필요, 구체적 방향 제시
-- critical: 심각한 문제, 즉시 개선 필요
+각 전문가의 역할과 평가 관점:
+- market_analyst: 시장 심리 판단 정확도 → 결과와 일치했나?
+- asset_manager: 투자 비율 적절성 → 리스크 조절이 성과에 기여했나?
+- buy_strategist: 8개 코인 선정 품질 → 분산 효과, 하락 코인 포함 여부
+- sell_strategist: TP/SL 조정 효과 → 조정이 수익 개선에 기여했나?
+- portfolio_evaluator: 파라미터 제안 정확도 → 제안대로 했을 때 성과 개선되었나?
 
-JSON으로만 응답:
+priority: reinforce(유지·강화) | improve(개선필요) | critical(즉시개선)
+
+strengths/weaknesses는 각 50자 이내, directive는 80자 이내로 작성.
+
+JSON으로만 응답 (마크다운 코드블록 없이):
 {{"agents": [
-  {{"role": "market_analyst", "score": 75, "strengths": "...", "weaknesses": "...", "directive": "다음 분석 시 ...", "priority": "reinforce"}},
-  {{"role": "asset_manager", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "다음 배분 시 ...", "priority": "improve"}},
-  {{"role": "buy_strategist", "score": 65, "strengths": "...", "weaknesses": "...", "directive": "다음 선정 시 ...", "priority": "improve"}},
-  {{"role": "sell_strategist", "score": 60, "strengths": "...", "weaknesses": "...", "directive": "다음 조정 시 ...", "priority": "critical"}},
-  {{"role": "portfolio_evaluator", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "다음 평가 시 ...", "priority": "reinforce"}}
+  {{"role": "market_analyst", "score": 75, "strengths": "구체적 잘한 점", "weaknesses": "구체적 부족한 점", "directive": "다음 분석 시 구체적 명령 (수치 포함)", "priority": "reinforce"}},
+  {{"role": "asset_manager", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve"}},
+  {{"role": "buy_strategist", "score": 65, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve"}},
+  {{"role": "sell_strategist", "score": 60, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "critical"}},
+  {{"role": "portfolio_evaluator", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "reinforce"}}
 ]}}"""
 
             logger.info("[MetaEvaluator] 전문가 종합 평가 시작...")
@@ -189,7 +219,7 @@ JSON으로만 응답:
         lines = []
         for i, r in enumerate(results, 1):
             if isinstance(r, dict):
-                symbol = r.get("symbol", "?")
+                label = r.get("portfolio_name") or r.get("symbol", "?")
                 pnl = r.get("pnl_pct", 0)
                 exit_type = r.get("exit_type", "?")
                 held = r.get("held_minutes", 0)
@@ -197,7 +227,7 @@ JSON으로만 응답:
                     exit_type, "시간초과"
                 )
                 lines.append(
-                    f"{i}. {symbol}: {exit_kr} {pnl:+.2f}% (보유 {held:.0f}분)"
+                    f"{i}. {label}: {exit_kr} {pnl:+.2f}% (보유 {held:.0f}분)"
                 )
             else:
                 lines.append(f"{i}. {r}")

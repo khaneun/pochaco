@@ -1,4 +1,7 @@
-"""SQLAlchemy ORM 모델 및 DB 엔진 설정
+"""SQLAlchemy ORM 모델 및 DB 엔진 설정 (v4.0 — 포트폴리오 기반)
+
+포트폴리오: 8개 코인을 동시 매수/매도하는 단위.
+포지션: 포트폴리오 내 개별 코인 보유 기록.
 
 EC2 환경 안전성:
 - SQLite: WAL 모드 활성화 (크래시 복구 + 동시 읽기 성능 향상)
@@ -6,6 +9,7 @@ EC2 환경 안전성:
 - DATABASE_URL 환경변수로 외부 DB 전환 가능
 """
 import os
+import shutil
 from datetime import datetime
 
 from sqlalchemy import (
@@ -26,11 +30,44 @@ class Base(DeclarativeBase):
 # ------------------------------------------------------------------ #
 #  ORM 모델                                                            #
 # ------------------------------------------------------------------ #
+class Portfolio(Base):
+    """포트폴리오 (8개 코인 묶음, 동시 매수/매도 단위)"""
+    __tablename__ = "portfolios"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(50), nullable=False)             # 랜덤 이름 (예: "판다-07")
+    total_buy_krw = Column(Float, nullable=False)         # 총 투입 KRW
+    take_profit_pct = Column(Float, nullable=False)       # 포트폴리오 익절%
+    stop_loss_pct = Column(Float, nullable=False)         # 포트폴리오 최대 손절% (max -2%)
+    agent_reason = Column(Text)                           # 포트폴리오 구성 이유
+    llm_provider = Column(String(50), default="")
+    opened_at = Column(DateTime, default=datetime.utcnow, index=True)
+    closed_at = Column(DateTime, nullable=True)
+    is_open = Column(Boolean, default=True, index=True)
+
+
+class Position(Base):
+    """포트폴리오 내 개별 코인 포지션"""
+    __tablename__ = "positions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    portfolio_id = Column(Integer, nullable=False, index=True)  # FK → portfolios.id
+    symbol = Column(String(20), nullable=False, index=True)
+    units = Column(Float, nullable=False)
+    buy_price = Column(Float, nullable=False)
+    buy_krw = Column(Float, nullable=False)               # 개별 투입금 (전체의 12.5%)
+    agent_reason = Column(Text)                            # 개별 코인 선정 이유
+    opened_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+    is_open = Column(Boolean, default=True, index=True)
+
+
 class Trade(Base):
     """개별 거래 내역"""
     __tablename__ = "trades"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    portfolio_id = Column(Integer, nullable=True, index=True)  # 소속 포트폴리오
     symbol = Column(String(20), nullable=False, index=True)
     side = Column(String(4), nullable=False)        # "buy" | "sell"
     price = Column(Float, nullable=False)
@@ -42,36 +79,17 @@ class Trade(Base):
     note = Column(Text)
 
 
-class Position(Base):
-    """오픈 포지션 (최대 1개)"""
-    __tablename__ = "positions"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    symbol = Column(String(20), nullable=False)
-    units = Column(Float, nullable=False)
-    buy_price = Column(Float, nullable=False)
-    buy_krw = Column(Float, nullable=False)
-    take_profit_pct = Column(Float, nullable=False)
-    stop_loss_1st_pct = Column(Float, nullable=True)   # 1차 손절 (50% 매도)
-    stop_loss_pct = Column(Float, nullable=False)       # 2차 손절 (전량 매도)
-    agent_reason = Column(Text)
-    llm_provider = Column(String(50), default="")   # 사용된 LLM 기록
-    opened_at = Column(DateTime, default=datetime.utcnow, index=True)
-    closed_at = Column(DateTime, nullable=True)
-    is_open = Column(Boolean, default=True, index=True)
-
-
 class DailyReport(Base):
     """일별 성과 리포트"""
     __tablename__ = "daily_reports"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     date = Column(String(10), unique=True, nullable=False)
-    starting_krw = Column(Float, default=0.0)   # 하루 시작 총자산 (KRW + 코인평가액)
-    ending_krw = Column(Float, default=0.0)      # 하루 종료 총자산 (KRW + 코인평가액)
-    pnl_krw = Column(Float, default=0.0)         # 당일 손익 (ending - starting)
+    starting_krw = Column(Float, default=0.0)
+    ending_krw = Column(Float, default=0.0)
+    pnl_krw = Column(Float, default=0.0)
     pnl_pct = Column(Float, default=0.0)
-    total_fee = Column(Float, default=0.0)       # 당일 수수료 합계 (추정)
+    total_fee = Column(Float, default=0.0)
     trade_count = Column(Integer, default=0)
     win_count = Column(Integer, default=0)
     llm_provider = Column(String(50), default="")
@@ -79,34 +97,34 @@ class DailyReport(Base):
 
 
 class StrategyEvaluation(Base):
-    """매매 후 성과 평가 및 전략 조정 기록"""
+    """포트폴리오 매매 후 성과 평가 및 전략 조정 기록"""
     __tablename__ = "strategy_evaluations"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    position_id = Column(Integer, nullable=False, index=True)
-    symbol = Column(String(20), nullable=False)
+    portfolio_id = Column(Integer, nullable=False, index=True)
+    portfolio_name = Column(String(50), nullable=False)
 
-    # 매매 결과
-    buy_price = Column(Float, nullable=False)
-    sell_price = Column(Float, nullable=False)
+    # 포트폴리오 매매 결과
+    total_buy_krw = Column(Float, nullable=False)
+    total_sell_krw = Column(Float, nullable=False)
     pnl_pct = Column(Float, nullable=False)
     held_minutes = Column(Float, nullable=False)
     exit_type = Column(String(10), nullable=False)      # "take_profit" | "stop_loss" | "timeout"
+    coins_summary = Column(Text, default="")            # JSON — 8개 코인별 상세 결과
 
     # 원래 설정
     original_tp_pct = Column(Float, nullable=False)
-    original_sl_1st_pct = Column(Float, nullable=True)  # 1차 손절%
-    original_sl_pct = Column(Float, nullable=False)      # 2차 손절%
+    original_sl_pct = Column(Float, nullable=False)
 
     # AI 평가 결과
-    evaluation = Column(Text, nullable=False)            # AI 평가 텍스트
-    suggested_tp_pct = Column(Float, nullable=False)     # 제안된 다음 익절%
-    suggested_sl_pct = Column(Float, nullable=False)     # 제안된 다음 손절%
-    lesson = Column(Text, default="")                    # 핵심 교훈 요약
+    evaluation = Column(Text, nullable=False)
+    suggested_tp_pct = Column(Float, nullable=False)
+    suggested_sl_pct = Column(Float, nullable=False)
+    lesson = Column(Text, default="")
 
-    # 동적 조정 기록 (보유 중 조정이 있었다면)
-    adjusted_tp_pct = Column(Float, nullable=True)       # 조정된 익절% (없으면 NULL)
-    adjusted_sl_pct = Column(Float, nullable=True)       # 조정된 손절% (없으면 NULL)
+    # 동적 조정 기록
+    adjusted_tp_pct = Column(Float, nullable=True)
+    adjusted_sl_pct = Column(Float, nullable=True)
     adjustment_reason = Column(Text, default="")
 
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -118,14 +136,13 @@ class AgentScore(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     agent_role = Column(String(30), nullable=False, index=True)
-    # market_analyst | asset_manager | buy_strategist | sell_strategist | portfolio_evaluator
-    score = Column(Float, nullable=False)           # 0~100
-    previous_score = Column(Float, nullable=True)   # 직전 점수 (트렌드)
+    score = Column(Float, nullable=False)
+    previous_score = Column(Float, nullable=True)
     strengths = Column(Text, default="")
     weaknesses = Column(Text, default="")
-    directive = Column(Text, default="")            # 개선 지시
-    priority = Column(String(20), default="")       # reinforce | improve | critical
-    eval_period = Column(String(20), nullable=False) # "2026-04-09_06" (날짜_시)
+    directive = Column(Text, default="")
+    priority = Column(String(20), default="")
+    eval_period = Column(String(20), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -135,10 +152,10 @@ class AgentDecisionLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     agent_role = Column(String(30), nullable=False, index=True)
-    decision_type = Column(String(30), nullable=False)  # market_analysis | allocation | coin_select | exit_adjust | evaluate
-    input_summary = Column(Text, default="")       # 입력 요약
-    output_summary = Column(Text, default="")      # 출력 요약
-    position_id = Column(Integer, nullable=True)   # 관련 포지션
+    decision_type = Column(String(30), nullable=False)
+    input_summary = Column(Text, default="")
+    output_summary = Column(Text, default="")
+    portfolio_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -155,8 +172,8 @@ def _make_engine() -> Engine:
             poolclass=QueuePool,
             pool_size=settings.DB_POOL_SIZE,
             max_overflow=settings.DB_MAX_OVERFLOW,
-            pool_pre_ping=True,     # 연결 유효성 사전 확인 (EC2 재시작 후 끊김 방지)
-            pool_recycle=3600,      # 1시간마다 커넥션 재생성
+            pool_pre_ping=True,
+            pool_recycle=3600,
             echo=settings.DB_ECHO,
         )
     else:
@@ -168,13 +185,12 @@ def _make_engine() -> Engine:
             f"sqlite:///{db_path}",
             connect_args={
                 "check_same_thread": False,
-                "timeout": 30,          # 락 대기 타임아웃(초)
+                "timeout": 30,
             },
-            poolclass=NullPool,         # SQLite는 멀티스레드 풀 불필요
+            poolclass=NullPool,
             echo=settings.DB_ECHO,
         )
 
-        # WAL 모드: 크래시 복구 + 동시 읽기 허용
         @event.listens_for(engine, "connect")
         def _set_sqlite_pragma(dbapi_conn, _):
             cursor = dbapi_conn.cursor()
@@ -187,28 +203,47 @@ def _make_engine() -> Engine:
     return engine
 
 
+def _backup_and_reset_db() -> None:
+    """v4.0 포트폴리오 전환: 기존 DB를 백업하고 클린 스타트
+
+    portfolios 테이블이 없으면 구 스키마로 간주하여 백업 후 삭제합니다.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    db_url = settings.DATABASE_URL
+    if db_url:
+        return  # 외부 DB는 수동 마이그레이션 필요
+
+    db_path = settings.DB_PATH
+    if not os.path.exists(db_path):
+        return  # 신규 설치
+
+    # 기존 DB에 portfolios 테이블이 있는지 확인
+    import sqlite3
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='portfolios'"
+        )
+        has_portfolio_table = cursor.fetchone() is not None
+        conn.close()
+    except Exception:
+        has_portfolio_table = False
+
+    if has_portfolio_table:
+        return  # 이미 v4.0 스키마
+
+    # 구 스키마 → 백업 후 삭제
+    backup_path = db_path + ".v1_backup"
+    if not os.path.exists(backup_path):
+        shutil.copy2(db_path, backup_path)
+        _log.info(f"[DB 마이그레이션] 기존 DB → {backup_path} 백업 완료")
+    os.remove(db_path)
+    _log.info("[DB 마이그레이션] 구 스키마 삭제 → 포트폴리오 스키마로 클린 스타트")
+
+
+_backup_and_reset_db()
 engine = _make_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base.metadata.create_all(engine)
-
-
-def _migrate_schema() -> None:
-    """기존 DB에 누락된 컬럼 자동 추가 (SQLite ALTER TABLE)"""
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
-    migrations = [
-        ("positions", "stop_loss_1st_pct", "REAL"),
-        ("strategy_evaluations", "original_sl_1st_pct", "REAL"),
-        ("daily_reports", "total_fee", "REAL DEFAULT 0"),
-    ]
-    with engine.connect() as conn:
-        for table, col, coltype in migrations:
-            try:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
-                conn.commit()
-                _log.info(f"[DB Migration] {table}.{col} 컬럼 추가 완료")
-            except Exception:
-                pass  # 이미 존재하는 컬럼은 무시
-
-
-_migrate_schema()

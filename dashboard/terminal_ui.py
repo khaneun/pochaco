@@ -23,7 +23,7 @@ from rich.text import Text
 
 from core import BithumbClient
 from database import TradeRepository
-from database.models import Position
+from database.models import Portfolio, Position
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -136,13 +136,18 @@ class Dashboard:
             pos_value = 0.0
             pos_symbol = ""
 
-            pos: Position | None = self._repo.get_open_position()
-            if pos:
+            pf: Portfolio | None = self._repo.get_open_portfolio()
+            if pf:
                 try:
-                    cur_price = self._client.get_current_price(pos.symbol)
-                    pos_value = pos.units * cur_price
+                    positions = self._repo.get_portfolio_positions(pf.id)
+                    for p in positions:
+                        try:
+                            cur_price = self._client.get_current_price(p.symbol)
+                            pos_value += p.units * cur_price
+                        except Exception:
+                            pos_value += p.buy_krw
                     total_assets = krw + pos_value
-                    pos_symbol = pos.symbol
+                    pos_symbol = pf.name
                 except Exception:
                     pass
 
@@ -190,31 +195,40 @@ class Dashboard:
     #  패널: 현재 포지션                                                 #
     # ---------------------------------------------------------------- #
     def _build_position_panel(self) -> Panel:
-        pos: Position | None = self._repo.get_open_position()
-        if pos is None:
+        pf: Portfolio | None = self._repo.get_open_portfolio()
+        if pf is None:
             return Panel(
-                Text("\n\n  현재 보유 포지션 없음\n  AI 코인 선정 대기 중...", style="dim"),
-                title="[bold]현재 포지션[/bold]",
+                Text("\n\n  활성 포트폴리오 없음\n  AI 포트폴리오 구성 대기 중...", style="dim"),
+                title="[bold]현재 포트폴리오[/bold]",
                 box=box.ROUNDED,
             )
         try:
-            cur_price = self._client.get_current_price(pos.symbol)
-            # 실제 거래소 잔고 기준 (1차 손절 후 pos.units는 원래 수량이라 부정확)
-            actual_units = self._client.get_coin_balance(pos.symbol)
-            if actual_units <= 0:
-                actual_units = pos.units  # 조회 실패 시 fallback
-            pnl_pct = (cur_price - pos.buy_price) / pos.buy_price * 100
-            pnl_krw = (cur_price - pos.buy_price) * actual_units
+            positions = self._repo.get_portfolio_positions(pf.id)
+            total_buy = sum(p.buy_krw for p in positions)
+            total_current = 0.0
+            coin_lines = []
+            for p in positions:
+                try:
+                    cur = self._client.get_current_price(p.symbol)
+                    val = self._client.get_coin_balance(p.symbol) * cur
+                    if val <= 0:
+                        val = p.buy_krw
+                except Exception:
+                    cur = p.buy_price
+                    val = p.buy_krw
+                total_current += val
+                cp = (cur - p.buy_price) / p.buy_price * 100 if p.buy_price > 0 else 0
+                c_color = "green" if cp >= 0 else "red"
+                coin_lines.append(f"  [{c_color}]{p.symbol} {cp:+.1f}%[/{c_color}]")
+
+            pnl_pct = (total_current - total_buy) / total_buy * 100 if total_buy > 0 else 0
+            pnl_krw = total_current - total_buy
             pnl_color = "green" if pnl_pct >= 0 else "red"
 
-            held_min = (datetime.utcnow() - pos.opened_at).total_seconds() / 60
+            held_min = (datetime.utcnow() - pf.opened_at).total_seconds() / 60
             held_str = f"{held_min / 60:.1f}시간" if held_min >= 60 else f"{held_min:.0f}분"
 
-            # 1차 손절 실행 여부 감지
-            sl1_executed = pos.units > 0 and (actual_units / pos.units) < 0.75
-
-            # 익절 목표 대비 진행률 바
-            progress = min(1.0, max(0.0, pnl_pct / pos.take_profit_pct)) if pos.take_profit_pct > 0 else 0.0
+            progress = min(1.0, max(0.0, pnl_pct / pf.take_profit_pct)) if pf.take_profit_pct > 0 else 0.0
             bar_len = 24
             filled = int(progress * bar_len)
             bar_text = Text()
@@ -226,37 +240,25 @@ class Dashboard:
             tbl.add_column("항목", style="dim", ratio=2)
             tbl.add_column("값", ratio=3)
 
-            units_label = f"{pos.symbol}  {actual_units:.6f}개"
-            if sl1_executed:
-                units_label += "  [yellow](1차손절 실행 — 50% 잔여)[/yellow]"
-            tbl.add_row("코인 / 수량", Text.from_markup(f"[bold]{units_label}[/bold]"))
-            tbl.add_row(
-                "매수가 → 현재가",
-                f"{pos.buy_price:,.0f}  →  [bold]{cur_price:,.0f}[/bold] 원",
-            )
+            tbl.add_row("포트폴리오", Text.from_markup(f"[bold]{pf.name}[/bold]  ({len(positions)}개 코인)"))
+            tbl.add_row("투입금", f"{total_buy:,.0f} 원")
 
             pnl_val = Text()
             pnl_val.append(f"{pnl_pct:+.2f}%", style=f"bold {pnl_color}")
             pnl_val.append(f"  ({pnl_krw:+,.0f} 원)", style=pnl_color)
-            tbl.add_row("평가 손익", pnl_val)
+            tbl.add_row("종합 손익", pnl_val)
 
-            # 손절 기준: SL1 → SL2 형태로 표시
-            if pos.stop_loss_1st_pct:
-                sl_display = (
-                    f"[yellow]{pos.stop_loss_1st_pct:.1f}%[/yellow] 50%"
-                    f"  →  [red]{pos.stop_loss_pct:.1f}%[/red] 전량"
-                )
-            else:
-                sl_display = f"[red]{pos.stop_loss_pct:.1f}%[/red]"
-            tbl.add_row("익절 / 손절 기준", f"[green]+{pos.take_profit_pct:.1f}%[/green]  /  {sl_display}")
+            sl_display = f"분할 -1%/-1.5%/[red]{pf.stop_loss_pct:.1f}%[/red]"
+            tbl.add_row("TP / SL", f"[green]+{pf.take_profit_pct:.1f}%[/green]  /  {sl_display}")
             tbl.add_row("보유 시간", held_str)
             tbl.add_row("익절 달성률", bar_text)
-            tbl.add_row("AI 선정 이유", Text((pos.agent_reason or "")[:55], style="dim italic"))
-            tbl.add_row("LLM", Text(pos.llm_provider or "-", style="dim"))
+            tbl.add_row("코인 현황", Text.from_markup(" ".join(coin_lines[:4])))
+            if len(coin_lines) > 4:
+                tbl.add_row("", Text.from_markup(" ".join(coin_lines[4:])))
 
-            return Panel(tbl, title="[bold]현재 포지션[/bold]", box=box.ROUNDED)
+            return Panel(tbl, title="[bold]현재 포트폴리오[/bold]", box=box.ROUNDED)
         except Exception as e:
-            return Panel(f"[red]{e}[/red]", title="현재 포지션", box=box.ROUNDED)
+            return Panel(f"[red]{e}[/red]", title="현재 포트폴리오", box=box.ROUNDED)
 
     # ---------------------------------------------------------------- #
     #  패널: 자산 변동 차트                                               #
@@ -275,10 +277,13 @@ class Dashboard:
             try:
                 krw = self._client.get_krw_balance()
                 total = krw
-                pos = self._repo.get_open_position()
-                if pos:
-                    cur = self._client.get_current_price(pos.symbol)
-                    total = krw + pos.units * cur
+                pf_chart = self._repo.get_open_portfolio()
+                if pf_chart:
+                    for p_c in self._repo.get_portfolio_positions(pf_chart.id):
+                        try:
+                            total += p_c.units * self._client.get_current_price(p_c.symbol)
+                        except Exception:
+                            total += p_c.buy_krw
 
                 today_label = today_str[5:].replace("-", "/") + "▶"
                 today_prefix = today_str[5:].replace("-", "/")

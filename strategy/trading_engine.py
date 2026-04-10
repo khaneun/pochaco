@@ -1,11 +1,14 @@
-"""핵심 매매 루프 엔진
+"""핵심 매매 루프 엔진 (v4.0 — 포트폴리오 기반)
 
 기동 시점부터 아래 사이클을 무한 반복합니다:
-  1. CoinSelector 사전 필터링 → AI Agent 코인 선정
-  2. 가용 KRW 전액 매수
-  3. 스마트 익절/손절 감시 (트레일링 + 손절 관찰 + 동적 조정)
-  4. 조건 충족 시 전량 시장가 매도 → 성과 평가 → 1번으로
+  1. CoinSelector 사전 필터링 → AI 8개 코인 포트폴리오 선정
+  2. 가용 KRW를 8등분하여 각 코인 매수
+  3. 포트폴리오 종합 P&L 기반 스마트 매도 감시
+     - 낙폭별 분할 매도: -1.0% → 33%, -1.5% → 33%, -2.0% → 전량
+     - 트레일링 익절: TP 도달 시 고점 추적
+  4. 매도 완료 → 성과 평가 → 1번으로
 """
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -15,12 +18,13 @@ from enum import Enum
 from config import settings
 from core import BithumbClient
 from database import TradeRepository
-from database.models import Position
-from strategy.ai_agent import TradingAgent
+from database.models import Portfolio, Position
+from strategy.ai_agent import PortfolioDecision
 from strategy.agent_coordinator import AgentCoordinator
 from strategy.market_analyzer import MarketAnalyzer
 from strategy.strategy_optimizer import StrategyOptimizer
 from strategy.coin_selector import CoinSelector
+from strategy.portfolio_names import generate_name as generate_portfolio_name
 from . import cooldown as cooldown_registry
 
 logger = logging.getLogger(__name__)
@@ -29,40 +33,46 @@ logger = logging.getLogger(__name__)
 _ADJUST_INTERVAL_SEC = 30 * 60
 # 최대 보유 시간 (분) — 초과 시 강제 매도
 _MAX_HOLD_MINUTES = 720  # 12시간
+# 코인 매수 간격 (초) — API 레이트 리밋 방지
+_BUY_INTERVAL_SEC = 0.5
+# 포트폴리오 최소 코인 수 (이 이하면 생성 실패)
+_MIN_PORTFOLIO_COINS = 3
 
 
 # ================================================================== #
-#  스마트 매도 상태 머신                                                #
+#  포트폴리오 매도 상태 머신                                              #
 # ================================================================== #
 class _ExitPhase(Enum):
     """매도 감시 상태"""
-    MONITORING = "monitoring"        # 일반 감시 중 (2단계 손절 포함)
+    MONITORING = "monitoring"        # 일반 감시 (낙폭별 분할 매도)
     TRAILING_TP = "trailing_tp"      # 익절 돌파 → 트레일링 추적
 
 
 @dataclass
-class _ExitTracker:
-    """포지션별 매도 상태 추적기"""
+class _PortfolioExitTracker:
+    """포트폴리오 매도 상태 추적기"""
     phase: _ExitPhase = _ExitPhase.MONITORING
 
     # ── 트레일링 익절 ──
-    peak_pnl_pct: float = 0.0          # 트레일링 진입 후 최고 수익률
-    trail_offset_pct: float = 0.8      # 고점 대비 이만큼 하락하면 매도
-    trailing_since: float = 0.0        # 트레일링 진입 시각 (epoch)
-    trailing_timeout: float = 1800.0   # 트레일링 최대 유지 시간 (초, 30분)
+    peak_pnl_pct: float = 0.0
+    trail_offset_pct: float = 0.8
+    trailing_since: float = 0.0
+    trailing_timeout: float = 1800.0   # 30분
 
-    # ── 2단계 손절 ──
-    sl1_executed: bool = False         # 1차 손절(50% 매도) 완료 여부
+    # ── 낙폭별 분할 매도 상태 ──
+    tier1_sold: bool = False    # -1.0% → 33% 매도 완료
+    tier2_sold: bool = False    # -1.5% → 33% 추가 매도 완료
+    # -2.0% → 잔여 전량 매도 (최종 손절)
 
 
 class TradingEngine:
-    """기동부터 종료까지 매매 사이클을 단일 루프로 관리"""
+    """기동부터 종료까지 포트폴리오 매매 사이클을 관리"""
 
     def __init__(
         self,
         client: BithumbClient,
         repo: TradeRepository,
-        agent: TradingAgent | AgentCoordinator,
+        agent: AgentCoordinator,
         analyzer: MarketAnalyzer,
         optimizer: StrategyOptimizer | None = None,
         selector: CoinSelector | None = None,
@@ -76,10 +86,10 @@ class TradingEngine:
         self._running = False
         self._paused = False
         self._notifier = None
-        self._price_fail_count: dict[int, int] = {}  # position_id → 연속 실패 횟수
-        self._exit_trackers: dict[int, _ExitTracker] = {}  # position_id → 매도 상태
-        self._last_adjust_time: float = 0.0           # 마지막 전략 조정 시각 (epoch)
-        self._last_adjustment: dict | None = None     # 가장 최근 동적 조정 기록
+        self._price_fail_count: dict[str, int] = {}        # symbol → 연속 실패 횟수
+        self._exit_tracker: _PortfolioExitTracker | None = None
+        self._last_adjust_time: float = 0.0
+        self._last_adjustment: dict | None = None
         self.daily_start_krw: float = 0.0
 
     # ------------------------------------------------------------------ #
@@ -103,20 +113,12 @@ class TradingEngine:
     def run(self) -> None:
         """매매 루프 (블로킹). 별도 스레드에서 호출하세요."""
         self._running = True
-        logger.info("=== TradingEngine 시작 ===")
+        logger.info("=== TradingEngine 시작 (포트폴리오 모드) ===")
 
-        # 시작 총자산 = KRW + 보유 코인 평가액
-        _start_krw = self._client.get_krw_balance()
-        _start_pos = self._repo.get_open_position()
-        if _start_pos:
-            try:
-                _start_cur = self._client.get_current_price(_start_pos.symbol)
-                _start_krw += _start_pos.units * _start_cur
-            except Exception:
-                pass
-        self.daily_start_krw = _start_krw
+        # 시작 총자산 계산
+        self.daily_start_krw = self._calc_total_assets()
 
-        # StrategyOptimizer 초기화 (기존 평가 데이터로 즉시 파라미터 결정)
+        # StrategyOptimizer 초기화
         if self._optimizer:
             try:
                 init_stats = self._repo.get_evaluation_stats(last_n=10)
@@ -129,19 +131,17 @@ class TradingEngine:
                         f"/ 손절 {p.sl_clamp_min}~{p.sl_clamp_max}% "
                         f"| {p.rationale}"
                     )
-                else:
-                    logger.info("[StrategyOptimizer] 과거 데이터 없음 — 기본 파라미터(익절 1~3.5%, 손절 -2~-6%) 사용")
             except Exception as e:
                 logger.error(f"[StrategyOptimizer 초기화 오류] {e}")
 
         while self._running:
             try:
-                pos = self._repo.get_open_position()
+                portfolio = self._repo.get_open_portfolio()
 
-                if pos is None:
-                    self._select_and_buy()
+                if portfolio is None:
+                    self._select_and_buy_portfolio()
                 else:
-                    self._check_exit(pos)
+                    self._check_portfolio_exit(portfolio)
 
             except Exception as e:
                 logger.error(f"[엔진 오류] {e}", exc_info=True)
@@ -161,10 +161,26 @@ class TradingEngine:
         self._running = False
 
     # ------------------------------------------------------------------ #
+    #  총자산 계산 헬퍼                                                     #
+    # ------------------------------------------------------------------ #
+    def _calc_total_assets(self) -> float:
+        """KRW 잔고 + 보유 코인 평가액"""
+        total = self._client.get_krw_balance()
+        portfolio = self._repo.get_open_portfolio()
+        if portfolio:
+            positions = self._repo.get_portfolio_positions(portfolio.id)
+            for pos in positions:
+                try:
+                    price = self._client.get_current_price(pos.symbol)
+                    total += pos.units * price
+                except Exception:
+                    total += pos.buy_krw  # 시세 조회 실패 시 매수가 기준
+        return total
+
+    # ------------------------------------------------------------------ #
     #  미체결 주문 정리                                                     #
     # ------------------------------------------------------------------ #
     def _cancel_stuck_orders(self) -> None:
-        """in_use_krw > 0이면 미체결 주문이 KRW를 묶고 있으므로 일괄 취소"""
         try:
             detail = self._client.get_krw_balance_detail()
             if detail["in_use"] <= 0:
@@ -183,12 +199,10 @@ class TradingEngine:
             logger.error(f"[미체결 취소 오류] {e}")
 
     # ------------------------------------------------------------------ #
-    #  Step 1: 전체 현금화                                                  #
+    #  전체 현금화                                                          #
     # ------------------------------------------------------------------ #
     def _liquidate_all(self, note: str = "현금화") -> None:
         logger.info(f"[현금화 시작] {note}")
-
-        # 먼저 미체결 주문 정리
         self._cancel_stuck_orders()
 
         balance_data = self._client.get_balance("ALL")
@@ -227,15 +241,18 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"  {symbol} 현금화 오류: {e}")
 
-        self._repo.close_all_positions()
+        # 모든 포트폴리오/포지션 종료
+        portfolio = self._repo.get_open_portfolio()
+        if portfolio:
+            self._repo.close_portfolio(portfolio.id)
 
         krw = self._client.get_krw_balance()
         logger.info(f"[현금화 완료] {'매도 없음' if not sold_any else '완료'} KRW={krw:,.0f}원")
 
     # ------------------------------------------------------------------ #
-    #  Step 2-3: 코인 선정 및 매수                                          #
+    #  포트폴리오 선정 및 매수                                               #
     # ------------------------------------------------------------------ #
-    def _select_and_buy(self) -> None:
+    def _select_and_buy_portfolio(self) -> None:
         if self._paused:
             logger.info("[매수 스킵] 일시 중지 상태")
             return
@@ -247,25 +264,21 @@ class TradingEngine:
             time.sleep(30)
             return
 
-        logger.info("=== AI Agent 코인 선정 ===")
+        logger.info("=== 포트폴리오 구성 시작 ===")
         snapshots = self._analyzer.build_market_summary(top_n=30)
         if not snapshots:
             logger.error("시장 데이터 수집 실패, 30초 후 재시도")
             time.sleep(30)
             return
 
-        # 과거 성과 통계를 가져와서 Agent에게 전달
         eval_stats = self._repo.get_evaluation_stats(last_n=10)
 
-        # StrategyOptimizer 파라미터를 clamp 범위로 주입
-        # eval_stats가 있으면 merge (repository suggested + optimizer 보정)
-        # eval_stats가 없으면 optimizer 기본값으로 clamp 구성
+        # StrategyOptimizer 파라미터 주입
         target_tp = 2.0
         if self._optimizer:
             opt = self._optimizer.get_params()
             target_tp = opt.target_tp
             if not eval_stats:
-                # 초기 상태: optimizer 기본값으로 clamp 직접 구성
                 eval_stats = {
                     "count": 0,
                     "tp_clamp_min": opt.tp_clamp_min,
@@ -274,26 +287,19 @@ class TradingEngine:
                     "sl_clamp_max": opt.sl_clamp_max,
                 }
             else:
-                # repository clamp과 optimizer clamp을 merge
-                # optimizer의 범위와 repository의 범위 중 더 넓은 쪽 채택
                 eval_stats["tp_clamp_min"] = min(
                     eval_stats.get("tp_clamp_min", 1.0), opt.tp_clamp_min)
                 eval_stats["tp_clamp_max"] = max(
                     eval_stats.get("tp_clamp_max", 3.5), opt.tp_clamp_max)
                 eval_stats["sl_clamp_min"] = min(
-                    eval_stats.get("sl_clamp_min", -6.0), opt.sl_clamp_min)
+                    eval_stats.get("sl_clamp_min", -2.0), opt.sl_clamp_min)
                 eval_stats["sl_clamp_max"] = max(
-                    eval_stats.get("sl_clamp_max", -2.0), opt.sl_clamp_max)
-            logger.info(
-                f"[StrategyOptimizer] 파라미터 주입: "
-                f"익절 {eval_stats['tp_clamp_min']}~{eval_stats['tp_clamp_max']}% "
-                f"/ 손절 {eval_stats['sl_clamp_min']}~{eval_stats['sl_clamp_max']}%"
-            )
+                    eval_stats.get("sl_clamp_max", -1.0), opt.sl_clamp_max)
 
-        # ── 쿨다운 심볼 조회 (자동 익손절 + 수동 청산 모두 포함) ──
+        # 쿨다운 심볼
         cooldown_symbols = cooldown_registry.get_cooldown_symbols()
 
-        # CoinSelector: 변동성·모멘텀 기반 사전 필터링
+        # CoinSelector: 사전 필터링
         filtered, coin_scores = self._selector.filter_and_rank(
             snapshots, target_tp=target_tp, cooldown_symbols=cooldown_symbols
         )
@@ -302,365 +308,502 @@ class TradingEngine:
             filtered = snapshots
             coin_scores = []
 
-        decision = self._agent.select_coin(filtered, eval_stats=eval_stats, coin_scores=coin_scores)
+        # AI 포트폴리오 선정
+        decision: PortfolioDecision = self._agent.select_portfolio(
+            filtered, eval_stats=eval_stats, coin_scores=coin_scores,
+        )
+        symbols_str = ", ".join(c.symbol for c in decision.coins)
         logger.info(
-            f"[AI 선정] {decision.symbol} "
-            f"익절=+{decision.take_profit_pct}% "
-            f"1차SL={decision.stop_loss_1st_pct}% 2차SL={decision.stop_loss_pct}% "
-            f"확신도={decision.confidence:.0%} | {decision.reason}"
+            f"[포트폴리오 선정] [{symbols_str}] "
+            f"TP=+{decision.take_profit_pct}% SL={decision.stop_loss_pct}% "
+            f"확신도={decision.confidence:.0%}"
         )
 
-        # 투자 비율: AgentCoordinator 사용 시 자산 운용가 결정값, 아니면 95%
+        # 투자 비율
         invest_ratio = getattr(self._agent, "last_invest_ratio", 0.95)
-        buy_amount = krw * invest_ratio
-        result = self._client.market_buy(decision.symbol, buy_amount)
-        if result.get("status") != "0000":
-            logger.error(f"[매수 실패] {result}")
-            self._cancel_stuck_orders()
-            time.sleep(2)
-            krw = self._client.get_krw_balance()
-            if krw >= settings.MIN_ORDER_KRW:
-                buy_amount = krw * invest_ratio
-                result = self._client.market_buy(decision.symbol, buy_amount)
-                if result.get("status") != "0000":
-                    logger.error(f"[매수 재시도 실패] {result} — 30초 후 재시도")
-                    time.sleep(30)
-                    return
-            else:
-                time.sleep(30)
-                return
+        total_invest = krw * invest_ratio
+        per_coin_amount = total_invest / len(decision.coins)
 
-        # 체결 반영 대기
-        time.sleep(1)
-        units = self._client.get_coin_balance(decision.symbol)
-        current_price = self._client.get_current_price(decision.symbol)
+        # 포트폴리오 이름 생성
+        portfolio_name = generate_portfolio_name()
 
-        self._repo.save_trade(
-            symbol=decision.symbol, side="buy",
-            price=current_price, units=units,
-            krw_amount=buy_amount, note=decision.reason,
-        )
-        self._repo.open_position(
-            symbol=decision.symbol,
-            units=units,
-            buy_price=current_price,
-            buy_krw=buy_amount,
+        # 포트폴리오 DB 생성
+        portfolio = self._repo.open_portfolio(
+            name=portfolio_name,
+            total_buy_krw=total_invest,
             take_profit_pct=decision.take_profit_pct,
-            stop_loss_1st_pct=decision.stop_loss_1st_pct,
             stop_loss_pct=decision.stop_loss_pct,
-            agent_reason=decision.reason,
+            agent_reason=decision.portfolio_reason,
             llm_provider=decision.llm_provider,
         )
+
+        # ── 8개 코인 순차 매수 ──
+        bought_count = 0
+        for coin in decision.coins:
+            try:
+                result = self._client.market_buy(coin.symbol, per_coin_amount)
+                if result.get("status") != "0000":
+                    logger.warning(f"[매수 실패] {coin.symbol}: {result}")
+                    continue
+
+                time.sleep(_BUY_INTERVAL_SEC)
+                units = self._client.get_coin_balance(coin.symbol)
+                current_price = self._client.get_current_price(coin.symbol)
+
+                self._repo.save_trade(
+                    symbol=coin.symbol, side="buy",
+                    price=current_price, units=units,
+                    krw_amount=per_coin_amount, note=coin.reason,
+                    portfolio_id=portfolio.id,
+                )
+                self._repo.open_position(
+                    portfolio_id=portfolio.id,
+                    symbol=coin.symbol,
+                    units=units,
+                    buy_price=current_price,
+                    buy_krw=per_coin_amount,
+                    agent_reason=coin.reason,
+                )
+                bought_count += 1
+                logger.info(
+                    f"  [{bought_count}/{len(decision.coins)}] "
+                    f"{coin.symbol} {units}개 @ {current_price:,.0f}원"
+                )
+            except Exception as e:
+                logger.error(f"[매수 오류] {coin.symbol}: {e}")
+
+        if bought_count < _MIN_PORTFOLIO_COINS:
+            logger.error(
+                f"[포트폴리오 실패] {bought_count}개만 매수 (최소 {_MIN_PORTFOLIO_COINS}개) "
+                f"— 전체 청산 후 재시도"
+            )
+            self._liquidate_all("포트폴리오 구성 실패")
+            time.sleep(30)
+            return
+
         logger.info(
-            f"[매수 완료] {decision.symbol} {units}개 @ {current_price:,.0f}원 "
-            f"투입={buy_amount:,.0f}원"
+            f"[포트폴리오 매수 완료] '{portfolio_name}' "
+            f"{bought_count}/{len(decision.coins)}개 코인 | "
+            f"총 투입={total_invest:,.0f}원"
         )
 
-        # 전략 조정 타이머 + 매도 상태 리셋
+        # 상태 초기화
         self._last_adjust_time = time.time()
         self._last_adjustment = None
-        self._exit_trackers.clear()
+        self._exit_tracker = _PortfolioExitTracker()
 
         if self._notifier:
             try:
-                self._notifier.notify_buy(
-                    symbol=decision.symbol,
-                    price=current_price,
-                    units=units,
-                    krw_amount=buy_amount,
-                    reason=decision.reason,
-                    take_profit_pct=decision.take_profit_pct,
-                    stop_loss_pct=decision.stop_loss_pct,
-                    stop_loss_1st_pct=decision.stop_loss_1st_pct,
-                    llm_provider=decision.llm_provider,
+                coin_list = "\n".join(
+                    f"  • {c.symbol} ({c.reason})" for c in decision.coins[:bought_count]
+                )
+                self._notifier.send(
+                    f"📦 <b>포트폴리오 매수 완료</b> '{portfolio_name}'\n"
+                    f"코인 {bought_count}개 | 투입 {total_invest:,.0f}원\n"
+                    f"TP +{decision.take_profit_pct}% / SL {decision.stop_loss_pct}%\n"
+                    f"{coin_list}"
                 )
             except Exception:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Step 4: 스마트 익절/손절 감시 (상태 머신)                              #
+    #  포트폴리오 종합 P&L 계산                                              #
     # ------------------------------------------------------------------ #
-    def _check_exit(self, position: Position) -> None:
-        try:
-            current_price = self._client.get_current_price(position.symbol)
-            self._price_fail_count.pop(position.id, None)
-        except Exception as e:
-            fail_count = self._price_fail_count.get(position.id, 0) + 1
-            self._price_fail_count[position.id] = fail_count
-            logger.error(f"[시세 조회 실패] {position.symbol} ({fail_count}/5): {e}")
-            if fail_count >= 5:
-                logger.warning(f"[강제 청산 시도] {position.symbol} 시세 5회 연속 조회 실패")
-                try:
-                    units = self._client.get_coin_balance(position.symbol)
-                    if units > 0:
-                        self._client.market_sell(position.symbol, units)
-                except Exception as sell_err:
-                    logger.error(f"[강제 청산 실패] {position.symbol}: {sell_err}")
-                self._repo.close_position(position.id)
-                self._price_fail_count.pop(position.id, None)
-                self._exit_trackers.pop(position.id, None)
+    def _calc_portfolio_pnl(
+        self, positions: list[Position],
+    ) -> tuple[float, float, list[dict]]:
+        """포트폴리오 종합 P&L 계산
+
+        Returns:
+            (pnl_pct, pnl_krw, coin_details)
+            coin_details: [{symbol, buy_price, buy_krw, current_price, current_value, pnl_pct, units}]
+        """
+        total_buy = 0.0
+        total_current = 0.0
+        coin_details = []
+
+        for pos in positions:
+            try:
+                current_price = self._client.get_current_price(pos.symbol)
+                current_value = pos.units * current_price
+                self._price_fail_count.pop(pos.symbol, None)
+            except Exception as e:
+                fail_count = self._price_fail_count.get(pos.symbol, 0) + 1
+                self._price_fail_count[pos.symbol] = fail_count
+                logger.warning(f"[시세 조회 실패] {pos.symbol} ({fail_count}회): {e}")
+                current_price = pos.buy_price
+                current_value = pos.buy_krw
+
+            coin_pnl_pct = (
+                (current_price - pos.buy_price) / pos.buy_price * 100
+                if pos.buy_price > 0 else 0.0
+            )
+
+            total_buy += pos.buy_krw
+            total_current += current_value
+
+            coin_details.append({
+                "symbol": pos.symbol,
+                "buy_price": pos.buy_price,
+                "buy_krw": pos.buy_krw,
+                "current_price": current_price,
+                "current_value": current_value,
+                "pnl_pct": round(coin_pnl_pct, 2),
+                "units": pos.units,
+            })
+
+        pnl_pct = (
+            (total_current - total_buy) / total_buy * 100
+            if total_buy > 0 else 0.0
+        )
+        pnl_krw = total_current - total_buy
+
+        return round(pnl_pct, 4), round(pnl_krw, 0), coin_details
+
+    # ------------------------------------------------------------------ #
+    #  포트폴리오 매도 감시 (상태 머신)                                       #
+    # ------------------------------------------------------------------ #
+    def _check_portfolio_exit(self, portfolio: Portfolio) -> None:
+        positions = self._repo.get_portfolio_positions(portfolio.id)
+        if not positions:
+            logger.warning(f"[포트폴리오 비어있음] '{portfolio.name}' — 종료 처리")
+            self._repo.close_portfolio(portfolio.id)
+            self._exit_tracker = None
             return
 
-        pnl_pct = (current_price - position.buy_price) / position.buy_price * 100
-        tracker = self._exit_trackers.get(position.id, _ExitTracker())
+        pnl_pct, pnl_krw, coin_details = self._calc_portfolio_pnl(positions)
+        tracker = self._exit_tracker or _PortfolioExitTracker()
 
-        # 시간 기반 강제 탈출 체크 (모든 상태에서 적용)
-        holding_minutes = (datetime.utcnow() - position.opened_at).total_seconds() / 60
+        # 시간 기반 강제 탈출
+        holding_minutes = (datetime.utcnow() - portfolio.opened_at).total_seconds() / 60
         if holding_minutes >= _MAX_HOLD_MINUTES:
-            self._execute_sell(
-                position, current_price, pnl_pct,
-                f"시간초과 강제매도 ({holding_minutes:.0f}분 >= {_MAX_HOLD_MINUTES}분, {pnl_pct:+.2f}%)",
+            self._execute_portfolio_sell(
+                portfolio, positions, pnl_pct, coin_details,
+                f"시간초과 강제매도 ({holding_minutes:.0f}분, {pnl_pct:+.2f}%)",
             )
-            self._exit_trackers.pop(position.id, None)
             return
 
         # ── 상태 머신 분기 ──
         if tracker.phase == _ExitPhase.TRAILING_TP:
-            self._handle_trailing_tp(position, current_price, pnl_pct, tracker)
+            self._handle_trailing_tp(portfolio, positions, pnl_pct, coin_details, tracker)
         else:
-            self._handle_monitoring(position, current_price, pnl_pct, tracker)
+            self._handle_monitoring(portfolio, positions, pnl_pct, coin_details, tracker, holding_minutes)
 
-        # 상태 저장
-        self._exit_trackers[position.id] = tracker
+        self._exit_tracker = tracker
 
     def _handle_monitoring(
-        self, position: Position, current_price: float, pnl_pct: float, tracker: _ExitTracker,
+        self, portfolio: Portfolio, positions: list[Position],
+        pnl_pct: float, coin_details: list[dict],
+        tracker: _PortfolioExitTracker, holding_minutes: float,
     ) -> None:
-        """일반 감시 상태 — 2단계 손절 + 트레일링 익절"""
-        # 1차 손절 기준: position.stop_loss_1st_pct, 없으면 SL2의 80% (더 위)
-        sl_1st = (
-            position.stop_loss_1st_pct
-            if position.stop_loss_1st_pct
-            else round(position.stop_loss_pct * 0.8, 2)
-        )
+        """일반 감시 — 낙폭별 분할 매도 + 트레일링 익절 진입"""
 
         logger.debug(
-            f"[감시] {position.symbol} "
-            f"매수가={position.buy_price:,.0f} 현재가={current_price:,.0f} "
-            f"수익={pnl_pct:+.2f}% "
-            f"익절=+{position.take_profit_pct}% "
-            f"1차SL={sl_1st}% 2차SL={position.stop_loss_pct}% "
-            f"{'[1차실행]' if tracker.sl1_executed else ''}"
+            f"[감시] '{portfolio.name}' 종합={pnl_pct:+.2f}% "
+            f"TP=+{portfolio.take_profit_pct}% SL={portfolio.stop_loss_pct}% "
+            f"{'[T1]' if tracker.tier1_sold else ''}{'[T2]' if tracker.tier2_sold else ''}"
         )
 
-        if pnl_pct >= position.take_profit_pct:
-            # ── 익절 돌파 → 트레일링 모드 진입 ──
+        # ── 익절 돌파 → 트레일링 모드 ──
+        if pnl_pct >= portfolio.take_profit_pct:
             tracker.phase = _ExitPhase.TRAILING_TP
             tracker.peak_pnl_pct = pnl_pct
             tracker.trailing_since = time.time()
-            tracker.trail_offset_pct = self._calc_trail_offset(pnl_pct, position.take_profit_pct)
+            tracker.trail_offset_pct = self._calc_trail_offset(pnl_pct, portfolio.take_profit_pct)
             logger.info(
-                f"[트레일링 진입] {position.symbol} {pnl_pct:+.2f}% >= TP +{position.take_profit_pct}% "
-                f"| 오프셋={tracker.trail_offset_pct}% (고점 대비 이만큼 하락 시 매도)"
+                f"[트레일링 진입] '{portfolio.name}' {pnl_pct:+.2f}% >= TP +{portfolio.take_profit_pct}%"
             )
             if self._notifier:
                 try:
                     self._notifier.send(
-                        f"🎣 <b>트레일링 익절 진입</b> {position.symbol}\n"
-                        f"수익: {pnl_pct:+.2f}% (TP +{position.take_profit_pct}% 돌파)\n"
-                        f"고점 추적 중... 하락 시 매도 (오프셋 {tracker.trail_offset_pct}%)"
+                        f"🎣 <b>트레일링 익절 진입</b> '{portfolio.name}'\n"
+                        f"종합 수익: {pnl_pct:+.2f}% (TP +{portfolio.take_profit_pct}% 돌파)\n"
+                        f"고점 추적 중... 오프셋 {tracker.trail_offset_pct}%"
                     )
                 except Exception:
                     pass
 
-        elif tracker.sl1_executed and pnl_pct <= position.stop_loss_pct:
-            # ── 2차 손절 도달 → 나머지 전량 매도 ──
+        # ── Tier 3: -2.0% 전량 매도 (최종 손절) ──
+        elif pnl_pct <= portfolio.stop_loss_pct:
             logger.warning(
-                f"[2차 손절] {position.symbol} {pnl_pct:+.2f}% <= SL2 {position.stop_loss_pct}%"
+                f"[최종 손절] '{portfolio.name}' {pnl_pct:+.2f}% <= SL {portfolio.stop_loss_pct}%"
             )
-            self._execute_sell(
-                position, current_price, pnl_pct,
-                f"2차 손절 ({pnl_pct:+.2f}% <= SL2 {position.stop_loss_pct}%)",
+            self._execute_portfolio_sell(
+                portfolio, positions, pnl_pct, coin_details,
+                f"최종 손절 ({pnl_pct:+.2f}% <= SL {portfolio.stop_loss_pct}%)",
             )
-            self._exit_trackers.pop(position.id, None)
 
-        elif not tracker.sl1_executed and pnl_pct <= sl_1st:
-            # ── 1차 손절 도달 → 50% 매도, 나머지 대기 ──
-            logger.warning(
-                f"[1차 손절] {position.symbol} {pnl_pct:+.2f}% <= SL1 {sl_1st}%"
+        # ── Tier 2: -1.5% → 33% 추가 매도 ──
+        elif not tracker.tier2_sold and tracker.tier1_sold and pnl_pct <= -1.5:
+            logger.warning(f"[2차 분할 매도] '{portfolio.name}' {pnl_pct:+.2f}% <= -1.5%")
+            self._execute_portfolio_partial_sell(
+                portfolio, positions, ratio=0.5,  # 잔여의 50% ≈ 원래의 33%
+                reason=f"2차 분할 매도 ({pnl_pct:+.2f}% <= -1.5%)",
             )
-            self._execute_partial_sell(position, current_price, pnl_pct, ratio=0.5)
-            tracker.sl1_executed = True
+            tracker.tier2_sold = True
+
+        # ── Tier 1: -1.0% → 33% 매도 ──
+        elif not tracker.tier1_sold and pnl_pct <= -1.0:
+            logger.warning(f"[1차 분할 매도] '{portfolio.name}' {pnl_pct:+.2f}% <= -1.0%")
+            self._execute_portfolio_partial_sell(
+                portfolio, positions, ratio=0.33,
+                reason=f"1차 분할 매도 ({pnl_pct:+.2f}% <= -1.0%)",
+            )
+            tracker.tier1_sold = True
 
         else:
             # 보유 중 — 주기적으로 전략 동적 조정
-            self._maybe_adjust_strategy(position, current_price, pnl_pct)
+            self._maybe_adjust_strategy(
+                portfolio, pnl_pct, coin_details, tracker, holding_minutes
+            )
 
     def _handle_trailing_tp(
-        self, position: Position, current_price: float, pnl_pct: float, tracker: _ExitTracker,
+        self, portfolio: Portfolio, positions: list[Position],
+        pnl_pct: float, coin_details: list[dict],
+        tracker: _PortfolioExitTracker,
     ) -> None:
-        """트레일링 익절 상태 — 고점 추적, 하락 시 매도"""
-        # 고점 갱신
+        """트레일링 익절 — 고점 추적, 하락 시 매도"""
         if pnl_pct > tracker.peak_pnl_pct:
             tracker.peak_pnl_pct = pnl_pct
-            # 수익 커지면 오프셋도 동적 조정 (더 여유)
-            tracker.trail_offset_pct = self._calc_trail_offset(pnl_pct, position.take_profit_pct)
+            tracker.trail_offset_pct = self._calc_trail_offset(pnl_pct, portfolio.take_profit_pct)
 
         drop_from_peak = tracker.peak_pnl_pct - pnl_pct
         elapsed = time.time() - tracker.trailing_since
 
         logger.debug(
-            f"[트레일링] {position.symbol} 현재={pnl_pct:+.2f}% "
-            f"고점={tracker.peak_pnl_pct:+.2f}% 하락={drop_from_peak:.2f}% "
-            f"오프셋={tracker.trail_offset_pct}% 경과={elapsed:.0f}초"
+            f"[트레일링] '{portfolio.name}' 현재={pnl_pct:+.2f}% "
+            f"고점={tracker.peak_pnl_pct:+.2f}% 하락={drop_from_peak:.2f}%"
         )
 
         if drop_from_peak >= tracker.trail_offset_pct:
-            # ── 고점에서 하락 → 매도 (낚시: 줄을 끊음) ──
-            self._execute_sell(
-                position, current_price, pnl_pct,
-                f"트레일링 익절 (고점 {tracker.peak_pnl_pct:+.2f}% → {pnl_pct:+.2f}%, "
-                f"하락 {drop_from_peak:.2f}% >= 오프셋 {tracker.trail_offset_pct}%)",
+            self._execute_portfolio_sell(
+                portfolio, positions, pnl_pct, coin_details,
+                f"트레일링 익절 (고점 {tracker.peak_pnl_pct:+.2f}% → {pnl_pct:+.2f}%)",
             )
-            self._exit_trackers.pop(position.id, None)
-
         elif elapsed >= tracker.trailing_timeout:
-            # ── 타임아웃 → 현재 가격으로 매도 ──
-            self._execute_sell(
-                position, current_price, pnl_pct,
-                f"트레일링 타임아웃 ({elapsed:.0f}초, {pnl_pct:+.2f}%, "
-                f"고점 {tracker.peak_pnl_pct:+.2f}%)",
+            self._execute_portfolio_sell(
+                portfolio, positions, pnl_pct, coin_details,
+                f"트레일링 타임아웃 ({elapsed:.0f}초, {pnl_pct:+.2f}%)",
             )
-            self._exit_trackers.pop(position.id, None)
-
-        elif pnl_pct < position.take_profit_pct * 0.2:
-            # ── TP 이하로 급락 → 즉시 매도 (모멘텀 완전 상실 안전망) ──
-            self._execute_sell(
-                position, current_price, pnl_pct,
+        elif pnl_pct < portfolio.take_profit_pct * 0.2:
+            self._execute_portfolio_sell(
+                portfolio, positions, pnl_pct, coin_details,
                 f"트레일링 모멘텀 상실 ({pnl_pct:+.2f}% < TP의 20%)",
             )
-            self._exit_trackers.pop(position.id, None)
 
-    def _execute_partial_sell(
+    # ------------------------------------------------------------------ #
+    #  포트폴리오 분할 매도                                                  #
+    # ------------------------------------------------------------------ #
+    def _execute_portfolio_partial_sell(
         self,
-        position: Position,
-        current_price: float,
-        pnl_pct: float,
-        ratio: float = 0.5,
+        portfolio: Portfolio,
+        positions: list[Position],
+        ratio: float,
+        reason: str,
     ) -> None:
-        """포지션 일부(ratio 비율) 시장가 매도 — 1차 손절 전용"""
-        logger.info(
-            f"[1차 손절 실행] {position.symbol} "
-            f"수익={pnl_pct:+.2f}% | {ratio*100:.0f}% 매도"
-        )
+        """8개 코인 각각 ratio만큼 분할 매도"""
+        logger.info(f"[분할 매도] '{portfolio.name}' {ratio*100:.0f}% | {reason}")
 
-        actual_units = self._client.get_coin_balance(position.symbol)
-        if actual_units <= 0:
-            logger.warning(f"[1차 손절 스킵] {position.symbol} 잔고 0")
-            return
+        for pos in positions:
+            try:
+                actual_units = self._client.get_coin_balance(pos.symbol)
+                if actual_units <= 0:
+                    continue
 
-        sell_units = actual_units * ratio
-        result = None
-        for attempt in range(1, 4):
-            result = self._client.market_sell(position.symbol, sell_units)
-            if result.get("status") == "0000":
-                break
-            logger.warning(f"[1차 손절 실패 {attempt}/3] {result}")
-            if attempt < 3:
-                time.sleep(2)
-                sell_units = self._client.get_coin_balance(position.symbol) * ratio
+                sell_units = actual_units * ratio
+                current_price = self._client.get_current_price(pos.symbol)
+                krw_value = sell_units * current_price
 
-        if result is None or result.get("status") != "0000":
-            logger.error(f"[1차 손절 최종 실패] {position.symbol} — 수동 확인 필요")
-            if self._notifier:
-                try:
-                    self._notifier.notify_error(
-                        f"1차 손절 3회 실패: {position.symbol} {sell_units}개"
+                if krw_value < settings.MIN_ORDER_KRW:
+                    logger.debug(f"  {pos.symbol} 소액({krw_value:.0f}원) 스킵")
+                    continue
+
+                result = self._client.market_sell(pos.symbol, sell_units)
+                if result.get("status") == "0000":
+                    self._repo.save_trade(
+                        symbol=pos.symbol, side="sell",
+                        price=current_price, units=sell_units,
+                        krw_amount=krw_value, note=reason,
+                        portfolio_id=portfolio.id,
                     )
-                except Exception:
-                    pass
-            return
+                    logger.info(f"  {pos.symbol} {sell_units:.6f}개 매도 ({krw_value:,.0f}원)")
+                else:
+                    logger.warning(f"  {pos.symbol} 분할 매도 실패: {result}")
+            except Exception as e:
+                logger.error(f"  {pos.symbol} 분할 매도 오류: {e}")
 
-        krw_sold = current_price * sell_units
-        self._repo.save_trade(
-            symbol=position.symbol, side="sell",
-            price=current_price, units=sell_units,
-            krw_amount=krw_sold,
-            note=f"1차 손절 ({pnl_pct:+.2f}%, {ratio*100:.0f}% 매도)",
-        )
-
-        logger.info(
-            f"[1차 손절 완료] {position.symbol} {sell_units:.6f}개 @ {current_price:,.0f}원 "
-            f"| 수익: {pnl_pct:+.2f}% | 회수: {krw_sold:,.0f}원"
-        )
         if self._notifier:
             try:
                 self._notifier.send(
-                    f"⚠️ <b>1차 손절 실행</b> {position.symbol}\n"
-                    f"현재 수익: {pnl_pct:+.2f}% (1차 SL 도달)\n"
-                    f"보유량 50% 매도 완료 — 나머지 50% 반등 대기\n"
-                    f"2차 손절: {position.stop_loss_pct}%"
+                    f"⚠️ <b>분할 매도</b> '{portfolio.name}'\n"
+                    f"{reason}\n보유량 {ratio*100:.0f}% 매도 완료"
                 )
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------ #
+    #  포트폴리오 전량 매도 + 종료                                           #
+    # ------------------------------------------------------------------ #
+    def _execute_portfolio_sell(
+        self,
+        portfolio: Portfolio,
+        positions: list[Position],
+        pnl_pct: float,
+        coin_details: list[dict],
+        reason: str,
+    ) -> None:
+        """8개 코인 전량 매도 → 포트폴리오 종료"""
+        logger.info(f"[포트폴리오 매도] '{portfolio.name}' | {reason}")
+
+        total_sell_krw = 0.0
+        coin_results = []
+
+        for pos in positions:
+            try:
+                actual_units = self._client.get_coin_balance(pos.symbol)
+                if actual_units <= 0:
+                    # 이미 분할 매도로 전부 팔림
+                    coin_results.append({
+                        "symbol": pos.symbol,
+                        "buy_price": pos.buy_price,
+                        "buy_krw": pos.buy_krw,
+                        "sell_price": pos.buy_price,
+                        "sell_krw": 0,
+                        "pnl_pct": 0,
+                        "reason": pos.agent_reason or "",
+                    })
+                    self._repo.close_position(pos.id)
+                    continue
+
+                current_price = self._client.get_current_price(pos.symbol)
+                krw_value = actual_units * current_price
+
+                result = self._client.market_sell(pos.symbol, actual_units)
+                if result.get("status") == "0000":
+                    self._repo.save_trade(
+                        symbol=pos.symbol, side="sell",
+                        price=current_price, units=actual_units,
+                        krw_amount=krw_value, note=reason,
+                        portfolio_id=portfolio.id,
+                    )
+                    total_sell_krw += krw_value
+                    logger.info(f"  {pos.symbol} 전량 매도 ({krw_value:,.0f}원)")
+                else:
+                    logger.warning(f"  {pos.symbol} 매도 실패: {result}")
+                    total_sell_krw += pos.buy_krw  # 실패 시 매수가 기준
+
+                coin_pnl = (
+                    (current_price - pos.buy_price) / pos.buy_price * 100
+                    if pos.buy_price > 0 else 0
+                )
+                coin_results.append({
+                    "symbol": pos.symbol,
+                    "buy_price": pos.buy_price,
+                    "buy_krw": pos.buy_krw,
+                    "sell_price": current_price,
+                    "sell_krw": krw_value,
+                    "pnl_pct": round(coin_pnl, 2),
+                    "reason": pos.agent_reason or "",
+                })
+                self._repo.close_position(pos.id)
+                time.sleep(_BUY_INTERVAL_SEC)  # API 간격
+            except Exception as e:
+                logger.error(f"  {pos.symbol} 매도 오류: {e}")
+                self._repo.close_position(pos.id)
+
+        # 포트폴리오 종료
+        self._repo.close_portfolio(portfolio.id)
+        self._exit_tracker = None
+
+        held_min = (datetime.utcnow() - portfolio.opened_at).total_seconds() / 60
+
+        # ── 쿨다운 등록 (8개 코인 모두) ──
+        exit_type_for_cd = "take_profit" if "익절" in reason else "stop_loss"
+        for pos in positions:
+            cooldown_registry.record_sell(pos.symbol, exit_type_for_cd)
+
+        pnl_krw = total_sell_krw - portfolio.total_buy_krw
+        logger.info(
+            f"[포트폴리오 매도 완료] '{portfolio.name}' "
+            f"수익={pnl_pct:+.2f}% ({pnl_krw:+,.0f}원) | {reason}"
+        )
+
+        if self._notifier:
+            try:
+                coin_summary = "\n".join(
+                    f"  {'✅' if cr['pnl_pct'] >= 0 else '❌'} {cr['symbol']} {cr['pnl_pct']:+.2f}%"
+                    for cr in coin_results
+                )
+                self._notifier.send(
+                    f"{'💰' if pnl_pct >= 0 else '📉'} <b>포트폴리오 매도</b> '{portfolio.name}'\n"
+                    f"종합: {pnl_pct:+.2f}% ({pnl_krw:+,.0f}원)\n"
+                    f"{coin_summary}\n"
+                    f"사유: {reason}"
+                )
+            except Exception:
+                pass
+
+        # ── 성과 평가 ──
+        self._run_post_trade_evaluation(
+            portfolio, total_sell_krw, pnl_pct, held_min, reason, coin_results,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  트레일링 오프셋 계산                                                  #
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _calc_trail_offset(current_pnl: float, original_tp: float) -> float:
-        """구간별 드랍포인트 — 수익 구간에 따라 단계적 오프셋 조정
-        목표: 5% 진입 후 10%+ 수익 추적
-        """
         if current_pnl >= 15.0:
-            return 2.5    # 15%+ — 대형 수익, 충분히 달림
+            return 2.5
         elif current_pnl >= 10.0:
-            return 1.8    # 10~15% — 넉넉하게
+            return 1.8
         elif current_pnl >= 7.0:
-            return 1.2    # 7~10% — 중간
+            return 1.2
         elif current_pnl >= 5.0:
-            return 0.8    # 5~7% — 진입 초기, 수익 보호
+            return 0.8
         else:
-            return 0.5    # 5% 미만 — 타이트 (수익 지킴)
+            return 0.5
 
+    # ------------------------------------------------------------------ #
+    #  전략 동적 조정 (30분 간격)                                           #
+    # ------------------------------------------------------------------ #
     def _maybe_adjust_strategy(
-        self, position: Position, current_price: float, pnl_pct: float,
+        self, portfolio: Portfolio, pnl_pct: float,
+        coin_details: list[dict], tracker: _PortfolioExitTracker,
+        holding_minutes: float,
     ) -> None:
-        """30분 간격으로 AI에게 전략 조정 질의"""
         now = time.time()
         if now - self._last_adjust_time < _ADJUST_INTERVAL_SEC:
             return
-
-        holding_minutes = int(
-            (datetime.utcnow() - position.opened_at).total_seconds() / 60
-        )
-
-        # 보유 30분 미만이면 조정 스킵
         if holding_minutes < 30:
             return
 
         self._last_adjust_time = now
 
         try:
-            tracker = self._exit_trackers.get(position.id, _ExitTracker())
             result = self._agent.should_adjust_strategy(
-                symbol=position.symbol,
-                buy_price=position.buy_price,
-                current_price=current_price,
-                current_pnl_pct=pnl_pct,
-                holding_minutes=holding_minutes,
-                original_tp=position.take_profit_pct,
-                original_sl=position.stop_loss_pct,
-                original_sl_1st=position.stop_loss_1st_pct,
-                sl1_executed=tracker.sl1_executed,
+                portfolio_name=portfolio.name,
+                combined_pnl_pct=pnl_pct,
+                holding_minutes=int(holding_minutes),
+                original_tp=portfolio.take_profit_pct,
+                original_sl=portfolio.stop_loss_pct,
+                coin_details=coin_details,
+                tier1_sold=tracker.tier1_sold,
+                tier2_sold=tracker.tier2_sold,
             )
 
             if result.get("adjust"):
                 new_tp = result["new_take_profit_pct"]
                 new_sl = result["new_stop_loss_pct"]
-                new_sl_1st = result.get("new_stop_loss_1st_pct")
                 reason = result.get("reason", "AI 동적 조정")
 
                 logger.info(
-                    f"[전략 조정] {position.symbol} "
-                    f"익절 +{position.take_profit_pct}% → +{new_tp}%, "
-                    f"1차SL {position.stop_loss_1st_pct}% → {new_sl_1st}%, "
-                    f"2차SL {position.stop_loss_pct}% → {new_sl}% "
-                    f"({reason})"
+                    f"[전략 조정] '{portfolio.name}' "
+                    f"TP +{portfolio.take_profit_pct}% → +{new_tp}%, "
+                    f"SL {portfolio.stop_loss_pct}% → {new_sl}% ({reason})"
                 )
 
-                # Position 업데이트 + 조정 기록 보존
-                self._update_position_targets(
-                    position.id, new_tp, new_sl, reason,
-                    new_sl_1st=new_sl_1st,
-                )
+                self._repo.update_portfolio_targets(portfolio.id, new_tp, new_sl)
                 self._last_adjustment = {
                     "adjusted_tp_pct": new_tp,
                     "adjusted_sl_pct": new_sl,
@@ -669,142 +812,32 @@ class TradingEngine:
 
                 if self._notifier:
                     try:
-                        sl1_str = f"\n1차SL: {position.stop_loss_1st_pct}% → {new_sl_1st}%" if new_sl_1st else ""
                         self._notifier.send(
-                            f"🔄 <b>전략 조정</b> {position.symbol}\n"
-                            f"익절: +{position.take_profit_pct}% → +{new_tp}%"
-                            f"{sl1_str}\n"
-                            f"2차SL: {position.stop_loss_pct}% → {new_sl}%\n"
+                            f"🔄 <b>전략 조정</b> '{portfolio.name}'\n"
+                            f"TP: +{portfolio.take_profit_pct}% → +{new_tp}%\n"
+                            f"SL: {portfolio.stop_loss_pct}% → {new_sl}%\n"
                             f"사유: {reason}"
                         )
                     except Exception:
                         pass
             else:
-                logger.debug(f"[전략 유지] {position.symbol} ({result.get('reason', '')})")
+                logger.debug(f"[전략 유지] '{portfolio.name}' ({result.get('reason', '')})")
 
         except Exception as e:
             logger.error(f"[전략 조정 오류] {e}")
-
-    def _update_position_targets(
-        self, position_id: int, new_tp: float, new_sl: float, reason: str,
-        new_sl_1st: float | None = None,
-    ) -> None:
-        """포지션의 익절/손절 기준을 DB에서 업데이트"""
-        from database.models import SessionLocal, Position as PositionModel
-
-        db = SessionLocal()
-        try:
-            pos = db.query(PositionModel).filter(PositionModel.id == position_id).first()
-            if pos:
-                pos.take_profit_pct = new_tp
-                pos.stop_loss_pct = new_sl
-                if new_sl_1st is not None:
-                    pos.stop_loss_1st_pct = new_sl_1st
-                db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-
-    # ------------------------------------------------------------------ #
-    #  매도 실행 + 성과 평가                                                #
-    # ------------------------------------------------------------------ #
-    def _execute_sell(
-        self,
-        position: Position,
-        current_price: float,
-        pnl_pct: float,
-        reason: str,
-    ) -> None:
-        logger.info(f"[매도 실행] {reason}")
-        # sl1_executed 상태를 먼저 저장 후 tracker 제거
-        _tracker_snap = self._exit_trackers.get(position.id, _ExitTracker())
-        _sl1_was_executed = _tracker_snap.sl1_executed
-        self._exit_trackers.pop(position.id, None)
-
-        actual_units = self._client.get_coin_balance(position.symbol)
-        if actual_units <= 0:
-            logger.warning(f"[매도 스킵] {position.symbol} 실제 잔고 0 — 포지션만 종료")
-            self._repo.close_position(position.id)
-            return
-
-        sell_units = actual_units
-        result = None
-        for attempt in range(1, 4):
-            result = self._client.market_sell(position.symbol, sell_units)
-            if result.get("status") == "0000":
-                break
-            logger.warning(f"[매도 실패 {attempt}/3] {result}")
-            if attempt < 3:
-                time.sleep(2)
-                sell_units = self._client.get_coin_balance(position.symbol)
-                if sell_units <= 0:
-                    logger.info(f"[매도 스킵] {position.symbol} 잔고 0 — 이미 체결됨")
-                    break
-
-        if result is None or result.get("status") != "0000":
-            logger.error(f"[매도 최종 실패] {position.symbol} — 수동 확인 필요")
-            if self._notifier:
-                try:
-                    self._notifier.notify_error(
-                        f"매도 3회 실패: {position.symbol} {sell_units}개"
-                    )
-                except Exception:
-                    pass
-            return
-
-        krw_received = current_price * actual_units
-        pnl_krw = (current_price - position.buy_price) * actual_units
-        held_min = (datetime.utcnow() - position.opened_at).total_seconds() / 60
-
-        self._repo.save_trade(
-            symbol=position.symbol, side="sell",
-            price=current_price, units=actual_units,
-            krw_amount=krw_received, note=reason,
-        )
-        self._repo.close_position(position.id)
-
-        # ── 쿨다운 등록 ──
-        exit_type_for_cd = "take_profit" if "익절" in reason else "stop_loss"
-        cooldown_registry.record_sell(position.symbol, exit_type_for_cd)
-
-        logger.info(
-            f"[매도 완료] {position.symbol} 수익={pnl_pct:+.2f}% "
-            f"회수={krw_received:,.0f}원 사유={reason}"
-        )
-        if self._notifier:
-            try:
-                self._notifier.notify_sell(
-                    symbol=position.symbol,
-                    price=current_price,
-                    pnl_pct=pnl_pct,
-                    pnl_krw=pnl_krw,
-                    reason=reason,
-                    held_minutes=held_min,
-                )
-            except Exception:
-                pass
-
-        # ── 매매 후 성과 평가 (Post-Trade Review) ──
-        self._run_post_trade_evaluation(
-            position, current_price, pnl_pct, held_min, reason,
-            sl1_was_executed=_sl1_was_executed,
-        )
 
     # ------------------------------------------------------------------ #
     #  Post-Trade Evaluation                                               #
     # ------------------------------------------------------------------ #
     def _run_post_trade_evaluation(
         self,
-        position: Position,
-        sell_price: float,
+        portfolio: Portfolio,
+        total_sell_krw: float,
         pnl_pct: float,
         held_minutes: float,
         reason: str,
-        sl1_was_executed: bool = False,
+        coin_results: list[dict],
     ) -> None:
-        """매도 후 AI에게 성과 평가를 요청하고 DB에 저장"""
         try:
             if "익절" in reason:
                 exit_type = "take_profit"
@@ -812,41 +845,40 @@ class TradingEngine:
                 exit_type = "timeout"
             else:
                 exit_type = "stop_loss"
+
             eval_stats = self._repo.get_evaluation_stats(last_n=10)
-            partial_executed = sl1_was_executed
 
             evaluation = self._agent.evaluate_trade(
-                symbol=position.symbol,
-                buy_price=position.buy_price,
-                sell_price=sell_price,
-                pnl_pct=pnl_pct,
+                portfolio_name=portfolio.name,
+                total_buy_krw=portfolio.total_buy_krw,
+                total_sell_krw=total_sell_krw,
+                combined_pnl_pct=pnl_pct,
                 held_minutes=held_minutes,
                 exit_type=exit_type,
-                original_tp=position.take_profit_pct,
-                original_sl=position.stop_loss_pct,
-                agent_reason=position.agent_reason or "",
-                original_sl_1st=position.stop_loss_1st_pct,
-                partial_sl_executed=partial_executed,
+                original_tp=portfolio.take_profit_pct,
+                original_sl=portfolio.stop_loss_pct,
+                coin_results=coin_results,
+                portfolio_reason=portfolio.agent_reason or "",
                 eval_stats=eval_stats,
             )
 
-            # 동적 조정 기록이 있으면 함께 저장
+            coins_summary_json = json.dumps(coin_results, ensure_ascii=False)
+
             adj = self._last_adjustment or {}
             self._repo.save_evaluation(
-                position_id=position.id,
-                symbol=position.symbol,
-                buy_price=position.buy_price,
-                sell_price=sell_price,
+                portfolio_id=portfolio.id,
+                portfolio_name=portfolio.name,
+                total_buy_krw=portfolio.total_buy_krw,
+                total_sell_krw=total_sell_krw,
                 pnl_pct=pnl_pct,
                 held_minutes=held_minutes,
                 exit_type=exit_type,
-                original_tp_pct=position.take_profit_pct,
-                original_sl_pct=position.stop_loss_pct,
-                original_sl_1st_pct=position.stop_loss_1st_pct,
+                original_tp_pct=portfolio.take_profit_pct,
+                original_sl_pct=portfolio.stop_loss_pct,
                 evaluation=evaluation.evaluation,
                 suggested_tp_pct=evaluation.suggested_tp_pct,
                 suggested_sl_pct=evaluation.suggested_sl_pct,
-                suggested_sl_1st_pct=evaluation.suggested_sl_1st_pct,
+                coins_summary=coins_summary_json,
                 lesson=evaluation.lesson,
                 adjusted_tp_pct=adj.get("adjusted_tp_pct"),
                 adjusted_sl_pct=adj.get("adjusted_sl_pct"),
@@ -854,39 +886,27 @@ class TradingEngine:
             )
 
             logger.info(
-                f"[성과 평가] {position.symbol} | {evaluation.evaluation} | "
-                f"제안: 익절 +{evaluation.suggested_tp_pct}% 손절 {evaluation.suggested_sl_pct}% | "
+                f"[성과 평가] '{portfolio.name}' | {evaluation.evaluation} | "
+                f"제안: TP +{evaluation.suggested_tp_pct}% SL {evaluation.suggested_sl_pct}% | "
                 f"교훈: {evaluation.lesson}"
             )
 
             if self._notifier:
                 try:
                     self._notifier.send(
-                        f"📊 <b>매매 평가</b> {position.symbol} ({pnl_pct:+.2f}%)\n"
+                        f"📊 <b>포트폴리오 평가</b> '{portfolio.name}' ({pnl_pct:+.2f}%)\n"
                         f"{evaluation.evaluation}\n"
-                        f"다음 제안: 익절 +{evaluation.suggested_tp_pct}% / 손절 {evaluation.suggested_sl_pct}%\n"
+                        f"다음 제안: TP +{evaluation.suggested_tp_pct}% / SL {evaluation.suggested_sl_pct}%\n"
                         f"💡 {evaluation.lesson}"
                     )
                 except Exception:
                     pass
 
-            # ── 평가 완료 즉시 StrategyOptimizer 재실행 → 다음 사이클에 즉시 반영 ──
+            # StrategyOptimizer 즉시 재실행
             if self._optimizer:
                 try:
                     updated_stats = self._repo.get_evaluation_stats(last_n=10)
-                    new_params = self._optimizer.optimize(updated_stats)
-                    if self._notifier:
-                        try:
-                            self._notifier.send(
-                                f"⚙️ <b>전략 최적화 완료</b>\n"
-                                f"익절 목표: +{new_params.target_tp}% "
-                                f"({new_params.tp_clamp_min}~{new_params.tp_clamp_max}%)\n"
-                                f"손절 목표: {new_params.target_sl}% "
-                                f"({new_params.sl_clamp_min}~{new_params.sl_clamp_max}%)\n"
-                                f"📝 {new_params.rationale}"
-                            )
-                        except Exception:
-                            pass
+                    self._optimizer.optimize(updated_stats)
                 except Exception as opt_err:
                     logger.error(f"[StrategyOptimizer 재실행 오류] {opt_err}")
 

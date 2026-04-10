@@ -70,13 +70,17 @@ class TradingScheduler:
         try:
             # 종료 총자산 = KRW + 보유 코인 평가액
             ending_krw = self._client.get_krw_balance()
-            open_pos = self._repo.get_open_position()
-            if open_pos:
+            open_pf = self._repo.get_open_portfolio()
+            if open_pf:
                 try:
-                    cur_price = self._client.get_current_price(open_pos.symbol)
-                    ending_krw += open_pos.units * cur_price
+                    for pos in self._repo.get_portfolio_positions(open_pf.id):
+                        try:
+                            cur_price = self._client.get_current_price(pos.symbol)
+                            ending_krw += pos.units * cur_price
+                        except Exception:
+                            ending_krw += pos.buy_krw
                 except Exception as pe:
-                    logger.warning(f"포지션 평가액 조회 실패: {pe}")
+                    logger.warning(f"포트폴리오 평가액 조회 실패: {pe}")
 
             starting_krw = self._get_daily_start_krw()
 

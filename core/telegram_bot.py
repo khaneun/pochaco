@@ -25,7 +25,7 @@ import requests
 
 from config import settings
 from database import TradeRepository
-from database.models import Position
+from database.models import Portfolio, Position
 
 if TYPE_CHECKING:
     from core import BithumbClient
@@ -196,16 +196,21 @@ class TelegramBot:
             total = krw
             pos_line = "없음"
 
-            pos: Position | None = self._repo.get_open_position()
-            if pos:
-                cur = self._client.get_current_price(pos.symbol)
-                pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100
-                pos_value = pos.units * cur
-                total = krw + pos_value
-                sign = "+" if pnl_pct >= 0 else ""
+            pf = self._repo.get_open_portfolio()
+            if pf:
+                positions = self._repo.get_portfolio_positions(pf.id)
+                pf_value = 0.0
+                for p in positions:
+                    try:
+                        pf_value += p.units * self._client.get_current_price(p.symbol)
+                    except Exception:
+                        pf_value += p.buy_krw
+                total = krw + pf_value
+                pf_pnl = (pf_value - pf.total_buy_krw) / pf.total_buy_krw * 100 if pf.total_buy_krw > 0 else 0
+                sign = "+" if pf_pnl >= 0 else ""
                 pos_line = (
-                    f"{pos.symbol} {pos.units:.4f}개  "
-                    f"({sign}{pnl_pct:.2f}%)"
+                    f"'{pf.name}' {len(positions)}개 코인  "
+                    f"({sign}{pf_pnl:.2f}%)"
                 )
 
             stats = self._repo.get_total_stats()
@@ -240,31 +245,43 @@ class TelegramBot:
             self.send(f"❌ 잔고 조회 실패: {e}")
 
     def _cmd_position(self, _args: str) -> None:
-        pos: Position | None = self._repo.get_open_position()
-        if pos is None:
-            self.send("📭 현재 보유 포지션 없음\nAI 코인 선정 대기 중...")
+        pf = self._repo.get_open_portfolio()
+        if pf is None:
+            self.send("📭 활성 포트폴리오 없음\nAI 포트폴리오 구성 대기 중...")
             return
         try:
-            cur = self._client.get_current_price(pos.symbol)
-            pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100
-            pnl_krw = (cur - pos.buy_price) * pos.units
-            held_min = (datetime.utcnow() - pos.opened_at).total_seconds() / 60
+            positions = self._repo.get_portfolio_positions(pf.id)
+            total_current = 0.0
+            coin_lines = []
+            for p in positions:
+                try:
+                    cur = self._client.get_current_price(p.symbol)
+                    val = p.units * cur
+                except Exception:
+                    cur = p.buy_price
+                    val = p.buy_krw
+                total_current += val
+                cp = (cur - p.buy_price) / p.buy_price * 100 if p.buy_price > 0 else 0
+                emoji = "+" if cp >= 0 else ""
+                coin_lines.append(f"  {p.symbol}: {emoji}{cp:.1f}%")
+
+            pnl_pct = (total_current - pf.total_buy_krw) / pf.total_buy_krw * 100 if pf.total_buy_krw > 0 else 0
+            pnl_krw = total_current - pf.total_buy_krw
+            held_min = (datetime.utcnow() - pf.opened_at).total_seconds() / 60
             held_str = f"{held_min / 60:.1f}시간" if held_min >= 60 else f"{held_min:.0f}분"
             sign = "+" if pnl_pct >= 0 else ""
             icon = "📈" if pnl_pct >= 0 else "📉"
+            coins_text = "\n".join(coin_lines)
             self.send(
-                f"{icon} <b>현재 포지션: {pos.symbol}</b>\n"
+                f"{icon} <b>포트폴리오: {pf.name}</b> ({len(positions)}개 코인)\n"
                 f"\n"
-                f"수량: {pos.units:.6f}개\n"
-                f"매수가: {pos.buy_price:,.0f} 원\n"
-                f"현재가: {cur:,.0f} 원\n"
+                f"투입금: {pf.total_buy_krw:,.0f} 원\n"
+                f"평가액: {total_current:,.0f} 원\n"
                 f"손익: {sign}{pnl_pct:.2f}% ({sign}{pnl_krw:,.0f} 원)\n"
                 f"\n"
-                f"익절 기준: +{pos.take_profit_pct}%\n"
-                f"손절 기준: {pos.stop_loss_pct}%\n"
+                f"TP: +{pf.take_profit_pct}% / SL: {pf.stop_loss_pct}%\n"
                 f"보유시간: {held_str}\n"
-                f"\n"
-                f"AI: {(pos.agent_reason or '')[:80]}"
+                f"\n{coins_text}"
             )
         except Exception as e:
             self.send(f"❌ 포지션 조회 실패: {e}")

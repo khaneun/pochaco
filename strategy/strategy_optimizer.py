@@ -22,14 +22,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StrategyParams:
-    """전략 파라미터 묶음 — StrategyOptimizer가 결정 (타이트 손절 + 트레일링 익절)"""
-    target_tp: float = 5.0       # 익절 진입% (트레일링 시작점)
-    target_sl: float = -1.5      # 권고 2차 손절% (음수, 타이트)
-    tp_clamp_min: float = 4.0    # 익절 허용 최솟값
-    tp_clamp_max: float = 10.0   # 익절 허용 최댓값
-    sl_clamp_min: float = -2.5   # 2차 손절 허용 최솟값 (타이트)
-    sl_clamp_max: float = -0.8   # 2차 손절 허용 최댓값 (타이트)
-    rationale: str = "기본 파라미터 (타이트 손절: SL1≈-0.8%, SL2≈-1.5%, 익절 5%+ 트레일링)"
+    """전략 파라미터 묶음 — 포트폴리오 레벨 (최대 손절 -2%)"""
+    target_tp: float = 5.0       # 포트폴리오 익절% (트레일링 시작점)
+    target_sl: float = -1.5      # 포트폴리오 권고 손절% (최대 -2.0%)
+    tp_clamp_min: float = 3.0    # 익절 허용 최솟값
+    tp_clamp_max: float = 8.0    # 익절 허용 최댓값
+    sl_clamp_min: float = -2.0   # 손절 허용 최솟값 (하드캡)
+    sl_clamp_max: float = -0.5   # 손절 허용 최댓값
+    rationale: str = "기본 파라미터 (포트폴리오: 분할매도 -1%/-1.5%/-2%, 익절 5%+ 트레일링)"
     confidence: float = 0.5
 
 
@@ -130,27 +130,24 @@ class StrategyOptimizer:
                 break
         avg_loss_size = abs(loss_pnl_sum / consecutive_losses) if consecutive_losses > 0 else 0
 
-        # ── 손절 파라미터 결정 ──────────────────────────────
-        # 기본: repository의 suggested 기반 (AI 제안 가중평균 계승)
+        # ── 손절 파라미터 결정 (포트폴리오: 최대 -2.0% 하드캡) ──
         target_sl = round(suggested_sl, 1)
         sl_min, sl_max = repo_sl_min, repo_sl_max
 
         if consecutive_losses >= 3:
             if avg_loss_size > 1.5:
-                # 손실 크기가 큼 → SL2 소폭 완화 (최대 -2.5% 이내 유지)
-                target_sl = max(target_sl - 0.2, -2.5)
-                rationale = f"연속 손절 {consecutive_losses}건(평균 -{avg_loss_size:.1f}%) — SL2 소폭 완화"
+                target_sl = max(target_sl - 0.2, -2.0)
+                rationale = f"연속 손절 {consecutive_losses}건(평균 -{avg_loss_size:.1f}%) — 소폭 완화"
             else:
-                # 손실 작음 → SL1이 너무 좁은 것, 범위 소폭 완화
-                target_sl = max(target_sl - 0.3, -2.5)
-                sl_min = max(sl_min - 0.3, -3.0)
-                rationale = f"연속 손절 {consecutive_losses}건(소폭) → SL2 완화"
+                target_sl = max(target_sl - 0.3, -2.0)
+                sl_min = max(sl_min - 0.3, -2.0)
+                rationale = f"연속 손절 {consecutive_losses}건(소폭) → 완화"
         elif consecutive_losses == 2:
-            target_sl = max(target_sl - 0.2, -2.5)
-            rationale = f"연속 손절 2건 → SL2 소폭 완화"
+            target_sl = max(target_sl - 0.2, -2.0)
+            rationale = f"연속 손절 2건 → 소폭 완화"
         elif win_rate < 0.35:
-            target_sl = max(target_sl - 0.3, -2.5)
-            rationale = f"낮은 승률 {win_rate:.0%} → SL2 완화"
+            target_sl = max(target_sl - 0.3, -2.0)
+            rationale = f"낮은 승률 {win_rate:.0%} → 완화"
         else:
             rationale = f"suggested 기반 유지 (승률 {win_rate:.0%})"
 
@@ -174,11 +171,11 @@ class StrategyOptimizer:
             tp_max = min(12.0, tp_max + 1.0)
 
         return StrategyParams(
-            target_tp=max(4.0, min(12.0, round(target_tp, 1))),
-            target_sl=max(-3.0, min(-0.5, round(target_sl, 1))),
-            tp_clamp_min=max(3.0, round(tp_min, 1)),
-            tp_clamp_max=min(12.0, round(tp_max, 1)),
-            sl_clamp_min=max(-3.0, round(sl_min, 1)),
+            target_tp=max(3.0, min(10.0, round(target_tp, 1))),
+            target_sl=max(-2.0, min(-0.5, round(target_sl, 1))),
+            tp_clamp_min=max(2.0, round(tp_min, 1)),
+            tp_clamp_max=min(10.0, round(tp_max, 1)),
+            sl_clamp_min=max(-2.0, round(sl_min, 1)),
             sl_clamp_max=min(-0.5, round(sl_max, 1)),
             rationale=rationale,
             confidence=0.7,
@@ -202,42 +199,41 @@ class StrategyOptimizer:
         lessons = eval_stats.get("recent_lessons", [])
         lessons_text = "\n".join(f"  - {l}" for l in lessons) if lessons else "  (없음)"
 
-        prompt = f"""당신은 단기 변동성 매매 전략 최적화 전문가입니다.
+        prompt = f"""당신은 포트폴리오 기반 단기 매매 전략 최적화 전문가입니다.
 
-**전략 철학 — 타이트 손절 + 트레일링 익절 (반드시 준수):**
-- 1차 손절(SL1): -0.5%~-1.5% → 빠르게 인지, 50% 매도 후 반등 대기
-- 2차 손절(SL2): -1.0%~-2.5% → 나머지 전량 매도 (SL1보다 0.3~1.0% 더 낮음)
-- 실효 최대 손실 ≈ SL1×50% + SL2×50% ≈ -1.5% 수준 (타이트 리스크 관리)
-- 익절: 4.0%+ 진입 후 단계별 트레일링으로 10%+ 목표 (5~7%: 0.8%, 7~10%: 1.2%, 10~15%: 1.8%, 15%+: 2.5% 오프셋)
-- 이 파라미터는 2차 손절(SL2) 범위를 결정합니다
+**전략 철학 — 포트폴리오 분할 매도 + 트레일링 익절 (반드시 준수):**
+- 8개 코인 균등 분산 포트폴리오 (12.5%씩)
+- 낙폭별 분할 매도: -1.0% → 33% 매도, -1.5% → 33% 추가, -2.0% → 전량 (최대 손절)
+- 최대 손절 하드캡: -2.0% (절대 초과 불가)
+- 익절: 포트폴리오 종합 P&L이 TP 도달 시 트레일링 (5~7%: 0.8%, 7~10%: 1.2% 오프셋)
 
-**최근 {eval_stats['count']}건 매매 성과:**
+**최근 {eval_stats['count']}건 포트폴리오 성과:**
 - 승률: {eval_stats['win_rate']:.0%} (익절 {eval_stats['win_count']}건, 손절 {eval_stats['loss_count']}건)
 - 평균 수익률: {eval_stats['avg_pnl_pct']:+.2f}%
 - 평균 보유 시간: {eval_stats['avg_hold_minutes']:.0f}분
 - 평균 익절 설정값: +{eval_stats['avg_tp_set']:.1f}%
-- 평균 2차 손절 설정값: {eval_stats['avg_sl_set']:.1f}%
+- 평균 손절 설정값: {eval_stats['avg_sl_set']:.1f}%
 
-**최근 거래 내역:**
+**최근 포트폴리오 내역:**
 {recent_text}
 
 **최근 교훈:**
 {lessons_text}
 
 **지시:**
-위 데이터를 분석해 다음 매매에 즉시 적용할 파라미터를 결정하세요.
-- 손절은 항상 타이트하게 유지 (-2.5% 이내). 빠른 탈출이 핵심
-- 연속 손절이 있어도 SL2는 -2.5% 이상 넓히지 마세요
-- 익절은 크게 (4%+ 진입 후 트레일링으로 10%+ 목표). 보유 시간이 길면 진입점을 낮추세요
+위 데이터를 분석해 다음 포트폴리오에 즉시 적용할 파라미터를 결정하세요.
+- 손절은 -2.0% 이내. 빠른 탈출이 핵심
+- 익절은 3%+ 진입 후 트레일링으로 수익 극대화
+- 보유 시간이 길면 익절 진입점 낮추기
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이):
 {{
-  "target_tp": 권고익절%(숫자, 4.0~10.0 범위),
-  "target_sl": 권고2차손절%(음수숫자, -0.5~-2.5 범위),
-  "tp_clamp_min": 익절허용최솟값(숫자, 3.0~5.0),
-  "tp_clamp_max": 익절허용최댓값(숫자, 7.0~12.0),
-  "sl_clamp_min": 2차손절허용최솟값(음수, -1.5~-3.0),
-  "sl_clamp_max": 2차손절허용최댓값(음수, -0.5~-1.5),
+  "target_tp": 권고익절%(숫자, 3.0~8.0 범위),
+  "target_sl": 권고손절%(음수숫자, -2.0~-0.5 범위),
+  "tp_clamp_min": 익절허용최솟값(숫자, 2.0~4.0),
+  "tp_clamp_max": 익절허용최댓값(숫자, 5.0~10.0),
+  "sl_clamp_min": 손절허용최솟값(음수, -2.0),
+  "sl_clamp_max": 손절허용최댓값(음수, -0.5~-1.0),
   "rationale": "결정 이유 (한국어, 80자 이내)",
   "confidence": 확신도(0.0~1.0)
 }}"""
@@ -248,14 +244,14 @@ class StrategyOptimizer:
         clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         data = json.loads(clean)
 
-        target_tp = max(4.0, min(12.0, float(data["target_tp"])))
+        target_tp = max(3.0, min(10.0, float(data["target_tp"])))
         target_sl = float(data["target_sl"])
         if target_sl > 0:
             target_sl = -abs(target_sl)
-        target_sl = max(-3.0, min(-0.5, target_sl))
+        target_sl = max(-2.0, min(-0.5, target_sl))
 
-        tp_min = max(3.0, min(6.0, float(data["tp_clamp_min"])))
-        tp_max = max(tp_min + 2.0, min(12.0, float(data["tp_clamp_max"])))
+        tp_min = max(2.0, min(5.0, float(data["tp_clamp_min"])))
+        tp_max = max(tp_min + 2.0, min(10.0, float(data["tp_clamp_max"])))
 
         sl_min = float(data["sl_clamp_min"])
         sl_max = float(data["sl_clamp_max"])
@@ -263,7 +259,7 @@ class StrategyOptimizer:
             sl_min = -abs(sl_min)
         if sl_max > 0:
             sl_max = -abs(sl_max)
-        sl_min = max(-3.0, min(-1.0, sl_min))
+        sl_min = max(-2.0, min(-0.5, sl_min))
         sl_max = max(sl_min + 0.3, min(-0.5, sl_max))
 
         return StrategyParams(

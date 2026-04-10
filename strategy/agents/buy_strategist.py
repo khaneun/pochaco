@@ -1,23 +1,25 @@
-"""매수 전략 전문가
+"""매수 전략 전문가 (v4.0 — 포트폴리오 기반)
 
-코인 선정 + TP/SL 결정을 담당합니다.
-기존 TradingAgent.select_coin() 프롬프트 구조를 계승하며,
-MarketCondition과 AllocationDecision 컨텍스트를 추가로 활용합니다.
+8개 코인으로 구성된 분산 포트폴리오를 선정합니다.
+단일 LLM 호출로 8개 코인을 동시에 선정하여 포트폴리오 일관성을 확보합니다.
 """
 import logging
 
 from .base_agent import BaseSpecialistAgent
 from .market_analyst import MarketCondition
 from .asset_manager import AllocationDecision
-from ..ai_agent import AgentDecision
+from ..ai_agent import PortfolioDecision, PortfolioCoinPick
 from ..market_analyzer import CoinSnapshot
 from ..coin_selector import CoinScore
 
 logger = logging.getLogger(__name__)
 
+# 포트폴리오 코인 수
+_PORTFOLIO_SIZE = 8
+
 
 class BuyStrategist(BaseSpecialistAgent):
-    """코인 선정과 매수 전략(TP/SL)을 결정하는 전문가 Agent"""
+    """8개 코인 포트폴리오를 선정하는 매수 전문가 Agent"""
 
     ROLE_NAME = "buy_strategist"
     DISPLAY_NAME = "매수 전문가"
@@ -25,15 +27,29 @@ class BuyStrategist(BaseSpecialistAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._base_prompt = (
-            "당신은 단기 변동성 매매에 특화된 매수 전문가입니다.\n"
-            "시장 분석가의 판단과 자산 운용가의 배분 지침을 참고하되, \n"
-            "코인 선정과 진입 타이밍 결정은 당신의 전문 영역입니다.\n"
-            "2단계 손절 전략(1차 50% 매도 + 2차 전량)을 사용하며, \n"
-            "수익 극대화를 위해 트레일링 익절(5%+ 진입)을 목표로 합니다."
+            "당신은 8개 코인 분산 포트폴리오 구성 전문가입니다.\n\n"
+            "【핵심 임무】\n"
+            "빗썸 거래소 상위 코인 중 8개를 선정하여 균등 분산 포트폴리오를 구성합니다.\n"
+            "8개 코인이 동시에 매수·매도되므로, 포트폴리오 전체의 종합 수익률이 관건입니다.\n"
+            "개별 코인 수익률이 아니라 '8개의 합산'이 플러스여야 성공입니다.\n\n"
+            "【포트폴리오 구성 철학 — 가장 중요】\n"
+            "★ 분산이 핵심입니다. 비슷한 코인 8개를 고르면 리스크가 분산되지 않습니다.\n"
+            "★ 대형주(BTC,ETH,XRP 등) 2~3개 + 중형 알트코인 3~4개 + 소형 모멘텀 코인 1~2개로 구성하세요.\n"
+            "★ 같은 섹터(예: AI 코인끼리, 밈코인끼리) 중복 선정을 피하세요.\n"
+            "★ 변동폭이 너무 작은 코인(< 2%)은 포트폴리오에 기여하지 못합니다.\n\n"
+            "【선정 금지 규칙 — 반드시 준수】\n"
+            "1. 24h 변동률이 -3% 이하인 코인은 절대 선정 금지 (강한 하락세)\n"
+            "2. 현재가 위치가 15% 이하인 코인 금지 (바닥 다이빙 위험)\n"
+            "3. 24h 거래대금 50억원 미만 금지 (유동성 부족)\n"
+            "4. 최근 포트폴리오에 포함된 종목은 가급적 회피\n\n"
+            "【TP/SL 설정 원칙】\n"
+            "- TP: 포트폴리오 종합 수익률 기준. 8개 코인 평균이므로 개별 코인보다 낮게 설정.\n"
+            "- SL: 최대 -2.0% (절대 초과 불가). 분할 매도로 리스크 관리.\n"
+            "- 수수료 감안: 8코인 × 매수/매도 수수료 0.25% = 총 약 0.5% 비용 고려."
         )
 
     def execute(self, context: dict) -> dict:
-        """코인을 선정하고 TP/SL을 결정하여 AgentDecision을 반환
+        """8개 코인 포트폴리오를 선정하여 PortfolioDecision을 반환
 
         Args:
             context: {
@@ -42,10 +58,11 @@ class BuyStrategist(BaseSpecialistAgent):
                 "allocation": AllocationDecision,
                 "eval_stats": dict | None,
                 "coin_scores": list[CoinScore] | None,
+                "coin_profiles": dict[str, str],
             }
 
         Returns:
-            {"decision": AgentDecision}
+            {"portfolio_decision": PortfolioDecision}
         """
         snapshots: list[CoinSnapshot] = context.get("snapshots", [])
         market_condition: MarketCondition | None = context.get("market_condition")
@@ -60,57 +77,29 @@ class BuyStrategist(BaseSpecialistAgent):
         # 시장 데이터 텍스트
         market_text = self._snapshots_to_text(snapshots, scores=coin_scores)
         history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
-
-        # 특성 분석가 프로파일 텍스트
         profiles_text = self._profiles_to_text(coin_profiles) if coin_profiles else ""
-
-        # 시장 상태 + 배분 컨텍스트
         specialist_context = self._build_specialist_context(market_condition, allocation)
 
-        # clamp 범위 결정
+        # clamp 범위
         has_clamp = eval_stats and "tp_clamp_min" in eval_stats
         if has_clamp:
             tp_min = eval_stats.get("tp_clamp_min", 2.0)
             tp_max = eval_stats.get("tp_clamp_max", 6.0)
-            sl1_min = eval_stats.get("sl_clamp_min", -4.5)
-            sl1_max = eval_stats.get("sl_clamp_max", -1.5)
-            sl2_min = max(-5.5, sl1_min - 1.5)
-            sl2_max = min(-1.8, sl1_max - 0.3)
             tp_guide = (
-                f"- 익절(take_profit_pct): 전략 최적화 범위 **+{tp_min:.1f}%~+{tp_max:.1f}%** 내에서 설정 (필수)\n"
-                f"- 1차 손절(sl_1st_pct): **{sl1_min:.1f}%~{sl1_max:.1f}%** — 도달 시 보유량의 50%만 매도\n"
-                f"- 2차 손절(sl_2nd_pct): **{sl2_min:.1f}%~{sl2_max:.1f}%** — 도달 시 나머지 전량 매도 "
-                f"(반드시 1차보다 더 낮은 음수)"
-            )
-            rr_guide = (
-                "- 2단계 손절 전략: 최대 실효 손실을 줄여 더 큰 익절 목표 가능. "
-                "수익이 클수록 전략 성과 극대화."
+                f"- 포트폴리오 익절(take_profit_pct): 전략 최적화 범위 "
+                f"**+{tp_min:.1f}%~+{tp_max:.1f}%** 내에서 설정 (필수)"
             )
         else:
-            tp_min, tp_max = 4.0, 10.0
-            sl1_min, sl1_max = -1.5, -0.5
-            sl2_min, sl2_max = -2.5, -0.8
-            tp_guide = (
-                "- 익절(take_profit_pct): 4.0%~10.0% 범위에서 설정 (트레일링으로 10%+ 목표)\n"
-                "- 1차 손절(sl_1st_pct): -0.5%~-1.5% 범위 — 빠르게 인지, 50%만 매도 (기준: -1% 전후)\n"
-                "- 2차 손절(sl_2nd_pct): -0.8%~-2.5% 범위 — 나머지 전량 매도 "
-                "(기준: -1.5% 전후, 1차보다 반드시 더 낮은 음수)"
-            )
-            rr_guide = (
-                "- 타이트 손절 전략: 빠르게 손실 인지·탈출. "
-                "익절은 5%+ 진입 후 트레일링으로 크게 수익 극대화."
-            )
+            tp_min, tp_max = 3.0, 8.0
+            tp_guide = "- 포트폴리오 익절(take_profit_pct): 3.0%~8.0% 범위에서 설정"
 
-        task_prompt = f"""전략: 코인 1개를 전액 매수 → 2단계 손절 또는 익절 시 매도 → 즉시 반복.
-수익은 오직 가격 변동성에서만 나옵니다.
+        # 후보 심볼 목록 (검증용)
+        valid_symbols = {s.symbol for s in snapshots}
+
+        task_prompt = f"""전략: 가용 자금을 8개 코인에 균등 분배(12.5%씩)하여 포트폴리오를 구성합니다.
+포트폴리오 종합 수익률이 목표이며, 8개 코인이 동시에 매수·매도됩니다.
 
 {specialist_context}
-
-【2단계 손절 전략 설명】
-- 1차 손절(sl_1st_pct) 도달 → 보유량 50%만 매도 → 나머지 50%는 반등 대기
-- 2차 손절(sl_2nd_pct) 도달 → 나머지 전량 매도
-- 실효 최대 손실 = sl_1st × 50% + sl_2nd × 50% (단순 손절보다 훨씬 유리)
-- 따라서 익절 목표를 더 크게 잡아 수익을 극대화해야 함
 
 아래는 빗썸 거래소 상위 코인의 실시간 시장 데이터입니다.
 
@@ -118,122 +107,135 @@ class BuyStrategist(BaseSpecialistAgent):
 {history_text}
 {profiles_text}
 
-**코인 선정 기준 (우선순위 순)**
-1. **변동폭 vs 익절 현실성** — 변동폭이 목표 익절%의 1.5배 이상인 코인만 선정 (예: 익절 3% 목표 시 변동폭 4.5% 이상 필수). 변동폭이 작은 코인은 절대 선정 금지
-2. **최근 익절 종목 재선정 절대 금지** — 위 과거 거래 목록에서 【익절 직후】로 표시된 종목은 어떤 상황에서도 선정하지 마세요
-3. 강한 단기 상승 모멘텀 — 현재가위치가 50~80% 구간이고, 모멘텀이 양수인 코인 최우선. 스코어가 높은 코인을 우선 검토하세요
-4. 거래대금 충분 — 최소 50억원/24h 이상
-5. 하락 중인 코인은 절대 선정 금지 — 24h 변동률이 음수이거나 현재가위치가 20% 이하인 코인 제외
+**포트폴리오 구성 원칙 (8개 코인 선정)**
+1. **분산 효과** — 서로 다른 모멘텀·변동성 특성을 가진 코인을 선택하세요. 유사한 코인을 중복 선정하지 마세요.
+2. **변동폭 현실성** — 변동폭이 너무 작은 코인(변동폭 < 2%)은 제외
+3. **상승 모멘텀** — 현재가위치가 40~80% 구간이고, 모멘텀이 양수인 코인 우선
+4. **거래대금 충분** — 최소 50억원/24h 이상
+5. **하락 코인 제외** — 24h 변동률이 -2% 이하이거나 현재가위치가 15% 이하인 코인 제외
+6. **최근 포트폴리오 종목 회피** — 위 과거 거래 목록의 코인은 가급적 제외
 
-**익절·손절 기준 설정 원칙 (반드시 준수)**
-{rr_guide}
+**포트폴리오 손익절 설정**
 {tp_guide}
-- 수수료(매수+매도 약 0.4%) 감안 후에도 순이익이 발생해야 함
-- **핵심: 2단계 손절로 리스크를 줄였으니 익절은 크게! sl_2nd는 sl_1st보다 반드시 더 낮은 음수여야 함.**
+- 포트폴리오 손절(stop_loss_pct): **최대 -2.0%** (절대 초과 불가)
+  - 낙폭별 분할 매도: -1.0% → 33% 매도, -1.5% → 33% 추가 매도, -2.0% → 잔여 전량 매도
+- 수수료(매수+매도 약 0.4% × 8코인) 감안 후에도 순이익이 발생해야 함
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
-  "symbol": "코인심볼(예:BTC)",
-  "take_profit_pct": 익절퍼센트(숫자, 예:4.0),
-  "sl_1st_pct": 1차손절퍼센트(음수숫자, 예:-2.0),
-  "sl_2nd_pct": 2차손절퍼센트(음수숫자, sl_1st보다 더낮은음수, 예:-2.5),
-  "confidence": 확신도(0.0~1.0),
-  "reason": "선정 이유 (한국어, 100자 이내) — 상승 모멘텀 근거 포함"
+  "coins": [
+    {{"symbol": "코인심볼", "confidence": 확신도(0.0~1.0), "reason": "선정 이유 (한국어, 50자 이내)"}},
+    ... (정확히 8개)
+  ],
+  "take_profit_pct": 포트폴리오익절퍼센트(숫자),
+  "stop_loss_pct": 포트폴리오손절퍼센트(음수숫자, 최대-2.0),
+  "portfolio_reason": "포트폴리오 구성 이유 (한국어, 100자 이내)"
 }}"""
 
-        logger.info(f"[BuyStrategist] 코인 선정 분석 중...")
-        raw = self._call_llm(task_prompt, max_tokens=512)
+        logger.info("[BuyStrategist] 포트폴리오 구성 분석 중...")
+        raw = self._call_llm(task_prompt, max_tokens=1024)
         logger.info(f"[BuyStrategist] LLM 응답: {raw}")
 
         try:
             data = self._parse_json(raw)
 
-            symbol = data["symbol"].upper()
-            take_profit_pct = float(data["take_profit_pct"])
-            sl_1st = float(data.get("sl_1st_pct", data.get("stop_loss_pct", sl1_max)))
-            sl_2nd = float(data.get("sl_2nd_pct", data.get("stop_loss_pct", sl2_max)))
-            confidence = float(data.get("confidence", 0.5))
-            reason = data.get("reason", "")
+            coins_raw = data.get("coins", [])
+            take_profit_pct = float(data.get("take_profit_pct", 5.0))
+            stop_loss_pct = float(data.get("stop_loss_pct", -2.0))
+            portfolio_reason = data.get("portfolio_reason", "")
 
-            # ── 안전장치: 음수 보장 ──
-            if sl_1st > 0:
-                sl_1st = -abs(sl_1st)
-            if sl_2nd > 0:
-                sl_2nd = -abs(sl_2nd)
+            # ── 코인 파싱 + 검증 ──
+            coins: list[PortfolioCoinPick] = []
+            seen_symbols: set[str] = set()
+            for c in coins_raw:
+                sym = c.get("symbol", "").upper()
+                if sym in seen_symbols or sym not in valid_symbols:
+                    continue
+                seen_symbols.add(sym)
+                coins.append(PortfolioCoinPick(
+                    symbol=sym,
+                    confidence=float(c.get("confidence", 0.5)),
+                    reason=c.get("reason", ""),
+                ))
+                if len(coins) >= _PORTFOLIO_SIZE:
+                    break
 
-            # ── SL1 clamp ──
-            sl_1st = max(sl1_min, min(sl1_max, sl_1st))
+            # ── 부족분 자동 보충 (스코어 상위 후보에서) ──
+            if len(coins) < _PORTFOLIO_SIZE and coin_scores:
+                sorted_scores = sorted(coin_scores, key=lambda s: s.total_score, reverse=True)
+                for sc in sorted_scores:
+                    if sc.symbol not in seen_symbols and sc.symbol in valid_symbols:
+                        seen_symbols.add(sc.symbol)
+                        coins.append(PortfolioCoinPick(
+                            symbol=sc.symbol,
+                            confidence=0.3,
+                            reason="AI 미선정 — 스코어 기반 자동 보충",
+                        ))
+                        logger.warning(f"[BuyStrategist 보충] {sc.symbol} (스코어={sc.total_score:.1f})")
+                        if len(coins) >= _PORTFOLIO_SIZE:
+                            break
 
-            # ── SL2 clamp: SL1보다 0.2% 이상 더 낮아야 함 ──
-            sl_2nd = max(sl2_min, min(sl2_max, sl_2nd))
-            if sl_2nd >= sl_1st - 0.2:
-                sl_2nd = round(sl_1st - 0.3, 2)
-                logger.warning(
-                    f"[BuyStrategist 보정] sl_2nd를 sl_1st({sl_1st}%) - 0.3% → {sl_2nd}%로 보정"
+            # 그래도 부족하면 스냅샷에서 보충
+            if len(coins) < _PORTFOLIO_SIZE:
+                for s in snapshots:
+                    if s.symbol not in seen_symbols:
+                        seen_symbols.add(s.symbol)
+                        coins.append(PortfolioCoinPick(
+                            symbol=s.symbol,
+                            confidence=0.2,
+                            reason="AI 미선정 — 후보 목록 자동 보충",
+                        ))
+                        if len(coins) >= _PORTFOLIO_SIZE:
+                            break
+
+            if len(coins) < 3:
+                raise RuntimeError(
+                    f"[BuyStrategist] 유효한 코인이 {len(coins)}개뿐 — 최소 3개 필요"
                 )
 
-            # ── TP clamp ──
-            if take_profit_pct < tp_min:
-                logger.warning(
-                    f"[BuyStrategist 보정] take_profit {take_profit_pct}% → {tp_min}% (범위 하한)"
-                )
-                take_profit_pct = tp_min
-            if take_profit_pct > tp_max:
-                logger.warning(
-                    f"[BuyStrategist 보정] take_profit {take_profit_pct}% → {tp_max}% (범위 상한)"
-                )
-                take_profit_pct = tp_max
+            # ── TP/SL clamp ──
+            take_profit_pct = max(tp_min, min(tp_max, take_profit_pct))
+            if stop_loss_pct > 0:
+                stop_loss_pct = -abs(stop_loss_pct)
+            stop_loss_pct = max(-2.0, min(-0.5, stop_loss_pct))
 
-            # ── 실효 R:R 체크: TP / 실효손실(SL1×50%+SL2×50%) ──
-            effective_loss = abs(sl_1st) * 0.5 + abs(sl_2nd) * 0.5
-            rr_ratio = take_profit_pct / effective_loss if effective_loss > 0 else 99
-            if rr_ratio < 0.8:
-                take_profit_pct = round(effective_loss * 0.8, 2)
-                logger.warning(
-                    f"[BuyStrategist 보정] R:R 0.8 미달 → take_profit={take_profit_pct}%"
-                )
-
-            decision = AgentDecision(
-                symbol=symbol,
+            decision = PortfolioDecision(
+                coins=coins,
                 take_profit_pct=round(take_profit_pct, 2),
-                stop_loss_1st_pct=round(sl_1st, 2),
-                stop_loss_pct=round(sl_2nd, 2),
-                confidence=confidence,
-                reason=reason,
+                stop_loss_pct=round(stop_loss_pct, 2),
+                portfolio_reason=portfolio_reason,
+                confidence=sum(c.confidence for c in coins) / len(coins),
                 llm_provider=self._llm.provider_name,
             )
 
+            symbols_str = ", ".join(c.symbol for c in coins)
             logger.info(
-                f"[BuyStrategist] 선정: {decision.symbol} / "
-                f"TP=+{decision.take_profit_pct}% / "
-                f"SL1={decision.stop_loss_1st_pct}% / "
-                f"SL2={decision.stop_loss_pct}% / "
-                f"확신도={decision.confidence:.1f}"
+                f"[BuyStrategist] 포트폴리오 구성: [{symbols_str}] / "
+                f"TP=+{decision.take_profit_pct}% / SL={decision.stop_loss_pct}% / "
+                f"코인 수={len(coins)}"
             )
-            return {"decision": decision}
+            return {"portfolio_decision": decision}
 
         except (KeyError, ValueError) as e:
             logger.error(f"[BuyStrategist] 응답 파싱 실패: {e}\n원문: {raw}")
             raise RuntimeError(f"[BuyStrategist] 응답 파싱 실패: {e}")
 
     # ---------------------------------------------------------------- #
-    #  유틸리티 메서드 (기존 TradingAgent에서 이관)                         #
+    #  유틸리티 메서드                                                     #
     # ---------------------------------------------------------------- #
     @staticmethod
     def _snapshots_to_text(
         snapshots: list[CoinSnapshot],
         scores: list[CoinScore] | None = None,
     ) -> str:
-        """스냅샷을 AI 프롬프트 텍스트로 변환 (스코어 정보 포함)"""
+        """스냅샷을 AI 프롬프트 텍스트로 변환"""
         score_map = {sc.symbol: sc for sc in (scores or [])}
         lines = []
         for s in snapshots:
-            # 변동폭 계산
             vol_pct = (
                 (s.high_price - s.low_price) / s.low_price * 100
                 if s.low_price > 0 else 0
             )
-            # 현재가 위치
             price_range = s.high_price - s.low_price
             pos_pct = (
                 (s.current_price - s.low_price) / price_range * 100
@@ -259,37 +261,27 @@ class BuyStrategist(BaseSpecialistAgent):
         if not stats:
             return ""
         lines = [
-            "\n**[과거 매매 성과 — 이 데이터를 기반으로 전략 파라미터를 결정하세요]**",
-            f"- 최근 {stats['count']}건 매매: 승률 {stats['win_rate']:.0%} "
+            "\n**[과거 포트폴리오 성과 — 이 데이터를 기반으로 전략을 결정하세요]**",
+            f"- 최근 {stats['count']}건 포트폴리오: 승률 {stats['win_rate']:.0%} "
             f"(익절 {stats['win_count']}건, 손절 {stats['loss_count']}건)",
             f"- 평균 실현 수익률: {stats['avg_pnl_pct']:+.2f}%",
             f"- 평균 보유 시간: {stats['avg_hold_minutes']:.0f}분",
-            f"- 기존 평균 익절 설정: +{stats['avg_tp_set']:.1f}%, 평균 손절 설정: {stats['avg_sl_set']:.1f}%",
-            f"- AI 제안 평균 익절: +{stats['avg_suggested_tp']:.1f}%, 제안 평균 손절: {stats['avg_suggested_sl']:.1f}%",
+            f"- 평균 익절 설정: +{stats['avg_tp_set']:.1f}%, 평균 손절 설정: {stats['avg_sl_set']:.1f}%",
         ]
 
-        # 추세 방향 정보
         if stats.get("tp_direction"):
             tp_vals = stats.get("tp_trend", [])
             trend_str = "→".join(f"{v:.1f}" for v in tp_vals)
-            lines.append(
-                f"- 익절 제안 추세: {stats['tp_direction']} ({trend_str}%)"
-            )
+            lines.append(f"- 익절 제안 추세: {stats['tp_direction']} ({trend_str}%)")
 
-        # 최근 거래 코인 정보
         recent = stats.get("recent_trades", [])
         if recent:
-            lines.append("- 최근 거래 코인 (선정 금지 원칙):")
+            lines.append("- 최근 포트폴리오 결과 (종목 회피 참고):")
             for t in recent:
                 exit_kr = "익절" if t["exit_type"] == "take_profit" else "손절"
-                warning = (
-                    "【익절 직후 — 반드시 제외】"
-                    if t["exit_type"] == "take_profit"
-                    else "【손절 직후 — 가급적 제외】"
-                )
                 lines.append(
-                    f"  * {t['symbol']}: {exit_kr} {t['pnl_pct']:+.2f}%, "
-                    f"보유 {t['held_minutes']:.0f}분 {warning}"
+                    f"  * {t['portfolio_name']}: {exit_kr} {t['pnl_pct']:+.2f}%, "
+                    f"보유 {t['held_minutes']:.0f}분"
                 )
 
         if stats.get("recent_lessons"):
@@ -300,10 +292,7 @@ class BuyStrategist(BaseSpecialistAgent):
 
     @staticmethod
     def _profiles_to_text(profiles: dict[str, str]) -> str:
-        """코인 프로파일을 프롬프트 삽입용 텍스트로 변환.
-
-        과거 보유 이력이 있는 코인만 포함되며, 매수 결정 전 반드시 참고해야 합니다.
-        """
+        """코인 프로파일을 프롬프트 삽입용 텍스트로 변환"""
         if not profiles:
             return ""
         lines = [
@@ -319,7 +308,7 @@ class BuyStrategist(BaseSpecialistAgent):
         market_condition: MarketCondition | None,
         allocation: AllocationDecision | None,
     ) -> str:
-        """시장 분석가 + 자산 운용가 컨텍스트를 프롬프트 텍스트로 변환"""
+        """시장 분석가 + 자산 운용가 컨텍스트"""
         parts = []
         if market_condition:
             parts.append(

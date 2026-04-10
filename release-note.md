@@ -2,6 +2,61 @@
 
 ---
 
+## v4.0.0 (2026-04-11)
+
+### 8코인 분산 포트폴리오 매매 시스템 전면 전환 + Agent 프롬프트 강화
+
+#### 핵심 변경 — 포트폴리오 기반 매매
+- **단일 코인 → 8코인 동시 포트폴리오**: 매 사이클마다 8개 코인을 동시에 매수·보유·매도
+  - 포트폴리오 단위 랜덤 이름 부여 (예: "판다-07", "장미-42")
+  - KRW 잔고를 8등분 (각 12.5%) 순차 매수, 일부 실패 시 성공 코인만으로 구성 (최소 3개)
+- **포트폴리오 종합 P&L 기반 매도**:
+  - 분할 손절: -1.0% → 전체 33% 매도, -1.5% → 잔여 50% 추가 매도
+  - 최대 손절: -2.0% 하드캡 → 잔여 전량 청산 (절대 변경 불가)
+  - 트레일링 익절: 종합 P&L이 TP 도달 → 고점 추적 → 하락 시 전량 청산
+
+#### 신규 파일
+- `strategy/portfolio_names.py` — 동물·색상·식물 풀에서 랜덤 포트폴리오 이름 생성기
+
+#### DB 스키마 전면 개편
+- **신규 테이블 `Portfolio`**: name, total_buy_krw, take_profit_pct, stop_loss_pct, is_open 등
+- **`Position`**: portfolio_id FK 추가, TP/SL 컬럼 포트폴리오 레벨로 이동
+- **`StrategyEvaluation`**: portfolio_id + portfolio_name + coins_summary(JSON) 포트폴리오 단위로 전환
+- DB 마이그레이션: 기존 스키마 감지 시 `.v1_backup`으로 백업 후 클린 재생성
+
+#### Repository 신규 메서드
+- `open_portfolio()`, `get_open_portfolio()`, `get_portfolio_positions()`, `close_portfolio()`
+- `update_portfolio_targets()`, `get_portfolio_history()`, `get_closed_portfolios()`
+
+#### Agent 프롬프트 대폭 강화
+- **매수 전문가**: 대형2+중형3+소형1 분산 철학, 4가지 금지 규칙, 섹터 분산 강조
+- **매도 전문가**: 3단계 분할 손절 메커니즘 명시, 보유 시간별 5가지 가이드라인, -2% 하드캡 절대 원칙
+- **포트폴리오 평가가**: 4점 평가 프레임워크 (승자/패자 비율 벤치마크, TP/SL 적정성, 보유 시간 효율)
+- **시장 분석가**: 5단계 분석 절차, 절대 규칙 (BTC -3% → 필수 high risk, 7개+ 하락 → 필수 bearish)
+- **자산 운용가**: 5가지 의사결정 기준, 연속 손절 시 비율 축소 규칙
+- **총괄 평가가**: directive 작성 원칙 강화 (명령형·수치 포함·데이터 근거), 점수 부여 기준 명확화
+
+#### 피드백 시스템 — 누적 요약 방식
+- `BaseSpecialistAgent.update_feedback()`: 덮어쓰기 → 최근 3회 히스토리 누적
+- 점수 추이 표시 (📈 상승 / 📉 하락 / ➡️ 유지) + 델타(+/-)
+- 누적 패턴 섹션: 반복되는 강점·약점·지시사항 요약
+- `restore_feedbacks_from_db()`: 재시작 시 최근 3회분을 시계열 순으로 누적 로드
+
+#### TradingEngine 전면 재작성
+- 메인 루프: `get_open_portfolio()` 기반 포트폴리오 감시
+- `_PortfolioExitTracker`: phase, peak_pnl_pct, tier1_sold, tier2_sold 상태 추적
+- `_select_and_buy_portfolio()`: 8코인 순차 매수 (0.5초 간격, 최소 3개 성공 필요)
+- `_handle_monitoring()`: 3단계 낙폭별 분할 매도 상태 머신
+- `_execute_portfolio_sell()`: 전량 매도 + 포트폴리오 종료 + 8개 심볼 쿨다운 일괄 등록
+
+#### 기타 개선
+- `CoinSelector._TOP_CANDIDATES`: 10 → 20 (8코인 선정을 위한 충분한 후보 확보)
+- `StrategyOptimizer`: -2% 하드캡 반영, 포트폴리오 TP 범위 3.0~8.0%
+- `config/settings.py`: `PORTFOLIO_SIZE: int = 8` 추가
+- 대시보드·텔레그램·스케줄러: 포트폴리오 단위 상태·이력 표시로 전환
+
+---
+
 ## v3.3.0 (2026-04-10)
 
 ### 특성 분석가(CoinProfileAnalyst) — 코인별 프로파일 누적 학습

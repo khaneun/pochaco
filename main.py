@@ -177,7 +177,8 @@ def main() -> None:
 
     logger.info(f"pochaco 시작 (HEADLESS={settings.HEADLESS})")
     logger.info(f"LLM 공급자: {settings.LLM_PROVIDER} / 감시 주기: {settings.POSITION_CHECK_INTERVAL}초")
-    logger.info("6개 전문가 Agent 시스템 활성화")
+    logger.info(f"포트폴리오 모드: {settings.PORTFOLIO_SIZE}개 코인 균등 분산")
+    logger.info("7개 전문가 Agent 시스템 활성화")
 
     if settings.HEADLESS:
         logger.info("헤드리스 모드 — 웹 대시보드 및 텔레그램으로 모니터링하세요.")

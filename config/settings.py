@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     QUOTE_CURRENCY: str = "KRW"
     MIN_ORDER_KRW: int = 5_000           # 빗썸 최소 주문금액
     POSITION_CHECK_INTERVAL: int = 10    # 포지션 감시 주기(초)
+    PORTFOLIO_SIZE: int = 8              # 포트폴리오당 코인 수
 
     # ---------------------------------------------------------------- #
     #  데이터베이스                                                       #
