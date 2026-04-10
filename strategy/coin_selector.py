@@ -6,9 +6,16 @@
 동작:
   1. 변동폭(고저차) < 목표 익절 × 1.5 → 제외 (변동성 부족)
   2. 거래대금 < 50억 → 제외 (유동성 부족)
-  3. 하락 추세(24h 변동 < -1% 또는 현재가가 저가 근처) → 제외
+  3. 하락 추세 → 제외 (다중 기준 복합 판정 — 아래 _check_downtrend 참고)
   4. 나머지를 [변동성 × 모멘텀 × 거래량] 가중 스코어로 정렬
   5. 상위 10개만 AI에게 전달 → AI는 검증된 후보풀에서만 선택
+
+하락 추세 판정 기준 (하나라도 해당 시 제외):
+  A. 24h 변동률 < -2.0%               — 강한 일봉 하락
+  B. 최근 3h 변화율 < -1.5%           — 현재 단기 급락 중
+  C. 최근 4캔들 중 3개 이상 하락       — 단, 24h < 1.0% 조건 병행 (강한 상승 조정은 허용)
+  D. 24h < -1.0% 이고 최근 2h도 하락  — 중단기 동반 하락 확인
+  E. 저가 근처(하위 15%) + 최근 2h 하락 — 바닥 다이빙
 """
 import logging
 from dataclasses import dataclass
@@ -17,10 +24,17 @@ from .market_analyzer import CoinSnapshot
 
 logger = logging.getLogger(__name__)
 
-# 기본 필터링 기준
-_MIN_VOLUME_KRW = 5_000_000_000    # 50억원
-_MIN_CHANGE_PCT = -1.0              # 24h 변동률 하한 (이하면 하락 추세로 간주)
-_TOP_CANDIDATES = 10                # AI에 전달할 최대 후보 수
+# 필터링 기준
+_MIN_VOLUME_KRW     = 5_000_000_000  # 50억원 — 유동성 하한
+_TOP_CANDIDATES     = 10             # AI에 전달할 최대 후보 수
+
+# 하락 추세 판정 임계값
+_DOWN_24H_STRONG    = -2.0   # 24h 이 이하면 무조건 제외
+_DOWN_24H_MILD      = -1.0   # 단기 확인과 병행 시 제외
+_DOWN_3H_THRESHOLD  = -1.5   # 최근 3h 이 이하면 제외
+_DOWN_2H_ANY        =  0.0   # 24h mild 하락 + 단기 이 이하면 제외
+_DOWN_CONSEC_RATIO  =  3     # 연속 하락 캔들 수 (최근 4개 중)
+_LOW_POSITION_PCT   = 15.0   # 저가 근처 기준 (%)
 
 
 @dataclass
@@ -93,11 +107,10 @@ class CoinSelector:
                 rejected += 1
                 continue
 
-            # ── 필터 3: 하락 추세 ──
-            if s.change_pct_24h < _MIN_CHANGE_PCT:
-                logger.debug(
-                    f"  [제외] {s.symbol}: 24h 변동 {s.change_pct_24h:+.1f}% (하락 추세)"
-                )
+            # ── 필터 3: 하락 추세 (다중 기준 복합 판정) ──
+            is_down, down_reason = self._check_downtrend(s)
+            if is_down:
+                logger.debug(f"  [제외] {s.symbol}: {down_reason}")
                 rejected += 1
                 continue
 
@@ -107,14 +120,6 @@ class CoinSelector:
                 (s.current_price - s.low_price) / price_range * 100
                 if price_range > 0 else 50.0
             )
-
-            # 현재가가 저가 근처면 (하위 20%) → 하락 후 바닥일 수 있으니 감점
-            if price_position < 20 and s.change_pct_24h < 0:
-                logger.debug(
-                    f"  [제외] {s.symbol}: 저가 근처({price_position:.0f}%) + 하락 중"
-                )
-                rejected += 1
-                continue
 
             # ── 캔들 모멘텀 분석 ──
             momentum = self._analyze_candle_momentum(s.candlestick_1h)
@@ -172,6 +177,85 @@ class CoinSelector:
             )
 
         return result_snapshots, result_scores
+
+    # ---------------------------------------------------------------- #
+    #  하락 추세 판정 (다중 기준)                                          #
+    # ---------------------------------------------------------------- #
+    @staticmethod
+    def _check_downtrend(s: "CoinSnapshot") -> tuple[bool, str]:
+        """1h 캔들 + 24h 변동률을 복합적으로 보는 하락 추세 판정.
+
+        캔들 데이터가 없으면 24h 단일 기준으로 폴백합니다.
+
+        Args:
+            s: CoinSnapshot (candlestick_1h 포함)
+
+        Returns:
+            (하락추세 여부, 제외 이유)
+        """
+        # ── 1h 캔들에서 종가 추출 ──
+        closes: list[float] = []
+        for c in (s.candlestick_1h or []):
+            try:
+                v = float(c[2]) if len(c) > 2 else 0.0
+                if v > 0:
+                    closes.append(v)
+            except (ValueError, TypeError):
+                pass
+
+        has_candles = len(closes) >= 4
+
+        # ── 기준 A: 24h 강한 하락 (캔들 무관하게 즉시 제외) ──
+        if s.change_pct_24h < _DOWN_24H_STRONG:
+            return True, f"24h 강한 하락 {s.change_pct_24h:+.1f}%"
+
+        # ── 기준 B: 단기(3h) 급락 ──
+        if has_candles and len(closes) >= 4:
+            ch3h = (closes[-1] - closes[-4]) / closes[-4] * 100
+            if ch3h < _DOWN_3H_THRESHOLD:
+                return True, f"단기(3h) {ch3h:+.1f}% 급락"
+
+        # ── 기준 C: 연속 하락 캔들 구조 (24h 강한 상승 조정은 제외) ──
+        if len(closes) >= 5 and s.change_pct_24h < 1.0:
+            tail = closes[-5:]
+            down_count = sum(
+                1 for i in range(1, len(tail)) if tail[i] < tail[i - 1]
+            )
+            if down_count >= _DOWN_CONSEC_RATIO:
+                return (
+                    True,
+                    f"연속 하락 캔들 {down_count}/4 (24h {s.change_pct_24h:+.1f}%)",
+                )
+
+        # ── 기준 D: 24h 완만 하락 + 단기도 하락 중 (동반 확인) ──
+        if s.change_pct_24h < _DOWN_24H_MILD:
+            if has_candles and len(closes) >= 3:
+                ch2h = (closes[-1] - closes[-3]) / closes[-3] * 100
+                if ch2h <= _DOWN_2H_ANY:
+                    return (
+                        True,
+                        f"24h {s.change_pct_24h:+.1f}% + 단기(2h) {ch2h:+.1f}% 동반 하락",
+                    )
+            else:
+                # 캔들 없음 → 24h 단일 기준으로 폴백
+                return True, f"24h 하락 {s.change_pct_24h:+.1f}% (캔들 없음)"
+
+        # ── 기준 E: 저가 근처 + 단기 하락 중 ──
+        price_range = s.high_price - s.low_price
+        if price_range > 0:
+            price_pos = (s.current_price - s.low_price) / price_range * 100
+            if price_pos < _LOW_POSITION_PCT:
+                if has_candles and len(closes) >= 3:
+                    ch2h = (closes[-1] - closes[-3]) / closes[-3] * 100
+                    if ch2h < -0.3:
+                        return (
+                            True,
+                            f"저가 근처({price_pos:.0f}%) + 단기(2h) {ch2h:+.1f}% 하락",
+                        )
+                elif s.change_pct_24h < 0:
+                    return True, f"저가 근처({price_pos:.0f}%) + 24h 하락"
+
+        return False, ""
 
     # ---------------------------------------------------------------- #
     #  캔들 모멘텀 분석                                                   #
