@@ -10,6 +10,9 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
+
+_APP_DIR = Path(__file__).parent
 
 from config import settings
 from core import BithumbClient
@@ -20,6 +23,7 @@ from strategy import MarketAnalyzer, TradingEngine, StrategyOptimizer, CoinSelec
 from strategy.agents import (
     MarketAnalyst, AssetManager, BuyStrategist,
     SellStrategist, PortfolioEvaluator, MetaEvaluator,
+    CoinProfileAnalyst,
 )
 from scheduler import TradingScheduler
 from dashboard import Dashboard
@@ -75,13 +79,17 @@ def main() -> None:
     # LLM 공급자 (공유)
     llm = get_llm_provider()
 
-    # 6개 전문가 Agent 생성
+    # 7개 전문가 Agent 생성
     market_analyst      = MarketAnalyst(llm=llm)
     asset_manager       = AssetManager(llm=llm)
     buy_strategist      = BuyStrategist(llm=llm)
     sell_strategist     = SellStrategist(llm=llm)
     portfolio_evaluator = PortfolioEvaluator(llm=llm)
     meta_evaluator      = MetaEvaluator(llm=llm)
+    coin_profile_analyst = CoinProfileAnalyst(
+        profile_dir=_APP_DIR / "data" / "coin_profiles",
+        llm=llm,
+    )
 
     # 코디네이터 (기존 TradingAgent 대체)
     coordinator = AgentCoordinator(
@@ -92,6 +100,7 @@ def main() -> None:
         portfolio_evaluator=portfolio_evaluator,
         meta_evaluator=meta_evaluator,
         repo=repo,
+        coin_profile_analyst=coin_profile_analyst,
     )
 
     # DB에서 최신 피드백 로드 → Agent에 주입 (재시작 시 피드백 유지)

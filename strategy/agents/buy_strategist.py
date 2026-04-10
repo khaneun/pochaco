@@ -52,6 +52,7 @@ class BuyStrategist(BaseSpecialistAgent):
         allocation: AllocationDecision | None = context.get("allocation")
         eval_stats: dict | None = context.get("eval_stats")
         coin_scores: list[CoinScore] | None = context.get("coin_scores")
+        coin_profiles: dict[str, str] = context.get("coin_profiles", {})
 
         if not snapshots:
             raise RuntimeError("[BuyStrategist] 스냅샷이 비어있음 — 매수 불가")
@@ -59,6 +60,9 @@ class BuyStrategist(BaseSpecialistAgent):
         # 시장 데이터 텍스트
         market_text = self._snapshots_to_text(snapshots, scores=coin_scores)
         history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
+
+        # 특성 분석가 프로파일 텍스트
+        profiles_text = self._profiles_to_text(coin_profiles) if coin_profiles else ""
 
         # 시장 상태 + 배분 컨텍스트
         specialist_context = self._build_specialist_context(market_condition, allocation)
@@ -112,6 +116,7 @@ class BuyStrategist(BaseSpecialistAgent):
 
 {market_text}
 {history_text}
+{profiles_text}
 
 **코인 선정 기준 (우선순위 순)**
 1. **변동폭 vs 익절 현실성** — 변동폭이 목표 익절%의 1.5배 이상인 코인만 선정 (예: 익절 3% 목표 시 변동폭 4.5% 이상 필수). 변동폭이 작은 코인은 절대 선정 금지
@@ -291,6 +296,22 @@ class BuyStrategist(BaseSpecialistAgent):
             lines.append("- 최근 교훈:")
             for lesson in stats["recent_lessons"]:
                 lines.append(f"  * {lesson}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _profiles_to_text(profiles: dict[str, str]) -> str:
+        """코인 프로파일을 프롬프트 삽입용 텍스트로 변환.
+
+        과거 보유 이력이 있는 코인만 포함되며, 매수 결정 전 반드시 참고해야 합니다.
+        """
+        if not profiles:
+            return ""
+        lines = [
+            "\n**[특성 분석가 프로파일 — 과거 보유 이력 있음, 매수 전 반드시 참고]**",
+        ]
+        for symbol, profile in profiles.items():
+            lines.append(f"\n### {symbol}")
+            lines.append(profile.strip())
         return "\n".join(lines)
 
     @staticmethod

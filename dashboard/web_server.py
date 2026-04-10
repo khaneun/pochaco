@@ -730,6 +730,7 @@ def _render_html(data: dict) -> str:
         "buy_strategist": "매수 전문가",
         "sell_strategist": "매도 전문가",
         "portfolio_evaluator": "포트폴리오 평가가",
+        "coin_profile_analyst": "특성 분석가",
     }
     if agent_scores:
         score_cards = '<div style="display:flex; gap:10px; flex-wrap:wrap;">'
@@ -879,6 +880,7 @@ _ROLE_DISPLAY = {
     "buy_strategist": ("매수 전문가", "🎯"),
     "sell_strategist": ("매도 전문가", "📉"),
     "portfolio_evaluator": ("포트폴리오 평가가", "📋"),
+    "coin_profile_analyst": ("특성 분석가", "🔍"),
 }
 
 
@@ -917,6 +919,10 @@ def _build_experts_data(coordinator: "AgentCoordinator | None") -> dict:
             if coordinator:
                 live = coordinator.get_agent_scores()
                 agent_info["current_score"] = round(live.get(role, agent_info["current_score"]), 1)
+
+            # 특성 분석가 전용: 관리 중인 코인 목록 추가
+            if role == "coin_profile_analyst" and coordinator:
+                agent_info["profiled_coins"] = coordinator.list_coin_profiles()
 
             agents_data.append(agent_info)
 
@@ -970,6 +976,31 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
                 f'justify-content:center; height:45px; margin-top:8px;">{bars}</div>'
             )
 
+        # 특성 분석가 전용: 관리 중인 코인 목록
+        profiled_html = ""
+        if role == "coin_profile_analyst":
+            coins = a.get("profiled_coins", [])
+            if coins:
+                tags = "".join(
+                    f'<span style="background:#0f172a; border:1px solid #334155; '
+                    f'border-radius:4px; padding:2px 7px; font-size:0.73rem; '
+                    f'color:#94a3b8; margin:2px 2px 0 0; display:inline-block;">'
+                    f'{c}</span>'
+                    for c in coins
+                )
+                profiled_html = (
+                    f'<div style="margin-top:10px; padding-top:10px; border-top:1px solid #334155;">'
+                    f'<div style="font-size:0.75rem; color:#64748b; margin-bottom:6px;">'
+                    f'프로파일 관리 중 ({len(coins)}개)</div>'
+                    f'{tags}</div>'
+                )
+            else:
+                profiled_html = (
+                    '<div style="margin-top:10px; padding-top:10px; border-top:1px solid #334155;'
+                    ' font-size:0.75rem; color:#475569; font-style:italic;">'
+                    '아직 관리 중인 코인 없음<br>(매매 완료 후 자동 기록)</div>'
+                )
+
         # 피드백
         fb = a.get("last_feedback")
         fb_html = ""
@@ -1014,6 +1045,7 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
             f'<div style="font-size:0.75rem; color:#475569;">/ 100</div>'
             f'</div>'
             f'{trend_html}'
+            f'{profiled_html}'
             f'{fb_html}'
             f'{action_btns}'
             f'</div>'

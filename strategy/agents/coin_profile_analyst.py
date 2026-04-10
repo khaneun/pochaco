@@ -1,0 +1,172 @@
+"""가상화폐 특성 분석가
+
+매매가 완료될 때마다 해당 코인의 특성·패턴을 학습하여 data/coin_profiles/ 에 저장합니다.
+저장된 프로파일은 매수 전문가 등이 진입 전에 참고합니다.
+투자가 반복될수록 프로파일이 누적되어 코인별 최적 전략이 자동으로 개선됩니다.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from .base_agent import BaseSpecialistAgent
+
+logger = logging.getLogger(__name__)
+
+_KST = timezone(timedelta(hours=9))
+
+
+class CoinProfileAnalyst(BaseSpecialistAgent):
+    """코인별 특성을 누적 학습·관리하는 전문가 Agent.
+
+    - get_profile(symbol)  : 저장된 프로파일 텍스트 반환 (없으면 None)
+    - execute(context)     : 매매 완료 후 프로파일 업데이트 (LLM 호출)
+    """
+
+    ROLE_NAME    = "coin_profile_analyst"
+    DISPLAY_NAME = "특성 분석가"
+
+    def __init__(self, profile_dir: Path, **kwargs):
+        super().__init__(**kwargs)
+        self._profile_dir = Path(profile_dir)
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
+        self._base_prompt = (
+            "당신은 가상화폐 특성 전문가입니다.\n"
+            "매매 결과를 분석하여 각 코인의 고유한 가격 패턴·변동성·최적 매매 전략을 학습합니다.\n"
+            "축적된 경험을 바탕으로 미래 매매에 실질적으로 도움이 되는 간결한 인사이트를 제공합니다.\n"
+            "매수 전문가가 해당 코인 진입을 고려할 때 과거 경험이 판단에 반영되도록 지원합니다."
+        )
+
+    # ── 프로파일 조회 ────────────────────────────────────────────── #
+
+    def get_profile(self, symbol: str) -> str | None:
+        """저장된 코인 프로파일 읽기.
+
+        Args:
+            symbol: 코인 심볼 (대소문자 무관)
+
+        Returns:
+            프로파일 마크다운 텍스트, 없으면 None
+        """
+        path = self._profile_dir / f"{symbol.upper()}.md"
+        try:
+            return path.read_text("utf-8") if path.exists() else None
+        except Exception as e:
+            logger.warning(f"[특성 분석가] {symbol} 프로파일 읽기 실패: {e}")
+            return None
+
+    def list_profiles(self) -> list[str]:
+        """프로파일이 존재하는 코인 심볼 목록 반환"""
+        return sorted(p.stem for p in self._profile_dir.glob("*.md"))
+
+    # ── 프로파일 업데이트 (LLM 호출) ────────────────────────────── #
+
+    def execute(self, context: dict) -> dict:
+        """매매 완료 후 코인 프로파일 생성·업데이트.
+
+        매 거래가 끝날 때 AgentCoordinator.evaluate_trade() 에서 호출합니다.
+
+        Args:
+            context: {
+                "symbol": str,
+                "buy_price": float,
+                "sell_price": float,
+                "pnl_pct": float,
+                "held_minutes": float,
+                "exit_type": str,           # "take_profit" | "stop_loss" | "timeout"
+                "agent_reason": str,        # 매수 이유
+                "original_tp": float,
+                "original_sl": float,
+                "original_sl_1st": float | None,
+                "partial_sl_executed": bool,
+                "evaluation": str,          # PortfolioEvaluator 평가 텍스트
+                "lesson": str,
+                "trade_time": str,          # "YYYY-MM-DD HH:MM" (KST)
+            }
+
+        Returns:
+            {"updated": bool, "symbol": str}
+        """
+        symbol = context.get("symbol", "").upper()
+        if not symbol:
+            return {"updated": False, "symbol": ""}
+
+        try:
+            existing  = self.get_profile(symbol) or ""
+            new_trade = self._format_trade(context)
+            updated   = self._update_with_llm(symbol, existing, new_trade)
+            self._save_profile(symbol, updated)
+            logger.info(
+                f"[특성 분석가] {symbol} 프로파일 업데이트 완료 ({len(updated)}자)"
+            )
+            return {"updated": True, "symbol": symbol}
+        except Exception as e:
+            logger.error(f"[특성 분석가] {symbol} 프로파일 업데이트 실패: {e}")
+            return {"updated": False, "symbol": symbol}
+
+    # ── 내부 헬퍼 ────────────────────────────────────────────────── #
+
+    @staticmethod
+    def _format_trade(ctx: dict) -> str:
+        """새 거래 데이터를 프롬프트용 텍스트로 포맷"""
+        exit_kr = {
+            "take_profit": "익절",
+            "stop_loss":   "손절",
+        }.get(ctx.get("exit_type", ""), "시간초과")
+        sl1       = ctx.get("original_sl_1st")
+        sl1_str   = f"{sl1}%" if sl1 else "없음"
+        partial   = "실행" if ctx.get("partial_sl_executed") else "미실행"
+        return (
+            f"거래일시  : {ctx.get('trade_time', '')}\n"
+            f"결과      : {exit_kr} {ctx.get('pnl_pct', 0):+.2f}%\n"
+            f"가격      : {ctx.get('buy_price', 0):,.0f}원 → {ctx.get('sell_price', 0):,.0f}원\n"
+            f"보유 시간 : {ctx.get('held_minutes', 0):.0f}분\n"
+            f"설정      : TP +{ctx.get('original_tp', 0)}% / "
+            f"SL1 {sl1_str} / SL2 {ctx.get('original_sl', 0)}% / 1차손절 {partial}\n"
+            f"매수 이유 : {ctx.get('agent_reason', '')}\n"
+            f"AI 평가   : {ctx.get('evaluation', '')}\n"
+            f"교훈      : {ctx.get('lesson', '')}"
+        )
+
+    def _update_with_llm(self, symbol: str, existing: str, new_trade: str) -> str:
+        """LLM을 사용해 프로파일을 갱신하고 마크다운 텍스트를 반환"""
+        existing_section = (
+            f"**기존 프로파일:**\n{existing}\n\n"
+            if existing else
+            "**기존 프로파일:** 없음 (첫 매매)\n\n"
+        )
+        today = datetime.now(tz=_KST).strftime("%Y-%m-%d")
+
+        task_prompt = (
+            f"{existing_section}"
+            f"**새로 완료된 거래 데이터:**\n{new_trade}\n\n"
+            f"위 정보를 바탕으로 {symbol} 특성 프로파일을 작성·업데이트하세요.\n\n"
+            f"**작성 규칙:**\n"
+            f"- 전체 분량: 500자 이내 (간결하게)\n"
+            f"- 매매 이력: 최신 10건만 유지 (초과 시 가장 오래된 항목 제거)\n"
+            f"- 아래 마크다운 형식을 정확히 따를 것 (코드블록 없이 순수 마크다운)\n\n"
+            f"---\n"
+            f"# {symbol} 특성 프로파일\n"
+            f"*마지막 업데이트: {today}*\n\n"
+            f"## 가격 특성\n"
+            f"- (변동성·패턴·고유 특징 2~3줄)\n\n"
+            f"## 매매 이력 (최신순, 최대 10건)\n"
+            f"| 날짜 | 결과 | 수익률 | 보유 | 핵심 교훈 |\n"
+            f"|------|------|--------|------|-----------|\n"
+            f"| YYYY-MM-DD | 익절/손절 | +X.X% | X분 | ... |\n\n"
+            f"## 전략 권고\n"
+            f"- 최적 TP: (경험 기반 범위)\n"
+            f"- SL 기준: (경험 기반 범위)\n"
+            f"- 유리한 진입 조건: (조건)\n\n"
+            f"## 주의사항\n"
+            f"- (이 코인 매매 시 특히 주의할 점)\n"
+            f"---"
+        )
+
+        return self._call_llm(task_prompt, max_tokens=900)
+
+    def _save_profile(self, symbol: str, content: str) -> None:
+        """프로파일 텍스트를 파일로 저장"""
+        path = self._profile_dir / f"{symbol.upper()}.md"
+        path.write_text(content.strip(), encoding="utf-8")

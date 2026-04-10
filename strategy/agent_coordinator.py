@@ -1,11 +1,11 @@
-"""Agent Coordinator — 6개 전문가 Agent 오케스트레이션
+"""Agent Coordinator — 7개 전문가 Agent 오케스트레이션
 
 TradingEngine은 이 클래스만 의존하며, 기존 TradingAgent와
 동일한 메서드 시그니처(select_coin, should_adjust_strategy, evaluate_trade)를
 제공해 최소 변경으로 전환 가능.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from database import TradeRepository
 from .ai_agent import AgentDecision, TradeEvaluation
@@ -18,14 +18,17 @@ from .agents import (
     SellStrategist,
     PortfolioEvaluator,
     MetaEvaluator, AgentFeedback,
+    CoinProfileAnalyst,
 )
 from .agents.meta_evaluator import AGENT_ROLES
+
+_KST = timezone(timedelta(hours=9))
 
 logger = logging.getLogger(__name__)
 
 
 class AgentCoordinator:
-    """6개 전문가 Agent를 오케스트레이션하는 코디네이터"""
+    """7개 전문가 Agent를 오케스트레이션하는 코디네이터"""
 
     def __init__(
         self,
@@ -36,6 +39,7 @@ class AgentCoordinator:
         portfolio_evaluator: PortfolioEvaluator,
         meta_evaluator: MetaEvaluator,
         repo: TradeRepository,
+        coin_profile_analyst: CoinProfileAnalyst | None = None,
     ):
         self._agents: dict = {
             "market_analyst": market_analyst,
@@ -44,7 +48,10 @@ class AgentCoordinator:
             "sell_strategist": sell_strategist,
             "portfolio_evaluator": portfolio_evaluator,
         }
+        if coin_profile_analyst:
+            self._agents["coin_profile_analyst"] = coin_profile_analyst
         self._meta = meta_evaluator
+        self._coin_analyst: CoinProfileAnalyst | None = coin_profile_analyst
         self._repo = repo
 
         # 마지막 투자 비율 (TradingEngine에서 참조)
@@ -77,6 +84,18 @@ class AgentCoordinator:
             "base_prompt": agent.base_prompt,
             "feedback_prompt": agent.feedback_prompt,
         }
+
+    def get_coin_profile(self, symbol: str) -> str | None:
+        """특정 코인 프로파일 반환 (대시보드·외부 조회용)"""
+        if not self._coin_analyst:
+            return None
+        return self._coin_analyst.get_profile(symbol)
+
+    def list_coin_profiles(self) -> list[str]:
+        """프로파일이 존재하는 코인 심볼 목록 반환"""
+        if not self._coin_analyst:
+            return []
+        return self._coin_analyst.list_profiles()
 
     def chat_with_agent(self, role: str, message: str, history: list[dict]) -> str:
         """특정 Agent와 자유 대화"""
@@ -189,7 +208,20 @@ class AgentCoordinator:
                 f"[자산 운용가 판단] 투자 보류: {allocation.reason}"
             )
 
-        # 3) 매수 전문가
+        # 3) 특성 분석가 — 후보 코인별 프로파일 수집
+        coin_profiles: dict[str, str] = {}
+        if self._coin_analyst:
+            for s in snapshots:
+                profile = self._coin_analyst.get_profile(s.symbol)
+                if profile:
+                    coin_profiles[s.symbol] = profile
+            if coin_profiles:
+                logger.info(
+                    f"[Coordinator] 특성 분석가 프로파일 로드: "
+                    f"{list(coin_profiles.keys())}"
+                )
+
+        # 4) 매수 전문가
         logger.info("[Coordinator] 매수 전문가 코인 선정 중...")
         buy_result = self._agents["buy_strategist"].execute({
             "snapshots": snapshots,
@@ -197,6 +229,7 @@ class AgentCoordinator:
             "allocation": allocation,
             "eval_stats": eval_stats,
             "coin_scores": coin_scores,
+            "coin_profiles": coin_profiles,
         })
         decision = buy_result.get("decision")
         if decision is None:
@@ -306,6 +339,28 @@ class AgentCoordinator:
             f"제안 TP=+{evaluation.suggested_tp_pct}% "
             f"SL={evaluation.suggested_sl_pct}% | {evaluation.lesson}",
         )
+
+        # 특성 분석가 — 매매 완료 후 코인 프로파일 업데이트
+        if self._coin_analyst:
+            try:
+                self._coin_analyst.execute({
+                    "symbol": symbol,
+                    "buy_price": buy_price,
+                    "sell_price": sell_price,
+                    "pnl_pct": pnl_pct,
+                    "held_minutes": held_minutes,
+                    "exit_type": exit_type,
+                    "agent_reason": agent_reason,
+                    "original_tp": original_tp,
+                    "original_sl": original_sl,
+                    "original_sl_1st": original_sl_1st,
+                    "partial_sl_executed": partial_sl_executed,
+                    "evaluation": evaluation.evaluation,
+                    "lesson": evaluation.lesson,
+                    "trade_time": datetime.now(tz=_KST).strftime("%Y-%m-%d %H:%M"),
+                })
+            except Exception as e:
+                logger.warning(f"[특성 분석가] 프로파일 업데이트 중 오류: {e}")
 
         return evaluation
 
