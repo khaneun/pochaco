@@ -254,6 +254,17 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                 "sl_pct": ph.stop_loss_pct,
             })
 
+        # 전문가 점수 추세용 이력 (최근 5건)
+        agent_score_history: dict[str, list[dict]] = {}
+        try:
+            all_hist = repo.get_all_agent_score_history(limit=5)
+            for role, rows in all_hist.items():
+                agent_score_history[role] = [
+                    {"score": r.score} for r in rows
+                ]
+        except Exception:
+            pass
+
         # 수동 청산 이력
         manual_trades_data = []
         for t in recent_trades:
@@ -289,6 +300,7 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
             "manual_trades": manual_trades_data,
             "eval_stats": eval_stats,
             "agent_scores": coordinator.get_agent_scores() if coordinator else {},
+            "agent_score_history": agent_score_history,
         }
     finally:
         repo.close()
@@ -320,13 +332,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
               letter-spacing: 0.05em; margin-bottom: 12px; }}
   .big-num {{ font-size: 2rem; font-weight: 700; color: #f1f5f9; }}
   .sub {{ font-size: 0.85rem; color: #94a3b8; margin-top: 4px; }}
-  .green {{ color: #4ade80; }}
-  .red   {{ color: #f87171; }}
+  .green {{ color: #f87171; }}
+  .red   {{ color: #60a5fa; }}
   .gray  {{ color: #64748b; }}
   .badge {{ display: inline-block; padding: 2px 8px; border-radius: 9999px;
             font-size: 0.75rem; font-weight: 600; }}
-  .badge-green {{ background: #14532d; color: #4ade80; }}
-  .badge-red   {{ background: #450a0a; color: #f87171; }}
+  .badge-green {{ background: #450a0a; color: #f87171; }}
+  .badge-red   {{ background: #1e3a5f; color: #60a5fa; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
   th {{ color: #64748b; text-align: left; padding: 6px 8px;
         border-bottom: 1px solid #334155; font-weight: 500; }}
@@ -535,7 +547,10 @@ document.addEventListener('DOMContentLoaded', function() {{
 <!-- 전문가 점수 요약 -->
 <div style="padding: 0 20px 16px;">
   <div class="card">
-    <h2>🤖 전문가 Agent 점수</h2>
+    <h2 style="display:flex;align-items:center;justify-content:space-between;">
+      <span>🤖 전문가 Agent 점수</span>
+      <a href="/experts" title="전문가 실적표" style="color:#38bdf8;font-size:1rem;text-decoration:none;opacity:0.7;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7">&#x1F517;</a>
+    </h2>
     {agent_scores_html}
   </div>
 </div>
@@ -620,7 +635,7 @@ def _render_html(data: dict) -> str:
         held = pf["held_minutes"]
         held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
         progress = min(1.0, max(0.0, pnl_pct / pf["take_profit_pct"])) if pf["take_profit_pct"] > 0 else 0.0
-        bar_color = "#4ade80" if pnl_pct >= 0 else "#f87171"
+        bar_color = "#f87171" if pnl_pct >= 0 else "#60a5fa"
 
         # 개별 코인 테이블
         coin_rows = ""
@@ -693,15 +708,16 @@ def _render_html(data: dict) -> str:
     # 현재 보유 중인 포트폴리오 (최상단)
     if pf:
         idx = len(pf_tx_popup_list)
+        open_pnl_color = "green" if pf["pnl_pct"] > 0 else ("red" if pf["pnl_pct"] < 0 else "gray")
+        open_pnl_krw = pf["pnl_krw"]
+        open_pnl_str = f"{open_pnl_krw:+,.0f}원 ({pf['pnl_pct']:+.2f}%)"
         pf_tx_rows += (
             f"<tr class='pf-tx-row' onclick='showPfTx({idx})' style='cursor:pointer;'>"
             f"<td><span class='time-date'>{pf['opened_at']}</span>"
             f"<span class='time-hms'>보유 중</span></td>"
-            f"<td><b>{pf['name']}</b>"
+            f"<td><b>{pf['name']} ({pf['coin_count']})</b>"
             f"<span class='badge badge-green' style='margin-left:6px;font-size:0.7rem;'>매수</span></td>"
-            f"<td style='text-align:right'>{pf['coin_count']}</td>"
-            f"<td style='text-align:right' class='{'green' if pf['pnl_pct'] >= 0 else 'red'}'>"
-            f"{pf['pnl_pct']:+.2f}%</td>"
+            f"<td style='text-align:right' class='{open_pnl_color}'>{open_pnl_str}</td>"
             f"</tr>"
         )
         pf_tx_popup_list.append({
@@ -736,16 +752,15 @@ def _render_html(data: dict) -> str:
         sell_krw = ev.get("total_sell_krw", 0)
         coin_count = ev.get("coin_count", "?")
         pnl_krw = ev.get("pnl_krw") or 0
-        pnl_krw_str = f"{pnl_krw:+,.0f}원" if pnl_krw != 0 else "—"
+        pnl_color = "green" if pnl_krw > 0 else ("red" if pnl_krw < 0 else "gray")
+        pnl_cell = f"{pnl_krw:+,.0f}원 ({ev['pnl_pct']:+.2f}%)" if pnl_krw != 0 else f"{ev['pnl_pct']:+.2f}%"
         pf_tx_rows += (
             f"<tr class='pf-tx-row' onclick='showPfTx({idx})' style='cursor:pointer;'>"
             f"<td><span class='time-date'>{t_date}</span>"
             f"<span class='time-hms'>{t_hms}</span></td>"
-            f"<td><b>{ev['portfolio_name']}</b>"
+            f"<td><b>{ev['portfolio_name']} ({coin_count})</b>"
             f"<span class='badge {exit_class}' style='margin-left:6px;font-size:0.7rem;'>{exit_kr}</span></td>"
-            f"<td style='text-align:right'>{coin_count}</td>"
-            f"<td style='text-align:right' class='{pnl_color}'>{ev['pnl_pct']:+.2f}%</td>"
-            f"<td style='text-align:right' class='{pnl_color}'>{pnl_krw_str}</td>"
+            f"<td style='text-align:right' class='{pnl_color}'>{pnl_cell}</td>"
             f"</tr>"
         )
         held = ev["held_minutes"]
@@ -773,9 +788,7 @@ def _render_html(data: dict) -> str:
         trades_html = (
             "<table id='trade-table'>"
             "<tr><th>시간</th><th>포트폴리오</th>"
-            "<th style='text-align:right'>종목</th>"
-            "<th style='text-align:right'>수익률</th>"
-            "<th style='text-align:right'>손익(원)</th></tr>"
+            "<th style='text-align:right'>손익</th></tr>"
             f"{pf_tx_rows}</table>"
         )
     else:
@@ -858,6 +871,8 @@ def _render_html(data: dict) -> str:
         "coin_profile_analyst": "특성 분석가",
     }
     if agent_scores:
+        # 최근 5건 평가 이력에서 역할별 점수 추세 계산
+        experts_data_cache = data.get("agent_score_history", {})
         score_cards = '<div style="display:flex; gap:10px; flex-wrap:wrap;">'
         for role, name in _role_names.items():
             sc = agent_scores.get(role, 50.0)
@@ -867,16 +882,33 @@ def _render_html(data: dict) -> str:
                 sc_color = "#facc15"
             else:
                 sc_color = "#f87171"
+            # 추세 표기: 이전 점수 대비
+            history = experts_data_cache.get(role, [])
+            trend_html = ""
+            if len(history) >= 2:
+                recent5 = history[:5]
+                avg5 = sum(h["score"] for h in recent5) / len(recent5)
+                oldest = recent5[-1]["score"]
+                newest = recent5[0]["score"]
+                if newest > oldest + 1:
+                    trend_html = '<span style="color:#f87171;font-size:0.75rem;">▲</span>'
+                elif newest < oldest - 1:
+                    trend_html = '<span style="color:#60a5fa;font-size:0.75rem;">▼</span>'
+                else:
+                    trend_html = '<span style="color:#64748b;font-size:0.75rem;">—</span>'
+                avg_html = f'<div style="font-size:0.7rem;color:#64748b;margin-top:2px;">최근{len(recent5)}건 평균 {avg5:.0f}</div>'
+            else:
+                avg_html = ""
             score_cards += (
                 f'<div style="flex:1; min-width:120px; background:#0f172a; border-radius:8px; '
                 f'padding:12px; text-align:center; border:1px solid #334155;">'
                 f'<div style="font-size:0.75rem; color:#94a3b8;">{name}</div>'
-                f'<div style="font-size:1.6rem; font-weight:700; color:{sc_color};">{sc:.0f}</div>'
-                f'<div style="font-size:0.7rem; color:#475569;">/ 100</div>'
+                f'<div style="font-size:1.6rem; font-weight:700; color:{sc_color};">{sc:.0f}'
+                f'<span style="font-size:0.9rem;">{trend_html}</span></div>'
+                f'{avg_html}'
                 f'</div>'
             )
         score_cards += '</div>'
-        score_cards += '<div style="text-align:center; margin-top:8px; font-size:0.75rem; color:#475569;">상세: <a href="/experts" style="color:#38bdf8;">전문가 실적표 →</a></div>'
         agent_scores_html = score_cards
     else:
         agent_scores_html = '<div class="no-data">전문가 평가 데이터 없음<br>(6시간 주기 평가 후 표시)</div>'
@@ -941,7 +973,7 @@ def _render_html(data: dict) -> str:
 function showPfTx(idx) {
   var d = _pfTxPopup[idx];
   if (!d) return;
-  var pnlColor = d.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+  var pnlColor = d.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
   var sign = d.pnl_pct >= 0 ? '+' : '';
   var statusBadge = d.is_open
     ? '<span style="background:#1d4ed8;color:#bfdbfe;padding:2px 8px;border-radius:4px;font-size:0.78rem;">보유 중</span>'
@@ -955,8 +987,8 @@ function showPfTx(idx) {
   var buyFmt = d.total_buy_krw ? d.total_buy_krw.toLocaleString('ko-KR') + '원' : '—';
   var sellFmt = d.total_sell_krw ? d.total_sell_krw.toLocaleString('ko-KR') + '원' : '—';
   var pnlKrwFmt = d.pnl_krw ? (d.pnl_krw >= 0 ? '+' : '') + d.pnl_krw.toLocaleString('ko-KR') + '원' : '—';
-  var tpSlStr = (d.take_profit_pct ? '<span style="color:#4ade80">+' + d.take_profit_pct + '%</span>' : '—')
-    + ' / ' + (d.stop_loss_pct ? '<span style="color:#f87171">' + d.stop_loss_pct + '%</span>' : '—');
+  var tpSlStr = (d.take_profit_pct ? '<span style="color:#f87171">+' + d.take_profit_pct + '%</span>' : '—')
+    + ' / ' + (d.stop_loss_pct ? '<span style="color:#60a5fa">' + d.stop_loss_pct + '%</span>' : '—');
 
   var html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
     + '<span style="font-size:1rem;font-weight:700;">' + d.name + '</span>' + statusBadge + '</div>'
@@ -979,7 +1011,7 @@ function showPfTx(idx) {
         + '<th style="text-align:right;">수익률</th><th style="text-align:right;">손익(원)</th></tr>';
       for (var i = 0; i < d.coins.length; i++) {
         var c = d.coins[i];
-        var cc = c.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+        var cc = c.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
         html += '<tr><td><b>' + c.symbol + '</b></td>'
           + '<td style="text-align:right">' + (c.buy_price || 0).toLocaleString('ko-KR') + '</td>'
           + '<td style="text-align:right">' + (c.current_price || 0).toLocaleString('ko-KR') + '</td>'
@@ -995,7 +1027,7 @@ function showPfTx(idx) {
         + '<th style="text-align:right;">수익률</th></tr>';
       for (var j = 0; j < d.coins.length; j++) {
         var cr = d.coins[j];
-        var crc = cr.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+        var crc = cr.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
         html += '<tr><td><b>' + cr.symbol + '</b></td>'
           + '<td style="text-align:right">' + (cr.buy_krw || 0).toLocaleString('ko-KR') + '</td>'
           + '<td style="text-align:right">' + (cr.sell_krw || 0).toLocaleString('ko-KR') + '</td>'
@@ -1027,7 +1059,7 @@ document.addEventListener('DOMContentLoaded', function() {
 function showEvalDetail(idx) {
   var d = _evalPopup[idx];
   if (!d) return;
-  var pnlColor = d.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+  var pnlColor = d.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
   var sign = d.pnl_pct >= 0 ? '+' : '';
   document.getElementById('edm-content').innerHTML =
     '<div class="stat-row"><span class="stat-label">코인 / 결과</span>' +
@@ -1037,11 +1069,11 @@ function showEvalDetail(idx) {
     '<div class="stat-row"><span class="stat-label">보유 시간</span>' +
     '<span class="stat-value">' + d.held + '</span></div>' +
     '<div class="stat-row"><span class="stat-label">설정 TP / SL</span>' +
-    '<span class="stat-value"><span style="color:#4ade80">+' + d.orig_tp + '%</span>' +
-    ' / <span style="color:#f87171">' + d.orig_sl + '%</span></span></div>' +
+    '<span class="stat-value"><span style="color:#f87171">+' + d.orig_tp + '%</span>' +
+    ' / <span style="color:#60a5fa">' + d.orig_sl + '%</span></span></div>' +
     '<div class="stat-row"><span class="stat-label">제안 TP / SL</span>' +
-    '<span class="stat-value"><b><span style="color:#4ade80">+' + d.sug_tp + '%</span>' +
-    ' / <span style="color:#f87171">' + d.sug_sl + '%</span></b></span></div>' +
+    '<span class="stat-value"><b><span style="color:#f87171">+' + d.sug_tp + '%</span>' +
+    ' / <span style="color:#60a5fa">' + d.sug_sl + '%</span></b></span></div>' +
     (d.evaluation ? '<div style="margin-top:10px;padding:10px;background:#0f172a;' +
     'border-radius:6px;font-size:0.82rem;color:#94a3b8;white-space:pre-wrap;">' +
     d.evaluation + '</div>' : '') +
