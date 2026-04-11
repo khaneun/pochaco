@@ -61,45 +61,109 @@ class CoinSelector:
         snapshots: list[CoinSnapshot],
         target_tp: float = 2.0,
         cooldown_symbols: set[str] | None = None,
+        min_candidates: int = 8,
     ) -> tuple[list[CoinSnapshot], list[CoinScore]]:
         """매매 가능한 코인만 필터링 + 스코어링
+
+        포트폴리오 8개 구성을 위해 min_candidates 미만이면
+        변동폭 조건만 완화한 2차 패스로 보충합니다.
+        하락추세·거래대금 필터는 2차에서도 항상 유지됩니다.
 
         Args:
             snapshots: 전체 코인 스냅샷 목록
             target_tp: 현재 목표 익절% (StrategyOptimizer 기준)
             cooldown_symbols: 쿨다운 중인 심볼 집합 (재매수 금지)
+            min_candidates: 최소 반환 개수 (부족 시 변동폭 조건 완화)
 
         Returns:
             (필터링된 스냅샷 목록, 스코어 목록) — AI 프롬프트에 함께 전달
         """
         cooldown_symbols = cooldown_symbols or set()
+
+        # ── 1차 패스: 전체 필터 (변동폭 TP×1.5 포함) ──
+        scored, rejected = self._run_filter_pass(
+            snapshots, cooldown_symbols, target_tp, vol_multiplier=1.5,
+        )
+        scored.sort(key=lambda x: x[1].total_score, reverse=True)
+
+        # ── 2차 패스: 1차 통과 코인이 min_candidates 미만이면 변동폭 완화 보충 ──
+        if len(scored) < min_candidates:
+            passed_symbols = {sc.symbol for _, sc in scored}
+            # 2차: 변동폭 조건 TP×0.5 (하락추세·거래대금은 유지)
+            extra, _ = self._run_filter_pass(
+                [s for s in snapshots if s.symbol not in passed_symbols],
+                cooldown_symbols, target_tp, vol_multiplier=0.5,
+            )
+            extra.sort(key=lambda x: x[1].total_score, reverse=True)
+            need = min_candidates - len(scored)
+            scored.extend(extra[:need])
+            scored.sort(key=lambda x: x[1].total_score, reverse=True)
+            if extra:
+                logger.info(
+                    f"[CoinSelector] 2차 패스(변동폭 완화): "
+                    f"{len(extra[:need])}개 추가 보충"
+                )
+
+        # 상위 N개만 반환
+        top = scored[:_TOP_CANDIDATES]
+        result_snapshots = [s for s, _ in top]
+        result_scores = [sc for _, sc in top]
+
+        logger.info(
+            f"[CoinSelector] {len(snapshots)}개 중 {len(result_snapshots)}개 선별 "
+            f"(제외: {len(snapshots) - len(result_snapshots)}개, TP 기준: {target_tp}%)"
+        )
+        for sc in result_scores[:5]:
+            logger.info(
+                f"  #{result_scores.index(sc)+1} {sc.symbol}: "
+                f"score={sc.total_score:.2f} 변동폭={sc.volatility_pct:.1f}% "
+                f"모멘텀={sc.momentum:+.1f} 위치={sc.price_position:.0f}%"
+            )
+
+        return result_snapshots, result_scores
+
+    def _run_filter_pass(
+        self,
+        snapshots: list[CoinSnapshot],
+        cooldown_symbols: set[str],
+        target_tp: float,
+        vol_multiplier: float,
+    ) -> tuple[list[tuple[CoinSnapshot, "CoinScore"]], int]:
+        """단일 필터 패스 실행.
+
+        Args:
+            snapshots: 대상 스냅샷 목록
+            cooldown_symbols: 쿨다운 심볼
+            target_tp: 목표 익절%
+            vol_multiplier: 변동폭 조건 배수 (target_tp × multiplier)
+
+        Returns:
+            (통과 코인 리스트, 제외된 개수)
+        """
         scored: list[tuple[CoinSnapshot, CoinScore]] = []
         rejected = 0
+        min_volatility = target_tp * vol_multiplier
 
         for s in snapshots:
-            # ── 쿨다운 필터: 익절/손절 후 일정 시간 동일 종목 재매수 금지 ──
             if s.symbol in cooldown_symbols:
-                logger.info(f"  [쿨다운] {s.symbol}: 최근 매도 후 쿨다운 중 — 제외")
                 rejected += 1
                 continue
 
-            # ── 변동폭 계산 ──
             if s.high_price <= 0 or s.low_price <= 0:
                 rejected += 1
                 continue
             volatility_pct = (s.high_price - s.low_price) / s.low_price * 100
 
-            # ── 필터 1: 변동폭 부족 ──
-            min_volatility = target_tp * 1.5
+            # 변동폭 필터
             if volatility_pct < min_volatility:
                 logger.debug(
                     f"  [제외] {s.symbol}: 변동폭 {volatility_pct:.1f}% < "
-                    f"필요 {min_volatility:.1f}% (TP {target_tp}%×1.5)"
+                    f"필요 {min_volatility:.1f}% (TP {target_tp}%×{vol_multiplier})"
                 )
                 rejected += 1
                 continue
 
-            # ── 필터 2: 거래대금 부족 ──
+            # 거래대금 필터
             if s.volume_krw_24h < _MIN_VOLUME_KRW:
                 logger.debug(
                     f"  [제외] {s.symbol}: 거래대금 {s.volume_krw_24h/1e8:.0f}억 < 50억"
@@ -107,34 +171,27 @@ class CoinSelector:
                 rejected += 1
                 continue
 
-            # ── 필터 3: 하락 추세 (다중 기준 복합 판정) ──
+            # 하락 추세 필터 (항상 적용)
             is_down, down_reason = self._check_downtrend(s)
             if is_down:
                 logger.debug(f"  [제외] {s.symbol}: {down_reason}")
                 rejected += 1
                 continue
 
-            # ── 현재가 위치 (0=저가, 100=고가) ──
+            # 현재가 위치
             price_range = s.high_price - s.low_price
             price_position = (
                 (s.current_price - s.low_price) / price_range * 100
                 if price_range > 0 else 50.0
             )
 
-            # ── 캔들 모멘텀 분석 ──
             momentum = self._analyze_candle_momentum(s.candlestick_1h)
 
-            # ── 스코어링 ──
-            # 변동폭: 클수록 좋음 (기회 많음)
-            vol_score = min(volatility_pct / 2.0, 5.0)  # 0~5점
-            # 상승 추세: 양수일수록 좋음
-            trend_score = min(max(s.change_pct_24h, 0) * 2, 5.0)  # 0~5점
-            # 모멘텀: 최근 상승 추세
-            mom_score = max(momentum, 0) / 2.0  # 0~5점
-            # 거래량: 충분하면 가산
-            v_score = min(s.volume_krw_24h / 2e10, 3.0)  # 0~3점
-            # 현재가 위치: 고가 근처이되 너무 꼭대기가 아닌 60~80% 최적
-            pos_score = 2.0 if 50 <= price_position <= 80 else (
+            vol_score   = min(volatility_pct / 2.0, 5.0)
+            trend_score = min(max(s.change_pct_24h, 0) * 2, 5.0)
+            mom_score   = max(momentum, 0) / 2.0
+            v_score     = min(s.volume_krw_24h / 2e10, 3.0)
+            pos_score   = 2.0 if 50 <= price_position <= 80 else (
                 1.0 if 30 <= price_position <= 90 else 0.0
             )
 
@@ -153,30 +210,13 @@ class CoinSelector:
                 price_position=round(price_position, 1),
                 momentum=round(momentum, 2),
                 volume_score=round(v_score, 2),
-                reason=self._make_reason(volatility_pct, s.change_pct_24h, momentum, price_position),
+                reason=self._make_reason(
+                    volatility_pct, s.change_pct_24h, momentum, price_position
+                ),
             )
             scored.append((s, score))
 
-        # 스코어 상위 정렬
-        scored.sort(key=lambda x: x[1].total_score, reverse=True)
-
-        # 상위 N개만 반환
-        top = scored[:_TOP_CANDIDATES]
-        result_snapshots = [s for s, _ in top]
-        result_scores = [sc for _, sc in top]
-
-        logger.info(
-            f"[CoinSelector] {len(snapshots)}개 중 {len(result_snapshots)}개 선별 "
-            f"(제외: {rejected}개, TP 기준: {target_tp}%)"
-        )
-        for sc in result_scores[:5]:
-            logger.info(
-                f"  #{result_scores.index(sc)+1} {sc.symbol}: "
-                f"score={sc.total_score:.2f} 변동폭={sc.volatility_pct:.1f}% "
-                f"모멘텀={sc.momentum:+.1f} 위치={sc.price_position:.0f}%"
-            )
-
-        return result_snapshots, result_scores
+        return scored, rejected
 
     # ---------------------------------------------------------------- #
     #  하락 추세 판정 (다중 기준)                                          #
