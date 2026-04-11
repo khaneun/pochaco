@@ -169,6 +169,7 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                 "llm_provider": pf.llm_provider or "",
                 "coin_count": len(coins_data),
                 "coins": coins_data,
+                "opened_at": _to_kst(pf.opened_at).strftime("%m-%d %H:%M"),
             }
 
         # holdings — 포트폴리오 외 보유 코인
@@ -212,13 +213,20 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
         eval_stats = repo.get_evaluation_stats(last_n=10)
         evals_data = []
         for ev in recent_evals:
-            pnl_krw_est = round(ev.total_buy_krw * ev.pnl_pct / 100, 0) if ev.total_buy_krw else None
+            pnl_krw_est = round(ev.total_sell_krw - ev.total_buy_krw, 0) if ev.total_buy_krw else None
+            try:
+                ev_coins = json.loads(ev.coins_summary) if ev.coins_summary else []
+            except Exception:
+                ev_coins = []
             evals_data.append({
                 "time": _to_kst(ev.created_at).strftime("%m-%d %H:%M:%S"),
                 "portfolio_name": ev.portfolio_name,
                 "exit_type": ev.exit_type,
                 "pnl_pct": round(ev.pnl_pct, 2),
                 "pnl_krw": pnl_krw_est,
+                "total_buy_krw": round(ev.total_buy_krw, 0),
+                "total_sell_krw": round(ev.total_sell_krw, 0),
+                "coin_count": len(ev_coins),
                 "held_minutes": round(ev.held_minutes, 1),
                 "original_tp": ev.original_tp_pct,
                 "original_sl": ev.original_sl_pct,
@@ -226,7 +234,7 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                 "suggested_sl": ev.suggested_sl_pct,
                 "evaluation": ev.evaluation,
                 "lesson": ev.lesson or "",
-                "coins_summary": ev.coins_summary or "",
+                "coins": ev_coins,
             })
 
         # 포트폴리오 히스토리
@@ -511,10 +519,10 @@ document.addEventListener('DOMContentLoaded', function() {{
 
 {manual_trades_section}
 
-<!-- 거래 내역 -->
+<!-- 포트폴리오 거래 내역 -->
 <div style="padding: 0 20px 20px;">
   <div class="card">
-    <h2>🔄 최근 거래 내역</h2>
+    <h2>📋 포트폴리오 거래 내역</h2>
     {trades_html}
     <div class="pager" id="trade-pager">
       <button class="pg-prev">&laquo; 이전</button>
@@ -532,7 +540,8 @@ document.addEventListener('DOMContentLoaded', function() {{
   </div>
 </div>
 
-<script>var _evalPopup = {eval_js_data};</script>
+<script>var _evalPopup = {eval_js_data}; var _pfTxPopup = {portfolio_tx_js_data};</script>
+{portfolio_tx_modal}
 {eval_detail_modal}
 <footer>pochaco — AI 자동매매 시스템 &nbsp;|&nbsp; 데이터는 30초마다 갱신됩니다</footer>
 </body>
@@ -677,44 +686,104 @@ def _render_html(data: dict) -> str:
     else:
         position_html = '<div class="no-data">현재 활성 포트폴리오 없음<br>AI 포트폴리오 구성 대기 중...</div>'
 
-    # 거래 내역 HTML — 2줄 레이아웃
-    # 1행: 시간(2줄) / 심볼 / 가격 / 수량 / 금액
-    # 2행: 구분 배지 / 비고 [more 확장]
-    if data["recent_trades"]:
-        rows = ""
-        for t in data["recent_trades"]:
-            side_class = "badge-green" if t["side"] == "buy" else "badge-red"
-            side_label = "매수" if t["side"] == "buy" else "매도"
-            note = t["note"] or ""
-            # 시간 분리: "2026-04-03 14:16:54" → date / hms
-            t_parts = t["time"].split(" ")
-            t_date = t_parts[0] if len(t_parts) > 0 else t["time"]  # mm-dd
-            t_hms  = t_parts[1] if len(t_parts) > 1 else ""
-            note_html = _expandable(note, 35)
-            rows += (
-                f"<tr class='trade-row-main'>"
-                f"<td><span class='time-date'>{t_date}</span>"
-                f"<span class='time-hms'>{t_hms}</span></td>"
-                f"<td><b>{t['symbol']}</b></td>"
-                f"<td style='text-align:right'>{t['price']:,.0f}</td>"
-                f"<td style='text-align:right'>{t['units']:.2f}</td>"
-                f"<td style='text-align:right'>{t['krw_amount']:,.0f}</td>"
-                f"</tr>"
-                f"<tr class='trade-row-sub'>"
-                f'<td><span class="badge {side_class}">{side_label}</span></td>'
-                f"<td colspan='4'>{note_html}</td>"
-                f"</tr>"
-            )
+    # 포트폴리오 거래 내역 — 포트폴리오 단위 표시 (클릭 → 팝업)
+    pf_tx_popup_list: list[dict] = []
+    pf_tx_rows = ""
+
+    # 현재 보유 중인 포트폴리오 (최상단)
+    if pf:
+        idx = len(pf_tx_popup_list)
+        pf_tx_rows += (
+            f"<tr class='pf-tx-row' onclick='showPfTx({idx})' style='cursor:pointer;'>"
+            f"<td><span class='time-date'>{pf['opened_at']}</span>"
+            f"<span class='time-hms'>보유 중</span></td>"
+            f"<td><b>{pf['name']}</b>"
+            f"<span class='badge badge-green' style='margin-left:6px;font-size:0.7rem;'>매수</span></td>"
+            f"<td style='text-align:right'>{pf['coin_count']}</td>"
+            f"<td style='text-align:right'>{pf['total_buy_krw']:,.0f}</td>"
+            f"<td style='text-align:right'>—</td>"
+            f"<td style='text-align:right' class='{'green' if pf['pnl_pct'] >= 0 else 'red'}'>"
+            f"{pf['pnl_pct']:+.2f}%</td>"
+            f"</tr>"
+        )
+        pf_tx_popup_list.append({
+            "name": pf["name"],
+            "is_open": True,
+            "opened_at": pf["opened_at"],
+            "closed_at": None,
+            "coin_count": pf["coin_count"],
+            "total_buy_krw": pf["total_buy_krw"],
+            "total_sell_krw": None,
+            "pnl_pct": pf["pnl_pct"],
+            "pnl_krw": pf["pnl_krw"],
+            "held_minutes": pf["held_minutes"],
+            "exit_type": "open",
+            "take_profit_pct": pf["take_profit_pct"],
+            "stop_loss_pct": pf["stop_loss_pct"],
+            "coins": pf.get("coins", []),
+            "evaluation": "",
+            "lesson": "",
+        })
+
+    # 종료된 포트폴리오 (평가 기록 기반)
+    for ev in data.get("evaluations", []):
+        idx = len(pf_tx_popup_list)
+        pnl_color = "green" if ev["pnl_pct"] >= 0 else "red"
+        exit_kr = "익절" if ev["exit_type"] == "take_profit" else "손절"
+        exit_class = "badge-green" if ev["exit_type"] == "take_profit" else "badge-red"
+        t_parts = ev["time"].split(" ")
+        t_date = t_parts[0] if len(t_parts) > 0 else ev["time"]
+        t_hms  = t_parts[1] if len(t_parts) > 1 else ""
+        buy_krw = ev.get("total_buy_krw", 0)
+        sell_krw = ev.get("total_sell_krw", 0)
+        coin_count = ev.get("coin_count", "?")
+        pf_tx_rows += (
+            f"<tr class='pf-tx-row' onclick='showPfTx({idx})' style='cursor:pointer;'>"
+            f"<td><span class='time-date'>{t_date}</span>"
+            f"<span class='time-hms'>{t_hms}</span></td>"
+            f"<td><b>{ev['portfolio_name']}</b>"
+            f"<span class='badge {exit_class}' style='margin-left:6px;font-size:0.7rem;'>{exit_kr}</span></td>"
+            f"<td style='text-align:right'>{coin_count}</td>"
+            f"<td style='text-align:right'>{buy_krw:,.0f}</td>"
+            f"<td style='text-align:right'>{sell_krw:,.0f}</td>"
+            f"<td style='text-align:right' class='{pnl_color}'>{ev['pnl_pct']:+.2f}%</td>"
+            f"</tr>"
+        )
+        held = ev["held_minutes"]
+        held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
+        pf_tx_popup_list.append({
+            "name": ev["portfolio_name"],
+            "is_open": False,
+            "opened_at": "",
+            "closed_at": ev["time"],
+            "coin_count": coin_count,
+            "total_buy_krw": buy_krw,
+            "total_sell_krw": sell_krw,
+            "pnl_pct": ev["pnl_pct"],
+            "pnl_krw": ev.get("pnl_krw") or 0,
+            "held_str": held_str,
+            "exit_type": ev["exit_type"],
+            "take_profit_pct": ev.get("original_tp", ""),
+            "stop_loss_pct": ev.get("original_sl", ""),
+            "coins": ev.get("coins", []),
+            "evaluation": ev.get("evaluation", ""),
+            "lesson": ev.get("lesson", ""),
+        })
+
+    if pf_tx_rows:
         trades_html = (
             "<table id='trade-table'>"
-            "<tr><th>시간</th><th>심볼</th>"
-            "<th style='text-align:right'>가격(원)</th>"
-            "<th style='text-align:right'>수량</th>"
-            "<th style='text-align:right'>금액(원)</th></tr>"
-            f"{rows}</table>"
+            "<tr><th>시간</th><th>포트폴리오</th>"
+            "<th style='text-align:right'>종목</th>"
+            "<th style='text-align:right'>매수금액(원)</th>"
+            "<th style='text-align:right'>매도금액(원)</th>"
+            "<th style='text-align:right'>수익률</th></tr>"
+            f"{pf_tx_rows}</table>"
         )
     else:
-        trades_html = '<div class="no-data">거래 내역 없음</div>'
+        trades_html = '<div class="no-data">포트폴리오 거래 내역 없음</div>'
+
+    portfolio_tx_js_data = json.dumps(pf_tx_popup_list, ensure_ascii=False)
 
     # 성과 평가 HTML
     eval_stats = data.get("eval_stats", {})
@@ -847,9 +916,116 @@ def _render_html(data: dict) -> str:
     else:
         manual_trades_section = ""
 
+    # 포트폴리오 거래 팝업 모달 HTML
+    portfolio_tx_modal = (
+        '<div id="pf-tx-modal" style="display:none;position:fixed;inset:0;'
+        'background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center;">'
+        '<div style="background:#1e293b;border-radius:12px;border:1px solid #334155;'
+        'width:92%;max-width:640px;max-height:85vh;overflow:hidden;display:flex;flex-direction:column;">'
+        '<div style="padding:14px 20px;border-bottom:1px solid #334155;'
+        'display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">'
+        '<span style="font-size:1rem;font-weight:600;color:#e2e8f0;">📋 포트폴리오 상세</span>'
+        '<button onclick="closePfTx()" style="background:none;border:none;'
+        'color:#64748b;font-size:1.5rem;cursor:pointer;line-height:1;padding:2px 6px;">&#215;</button>'
+        '</div>'
+        '<div id="pf-tx-content" style="padding:16px 20px;font-size:0.85rem;overflow-y:auto;"></div>'
+        '<div style="padding:12px 20px;border-top:1px solid #334155;'
+        'display:flex;justify-content:flex-end;flex-shrink:0;">'
+        '<button onclick="closePfTx()" style="background:#334155;color:#e2e8f0;'
+        'border:none;border-radius:6px;padding:8px 18px;font-size:0.85rem;'
+        'font-weight:600;cursor:pointer;">닫기</button>'
+        '</div></div></div>'
+    )
+
     # eval 상세 팝업 JS (extra_js에 삽입 — 일반 문자열, 중괄호 이스케이프 불필요)
     extra_css = ""
     extra_js = """
+function showPfTx(idx) {
+  var d = _pfTxPopup[idx];
+  if (!d) return;
+  var pnlColor = d.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+  var sign = d.pnl_pct >= 0 ? '+' : '';
+  var statusBadge = d.is_open
+    ? '<span style="background:#1d4ed8;color:#bfdbfe;padding:2px 8px;border-radius:4px;font-size:0.78rem;">보유 중</span>'
+    : (d.exit_type === 'take_profit'
+      ? '<span style="background:#166534;color:#bbf7d0;padding:2px 8px;border-radius:4px;font-size:0.78rem;">익절</span>'
+      : '<span style="background:#991b1b;color:#fecaca;padding:2px 8px;border-radius:4px;font-size:0.78rem;">손절</span>');
+  var timeStr = d.is_open ? ('매수: ' + d.opened_at) : ('종료: ' + d.closed_at);
+  var heldStr = d.is_open
+    ? (d.held_minutes >= 60 ? (d.held_minutes / 60).toFixed(1) + '시간' : Math.round(d.held_minutes) + '분')
+    : (d.held_str || '—');
+  var buyFmt = d.total_buy_krw ? d.total_buy_krw.toLocaleString('ko-KR') + '원' : '—';
+  var sellFmt = d.total_sell_krw ? d.total_sell_krw.toLocaleString('ko-KR') + '원' : '—';
+  var pnlKrwFmt = d.pnl_krw ? (d.pnl_krw >= 0 ? '+' : '') + d.pnl_krw.toLocaleString('ko-KR') + '원' : '—';
+  var tpSlStr = (d.take_profit_pct ? '<span style="color:#4ade80">+' + d.take_profit_pct + '%</span>' : '—')
+    + ' / ' + (d.stop_loss_pct ? '<span style="color:#f87171">' + d.stop_loss_pct + '%</span>' : '—');
+
+  var html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
+    + '<span style="font-size:1rem;font-weight:700;">' + d.name + '</span>' + statusBadge + '</div>'
+    + '<div class="stat-row"><span class="stat-label">시간</span><span class="stat-value">' + timeStr + '</span></div>'
+    + '<div class="stat-row"><span class="stat-label">보유 시간</span><span class="stat-value">' + heldStr + '</span></div>'
+    + '<div class="stat-row"><span class="stat-label">종목 수</span><span class="stat-value">' + d.coin_count + '개</span></div>'
+    + '<div class="stat-row"><span class="stat-label">매수 금액</span><span class="stat-value">' + buyFmt + '</span></div>'
+    + '<div class="stat-row"><span class="stat-label">매도 금액</span><span class="stat-value">' + sellFmt + '</span></div>'
+    + '<div class="stat-row"><span class="stat-label">수익률</span><span class="stat-value" style="color:' + pnlColor + '">' + sign + d.pnl_pct.toFixed(2) + '%</span></div>'
+    + '<div class="stat-row"><span class="stat-label">손익(원)</span><span class="stat-value" style="color:' + pnlColor + '">' + pnlKrwFmt + '</span></div>'
+    + '<div class="stat-row"><span class="stat-label">TP / SL 설정</span><span class="stat-value">' + tpSlStr + '</span></div>';
+
+  // 코인 상세 테이블
+  if (d.coins && d.coins.length > 0) {
+    html += '<div style="margin-top:12px;font-size:0.8rem;color:#94a3b8;font-weight:600;">코인별 상세</div>';
+    if (d.is_open) {
+      html += '<table style="margin-top:6px;width:100%;font-size:0.8rem;">'
+        + '<tr style="color:#64748b;"><th style="text-align:left;">코인</th>'
+        + '<th style="text-align:right;">매수가</th><th style="text-align:right;">현재가</th>'
+        + '<th style="text-align:right;">수익률</th><th style="text-align:right;">손익(원)</th></tr>';
+      for (var i = 0; i < d.coins.length; i++) {
+        var c = d.coins[i];
+        var cc = c.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+        html += '<tr><td><b>' + c.symbol + '</b></td>'
+          + '<td style="text-align:right">' + (c.buy_price || 0).toLocaleString('ko-KR') + '</td>'
+          + '<td style="text-align:right">' + (c.current_price || 0).toLocaleString('ko-KR') + '</td>'
+          + '<td style="text-align:right;color:' + cc + '">' + (c.pnl_pct >= 0 ? '+' : '') + (c.pnl_pct || 0).toFixed(2) + '%</td>'
+          + '<td style="text-align:right;color:' + cc + '">' + (c.pnl_krw >= 0 ? '+' : '') + (c.pnl_krw || 0).toLocaleString('ko-KR') + '</td>'
+          + '</tr>';
+      }
+      html += '</table>';
+    } else {
+      html += '<table style="margin-top:6px;width:100%;font-size:0.8rem;">'
+        + '<tr style="color:#64748b;"><th style="text-align:left;">코인</th>'
+        + '<th style="text-align:right;">매수(원)</th><th style="text-align:right;">매도(원)</th>'
+        + '<th style="text-align:right;">수익률</th></tr>';
+      for (var j = 0; j < d.coins.length; j++) {
+        var cr = d.coins[j];
+        var crc = cr.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+        html += '<tr><td><b>' + cr.symbol + '</b></td>'
+          + '<td style="text-align:right">' + (cr.buy_krw || 0).toLocaleString('ko-KR') + '</td>'
+          + '<td style="text-align:right">' + (cr.sell_krw || 0).toLocaleString('ko-KR') + '</td>'
+          + '<td style="text-align:right;color:' + crc + '">' + (cr.pnl_pct >= 0 ? '+' : '') + (cr.pnl_pct || 0).toFixed(2) + '%</td>'
+          + '</tr>';
+      }
+      html += '</table>';
+    }
+  }
+
+  if (d.evaluation) {
+    html += '<div style="margin-top:10px;padding:10px;background:#0f172a;border-radius:6px;'
+      + 'font-size:0.82rem;color:#94a3b8;white-space:pre-wrap;">' + d.evaluation + '</div>';
+  }
+  if (d.lesson) {
+    html += '<div style="margin-top:8px;font-size:0.78rem;color:#64748b;font-style:italic;">' + d.lesson + '</div>';
+  }
+
+  document.getElementById('pf-tx-content').innerHTML = html;
+  document.getElementById('pf-tx-modal').style.display = 'flex';
+}
+function closePfTx() {
+  document.getElementById('pf-tx-modal').style.display = 'none';
+}
+document.addEventListener('DOMContentLoaded', function() {
+  var ptm = document.getElementById('pf-tx-modal');
+  if (ptm) ptm.addEventListener('click', function(e) { if (e.target === this) closePfTx(); });
+});
 function showEvalDetail(idx) {
   var d = _evalPopup[idx];
   if (!d) return;
@@ -926,6 +1102,8 @@ document.addEventListener('DOMContentLoaded', function() {
         agent_scores_html=agent_scores_html,
         eval_js_data=eval_js_data,
         eval_detail_modal=eval_detail_modal,
+        portfolio_tx_js_data=portfolio_tx_js_data,
+        portfolio_tx_modal=portfolio_tx_modal,
         manual_trades_section=manual_trades_section,
         extra_css=extra_css,
         extra_js=extra_js,

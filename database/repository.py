@@ -474,12 +474,12 @@ class TradeRepository:
                 w_sum = sum(weights)
                 w_tp = sum(e.suggested_tp_pct * w for e, w in zip(evals, weights)) / w_sum
 
-                tp_clamp_min = max(1.5, round(w_tp - 1.0, 1))
-                tp_clamp_max = min(6.5, round(w_tp + 1.5, 1))
+                tp_clamp_min = max(4.0, round(w_tp - 1.0, 1))
+                tp_clamp_max = min(10.0, round(w_tp + 1.5, 1))
                 sl_clamp_min = -2.0
                 sl_clamp_max = -1.0
             else:
-                tp_clamp_min, tp_clamp_max = 2.0, 6.0
+                tp_clamp_min, tp_clamp_max = 4.0, 8.0
                 sl_clamp_min, sl_clamp_max = -2.0, -1.0
 
             return {
