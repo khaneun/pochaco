@@ -165,6 +165,7 @@ class AgentCoordinator:
         snapshots: list[CoinSnapshot],
         eval_stats: dict | None = None,
         coin_scores: list[CoinScore] | None = None,
+        krw_balance: float = 0.0,
     ) -> PortfolioDecision:
         """시장 분석 → 자산 배분 → 8개 코인 포트폴리오 선정 파이프라인"""
 
@@ -189,6 +190,7 @@ class AgentCoordinator:
         alloc_result = self._agents["asset_manager"].execute({
             "market_condition": condition,
             "eval_stats": eval_stats,
+            "krw_balance": krw_balance,
         })
         allocation = alloc_result.get("allocation", AllocationDecision(
             should_invest=True, invest_ratio=0.85, reason="기본 배분",

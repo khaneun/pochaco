@@ -311,6 +311,7 @@ class TradingEngine:
         # AI 포트폴리오 선정
         decision: PortfolioDecision = self._agent.select_portfolio(
             filtered, eval_stats=eval_stats, coin_scores=coin_scores,
+            krw_balance=krw,
         )
         symbols_str = ", ".join(c.symbol for c in decision.coins)
         logger.info(
