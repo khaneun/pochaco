@@ -258,7 +258,7 @@ class BuyStrategist(BaseSpecialistAgent):
     @staticmethod
     def _eval_stats_to_text(stats: dict) -> str:
         """평가 통계를 프롬프트용 텍스트로 변환"""
-        if not stats:
+        if not stats or stats.get("count", 0) == 0:
             return ""
         lines = [
             "\n**[과거 포트폴리오 성과 — 이 데이터를 기반으로 전략을 결정하세요]**",
