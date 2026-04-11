@@ -4,7 +4,7 @@
 - 1차 손절(SL1): -0.5%~-1.5% — 빠르게 인지, 50% 매도 후 반등 대기
 - 2차 손절(SL2): -1.0%~-2.5% — 나머지 전량 매도 (신속 탈출)
 - 실효 최대 손실 = SL1×50% + SL2×50% ≈ -1.5% 수준 (타이트 리스크 관리)
-- 익절 진입: 4.0%+ 도달 시 트레일링 시작 (10%+ 수익 목표)
+- 익절 진입: 5.0%+ 도달 시 트레일링 시작 (12%+ 수익 목표)
   · 5~7%: 오프셋 0.8% | 7~10%: 오프셋 1.2% | 10~15%: 오프셋 1.8% | 15%+: 오프셋 2.5%
 - 즉각 반영: 매매 완료 즉시 분석 → 다음 파라미터 즉시 갱신
 
@@ -25,8 +25,8 @@ class StrategyParams:
     """전략 파라미터 묶음 — 포트폴리오 레벨 (최대 손절 -2%)"""
     target_tp: float = 5.0       # 포트폴리오 익절% (트레일링 시작점)
     target_sl: float = -1.5      # 포트폴리오 권고 손절% (최대 -2.0%)
-    tp_clamp_min: float = 3.0    # 익절 허용 최솟값
-    tp_clamp_max: float = 8.0    # 익절 허용 최댓값
+    tp_clamp_min: float = 5.0    # 익절 허용 최솟값
+    tp_clamp_max: float = 10.0   # 익절 허용 최댓값
     sl_clamp_min: float = -2.0   # 손절 허용 최솟값 (하드캡)
     sl_clamp_max: float = -0.5   # 손절 허용 최댓값
     rationale: str = "기본 파라미터 (포트폴리오: 분할매도 -1%/-1.5%/-2%, 익절 5%+ 트레일링)"
@@ -158,23 +158,23 @@ class StrategyOptimizer:
 
         if consecutive_losses >= 3 and avg_loss_size > 1.5:
             # 시장 악화 시 익절을 소폭 낮춰 빠른 수익 실현
-            target_tp = max(4.0, target_tp - 0.5)
-            tp_max = min(tp_max, 8.0)
+            target_tp = max(5.0, target_tp - 0.5)
+            tp_max = min(tp_max, 10.0)
         elif avg_hold > 240:
-            target_tp = max(4.0, target_tp - 1.0)
-            tp_max = min(tp_max, 7.0)
+            target_tp = max(5.0, target_tp - 1.0)
+            tp_max = min(tp_max, 9.0)
         elif avg_hold > 120:
-            target_tp = max(4.0, target_tp - 0.5)
+            target_tp = max(5.0, target_tp - 0.5)
         elif win_rate >= 0.6 and avg_pnl > 2.0:
             # 잘 되고 있으면 익절 목표 상향
             target_tp = min(10.0, target_tp + 0.5)
             tp_max = min(12.0, tp_max + 1.0)
 
         return StrategyParams(
-            target_tp=max(3.0, min(10.0, round(target_tp, 1))),
+            target_tp=max(5.0, min(12.0, round(target_tp, 1))),
             target_sl=max(-2.0, min(-0.5, round(target_sl, 1))),
-            tp_clamp_min=max(2.0, round(tp_min, 1)),
-            tp_clamp_max=min(10.0, round(tp_max, 1)),
+            tp_clamp_min=max(4.0, round(tp_min, 1)),
+            tp_clamp_max=min(12.0, round(tp_max, 1)),
             sl_clamp_min=max(-2.0, round(sl_min, 1)),
             sl_clamp_max=min(-0.5, round(sl_max, 1)),
             rationale=rationale,
@@ -223,15 +223,15 @@ class StrategyOptimizer:
 **지시:**
 위 데이터를 분석해 다음 포트폴리오에 즉시 적용할 파라미터를 결정하세요.
 - 손절은 -2.0% 이내. 빠른 탈출이 핵심
-- 익절은 3%+ 진입 후 트레일링으로 수익 극대화
+- 익절은 5%+ 진입 후 트레일링으로 수익 극대화
 - 보유 시간이 길면 익절 진입점 낮추기
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이):
 {{
-  "target_tp": 권고익절%(숫자, 3.0~8.0 범위),
+  "target_tp": 권고익절%(숫자, 5.0~12.0 범위),
   "target_sl": 권고손절%(음수숫자, -2.0~-0.5 범위),
-  "tp_clamp_min": 익절허용최솟값(숫자, 2.0~4.0),
-  "tp_clamp_max": 익절허용최댓값(숫자, 5.0~10.0),
+  "tp_clamp_min": 익절허용최솟값(숫자, 4.0~6.0),
+  "tp_clamp_max": 익절허용최댓값(숫자, 7.0~12.0),
   "sl_clamp_min": 손절허용최솟값(음수, -2.0),
   "sl_clamp_max": 손절허용최댓값(음수, -0.5~-1.0),
   "rationale": "결정 이유 (한국어, 80자 이내)",
@@ -244,14 +244,14 @@ class StrategyOptimizer:
         clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         data = json.loads(clean)
 
-        target_tp = max(3.0, min(10.0, float(data["target_tp"])))
+        target_tp = max(5.0, min(12.0, float(data["target_tp"])))
         target_sl = float(data["target_sl"])
         if target_sl > 0:
             target_sl = -abs(target_sl)
         target_sl = max(-2.0, min(-0.5, target_sl))
 
-        tp_min = max(2.0, min(5.0, float(data["tp_clamp_min"])))
-        tp_max = max(tp_min + 2.0, min(10.0, float(data["tp_clamp_max"])))
+        tp_min = max(4.0, min(6.0, float(data["tp_clamp_min"])))
+        tp_max = max(tp_min + 2.0, min(12.0, float(data["tp_clamp_max"])))
 
         sl_min = float(data["sl_clamp_min"])
         sl_max = float(data["sl_clamp_max"])

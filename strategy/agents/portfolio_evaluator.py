@@ -34,7 +34,7 @@ class PortfolioEvaluator(BaseSpecialistAgent):
             "3. SL 적정성: 반등 없이 연쇄 매도되었으면 시장 판단 오류\n"
             "4. 보유 시간 효율: 2시간 이상 보유하고 소폭 수익이면 TP 낮추기 권고\n\n"
             "【제안 원칙 — 반드시 준수】\n"
-            "- suggested_tp: 2.0%~10.0% (현실적 목표 설정. 8코인 평균이므로 보수적으로)\n"
+            "- suggested_tp: 4.0%~12.0% (수익 극대화를 위해 높은 목표 유지. 최소 4.0% 사수)\n"
             "- suggested_sl: -2.0%~-0.5% (너무 좁으면 빈번한 손절, 너무 넓으면 큰 손실)\n"
             "- lesson은 매수 전문가가 읽을 핵심 한 줄. 구체적이어야 합니다.\n"
             "- 연속 손절 중이라면 → TP를 낮추고 SL은 현재 유지 권고 (빠른 수익 실현)"
@@ -124,14 +124,14 @@ class PortfolioEvaluator(BaseSpecialistAgent):
 
 **평가 관점:**
 1. 포트폴리오 분산 효과 — 8개 코인 중 승자/패자 비율이 어떠한가?
-2. 익절이 너무 높아서 도달하지 못했는가? → 낮추기 (단, 최소 2.0% 유지)
+2. 익절이 너무 높아서 도달하지 못했는가? → 낮추기 (단, 최소 4.0% 유지)
 3. 손절이 너무 좁아서 반등 기회 없이 매도되었는가? → 소폭 넓히기 (최대 -2.0%)
 4. 보유 시간이 길었다면 익절을 낮춰 빠른 트레일링 진입 도모
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{
   "evaluation": "이번 포트폴리오에 대한 평가 (한국어, 200자 이내)",
-  "suggested_tp_pct": 다음포트폴리오추천익절퍼센트(숫자, 2.0~10.0 범위),
+  "suggested_tp_pct": 다음포트폴리오추천익절퍼센트(숫자, 4.0~12.0 범위),
   "suggested_sl_pct": 다음포트폴리오추천손절퍼센트(음수, -2.0~-0.5 범위),
   "lesson": "핵심 교훈 한 줄 (한국어, 50자 이내)"
 }}"""
@@ -148,8 +148,8 @@ class PortfolioEvaluator(BaseSpecialistAgent):
             suggested_tp = float(data.get("suggested_tp_pct", original_tp))
             suggested_sl = float(data.get("suggested_sl_pct", original_sl))
 
-            # ── 안전장치: TP 2~10%, SL 최대 -2.0% ──
-            suggested_tp = max(2.0, min(10.0, suggested_tp))
+            # ── 안전장치: TP 4~12%, SL 최대 -2.0% ──
+            suggested_tp = max(4.0, min(12.0, suggested_tp))
             if suggested_sl > 0:
                 suggested_sl = -abs(suggested_sl)
             suggested_sl = max(-2.0, min(-0.5, suggested_sl))

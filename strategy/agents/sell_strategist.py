@@ -32,7 +32,7 @@ class SellStrategist(BaseSpecialistAgent):
             "★ 보유 30분 미만: 조기 조정은 불필요. adjust=false 권장.\n"
             "★ 보유 1~2시간 + 수익 없음: 익절선 소폭 하향(-0.5%) 고려\n"
             "★ 보유 2시간+ + 손실 중: 익절선 적극 하향, 빠른 탈출 유도\n"
-            "★ 보유 4시간+: 기회비용 심각. 익절 최소 +1.5%까지 낮춰야 함\n"
+            "★ 보유 4시간+: 기회비용 심각. 익절 최소 +3.0%까지 낮춰야 함\n"
             "★ 분할 매도가 이미 진행된 상태: 남은 물량 빠르게 처리 권장\n\n"
             "【절대 원칙】\n"
             "- 손절 하드캡 -2.0%는 절대 변경할 수 없음 (시스템 레벨 제한)\n"
@@ -104,7 +104,7 @@ class SellStrategist(BaseSpecialistAgent):
 **시간 기반 가이드라인:** {time_guidance}
 
 **조정 원칙:**
-- 익절은 낮추는 방향 — 오래 보유할수록 익절 낮추기 (최소 +1.5% 유지)
+- 익절은 낮추는 방향 — 오래 보유할수록 익절 낮추기 (최소 +3.0% 유지)
 - 손절은 -2.0%를 절대 초과할 수 없음 (하드캡)
 - 분할 매도가 이미 진행되었다면 남은 물량의 빠른 처리를 고려
 - 포트폴리오 내 대부분 코인이 하락 중이면 익절을 낮추어 빠른 탈출 권장
@@ -126,8 +126,8 @@ class SellStrategist(BaseSpecialistAgent):
                 new_tp = float(data.get("new_take_profit_pct", original_tp))
                 new_sl = float(data.get("new_stop_loss_pct", original_sl))
 
-                # ── 안전장치: TP 1.5~12%, SL 최대 -2.0% ──
-                new_tp = max(1.5, min(12.0, new_tp))
+                # ── 안전장치: TP 3.0~12%, SL 최대 -2.0% ──
+                new_tp = max(3.0, min(12.0, new_tp))
                 if new_sl > 0:
                     new_sl = -abs(new_sl)
                 new_sl = max(-2.0, min(-0.5, new_sl))
