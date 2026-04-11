@@ -627,7 +627,17 @@ class TradingEngine:
                         krw_amount=krw_value, note=reason,
                         portfolio_id=portfolio.id,
                     )
-                    logger.info(f"  {pos.symbol} {sell_units:.6f}개 매도 ({krw_value:,.0f}원)")
+                    # 잔여 수량·투입금액 업데이트 — P&L 기준 보정
+                    remaining_units = actual_units - sell_units
+                    remaining_ratio = remaining_units / actual_units if actual_units > 0 else 0.0
+                    remaining_buy_krw = pos.buy_krw * remaining_ratio
+                    self._repo.update_position_after_partial_sell(
+                        pos.id, remaining_units, remaining_buy_krw,
+                    )
+                    logger.info(
+                        f"  {pos.symbol} {sell_units:.6f}개 매도 ({krw_value:,.0f}원) "
+                        f"잔여={remaining_units:.6f}개 ({remaining_buy_krw:,.0f}원 기준)"
+                    )
                 else:
                     logger.warning(f"  {pos.symbol} 분할 매도 실패: {result}")
             except Exception as e:

@@ -117,7 +117,12 @@ def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator |
                     coin_value = actual_units * cur
                     coin_pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100 if pos.buy_price > 0 else 0
                     coin_pnl_krw = (cur - pos.buy_price) * actual_units
-                    total_buy += pos.buy_krw
+                    # 분할 매도 후 actual_units < pos.units 인 경우 cost basis 비례 조정
+                    if pos.units > 0 and actual_units < pos.units * 0.99:
+                        effective_buy_krw = pos.buy_krw * (actual_units / pos.units)
+                    else:
+                        effective_buy_krw = pos.buy_krw
+                    total_buy += effective_buy_krw
                     total_current += coin_value
                     coins_data.append({
                         "symbol": pos.symbol,

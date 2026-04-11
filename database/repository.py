@@ -160,6 +160,16 @@ class TradeRepository:
             db.expunge_all()
             return rows
 
+    def update_position_after_partial_sell(
+        self, position_id: int, remaining_units: float, remaining_buy_krw: float,
+    ) -> None:
+        """분할 매도 후 잔여 수량·투입금액 업데이트 (P&L 기준 보정)"""
+        with self._session() as db:
+            pos = db.query(Position).filter(Position.id == position_id).first()
+            if pos:
+                pos.units = remaining_units
+                pos.buy_krw = remaining_buy_krw
+
     def close_position(self, position_id: int) -> None:
         with self._session() as db:
             pos = db.query(Position).filter(Position.id == position_id).first()
