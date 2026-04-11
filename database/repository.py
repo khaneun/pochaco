@@ -224,6 +224,23 @@ class TradeRepository:
             db.expunge_all()
             return rows
 
+    def get_portfolio_sell_total(self, portfolio_id: int) -> float:
+        """포트폴리오의 전체 매도 금액 합산 (분할 매도 포함).
+
+        Args:
+            portfolio_id: 포트폴리오 ID
+
+        Returns:
+            해당 포트폴리오의 sell side 거래 krw_amount 합계
+        """
+        with self._session() as db:
+            trades = (
+                db.query(Trade)
+                .filter(Trade.portfolio_id == portfolio_id, Trade.side == "sell")
+                .all()
+            )
+            return sum(t.krw_amount for t in trades)
+
     # ------------------------------------------------------------------ #
     #  DailyReport                                                         #
     # ------------------------------------------------------------------ #

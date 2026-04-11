@@ -893,12 +893,18 @@ class TradingEngine:
 
             coins_summary_json = json.dumps(coin_results, ensure_ascii=False)
 
+            # 분할 매도(tier1/tier2)까지 포함한 전체 매도 금액 계산
+            total_sell_all = self._repo.get_portfolio_sell_total(portfolio.id)
+            if total_sell_all < total_sell_krw:
+                # Trade 테이블 미반영 시 최종 매도분 fallback
+                total_sell_all = total_sell_krw
+
             adj = self._last_adjustment or {}
             self._repo.save_evaluation(
                 portfolio_id=portfolio.id,
                 portfolio_name=portfolio.name,
                 total_buy_krw=portfolio.total_buy_krw,
-                total_sell_krw=total_sell_krw,
+                total_sell_krw=total_sell_all,
                 pnl_pct=pnl_pct,
                 held_minutes=held_minutes,
                 exit_type=exit_type,

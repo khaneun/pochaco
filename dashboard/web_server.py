@@ -700,8 +700,6 @@ def _render_html(data: dict) -> str:
             f"<td><b>{pf['name']}</b>"
             f"<span class='badge badge-green' style='margin-left:6px;font-size:0.7rem;'>매수</span></td>"
             f"<td style='text-align:right'>{pf['coin_count']}</td>"
-            f"<td style='text-align:right'>{pf['total_buy_krw']:,.0f}</td>"
-            f"<td style='text-align:right'>—</td>"
             f"<td style='text-align:right' class='{'green' if pf['pnl_pct'] >= 0 else 'red'}'>"
             f"{pf['pnl_pct']:+.2f}%</td>"
             f"</tr>"
@@ -737,6 +735,8 @@ def _render_html(data: dict) -> str:
         buy_krw = ev.get("total_buy_krw", 0)
         sell_krw = ev.get("total_sell_krw", 0)
         coin_count = ev.get("coin_count", "?")
+        pnl_krw = ev.get("pnl_krw") or 0
+        pnl_krw_str = f"{pnl_krw:+,.0f}원" if pnl_krw != 0 else "—"
         pf_tx_rows += (
             f"<tr class='pf-tx-row' onclick='showPfTx({idx})' style='cursor:pointer;'>"
             f"<td><span class='time-date'>{t_date}</span>"
@@ -744,9 +744,8 @@ def _render_html(data: dict) -> str:
             f"<td><b>{ev['portfolio_name']}</b>"
             f"<span class='badge {exit_class}' style='margin-left:6px;font-size:0.7rem;'>{exit_kr}</span></td>"
             f"<td style='text-align:right'>{coin_count}</td>"
-            f"<td style='text-align:right'>{buy_krw:,.0f}</td>"
-            f"<td style='text-align:right'>{sell_krw:,.0f}</td>"
             f"<td style='text-align:right' class='{pnl_color}'>{ev['pnl_pct']:+.2f}%</td>"
+            f"<td style='text-align:right' class='{pnl_color}'>{pnl_krw_str}</td>"
             f"</tr>"
         )
         held = ev["held_minutes"]
@@ -775,9 +774,8 @@ def _render_html(data: dict) -> str:
             "<table id='trade-table'>"
             "<tr><th>시간</th><th>포트폴리오</th>"
             "<th style='text-align:right'>종목</th>"
-            "<th style='text-align:right'>매수금액(원)</th>"
-            "<th style='text-align:right'>매도금액(원)</th>"
-            "<th style='text-align:right'>수익률</th></tr>"
+            "<th style='text-align:right'>수익률</th>"
+            "<th style='text-align:right'>손익(원)</th></tr>"
             f"{pf_tx_rows}</table>"
         )
     else:
