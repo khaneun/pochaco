@@ -224,6 +224,30 @@ class TradeRepository:
             db.expunge_all()
             return rows
 
+    def get_coin_sell_total(self, portfolio_id: int, symbol: str) -> float:
+        """특정 코인의 포트폴리오 내 전체 매도 금액 합산.
+
+        분할 매도가 완료된 코인의 실제 수익을 계산할 때 사용.
+
+        Args:
+            portfolio_id: 포트폴리오 ID
+            symbol: 코인 심볼
+
+        Returns:
+            해당 코인의 sell side 거래 krw_amount 합계
+        """
+        with self._session() as db:
+            trades = (
+                db.query(Trade)
+                .filter(
+                    Trade.portfolio_id == portfolio_id,
+                    Trade.symbol == symbol,
+                    Trade.side == "sell",
+                )
+                .all()
+            )
+            return sum(t.krw_amount for t in trades)
+
     def get_portfolio_sell_total(self, portfolio_id: int) -> float:
         """포트폴리오의 전체 매도 금액 합산 (분할 매도 포함).
 

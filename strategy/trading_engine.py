@@ -449,9 +449,9 @@ class TradingEngine:
             except Exception as e:
                 fail_count = self._price_fail_count.get(pos.symbol, 0) + 1
                 self._price_fail_count[pos.symbol] = fail_count
-                logger.warning(f"[시세 조회 실패] {pos.symbol} ({fail_count}회): {e}")
+                logger.warning(f"[시세 조회 실패] {pos.symbol} ({fail_count}회): {e} — 매수가 fallback")
                 current_price = pos.buy_price
-                current_value = pos.buy_krw
+                current_value = pos.buy_krw  # 가격 조회 실패 시 P&L 0으로 처리 (최소 손실 추정)
 
             coin_pnl_pct = (
                 (current_price - pos.buy_price) / pos.buy_price * 100
@@ -630,7 +630,17 @@ class TradingEngine:
                     continue
 
                 sell_units = actual_units * ratio
-                current_price = self._client.get_current_price(pos.symbol)
+
+                # 시세 조회 — 실패 시 매수가 fallback (0원 저장 방지)
+                try:
+                    current_price = self._client.get_current_price(pos.symbol)
+                except Exception as price_err:
+                    current_price = pos.buy_price
+                    logger.warning(
+                        f"  {pos.symbol} 분할매도 시세 조회 실패({price_err})"
+                        f" — 매수가 {current_price:,.0f}원으로 대체"
+                    )
+
                 krw_value = sell_units * current_price
 
                 if krw_value < settings.MIN_ORDER_KRW:
@@ -687,24 +697,45 @@ class TradingEngine:
         total_sell_krw = 0.0
         coin_results = []
 
+        # 직전 감시 루프에서 계산된 가격 — 시세 재조회 실패 시 fallback용
+        detail_price_map: dict[str, float] = {
+            d["symbol"]: d["current_price"]
+            for d in coin_details
+            if d.get("current_price", 0) > 0
+        }
+
         for pos in positions:
             try:
                 actual_units = self._client.get_coin_balance(pos.symbol)
                 if actual_units <= 0:
-                    # 이미 분할 매도로 전부 팔림
+                    # 이미 분할 매도로 전부 팔림 — Trade 테이블에서 실제 수익 조회
+                    coin_sell_krw = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
+                    coin_pnl = (
+                        (coin_sell_krw - pos.buy_krw) / pos.buy_krw * 100
+                        if pos.buy_krw > 0 else 0.0
+                    )
                     coin_results.append({
                         "symbol": pos.symbol,
                         "buy_price": pos.buy_price,
                         "buy_krw": pos.buy_krw,
-                        "sell_price": pos.buy_price,
-                        "sell_krw": 0,
-                        "pnl_pct": 0,
+                        "sell_price": 0,
+                        "sell_krw": round(coin_sell_krw, 0),
+                        "pnl_pct": round(coin_pnl, 2),
                         "reason": pos.agent_reason or "",
                     })
                     self._repo.close_position(pos.id)
                     continue
 
-                current_price = self._client.get_current_price(pos.symbol)
+                # 시세 조회 — 실패 시 fallback 체인: 직전가 → 매수가
+                try:
+                    current_price = self._client.get_current_price(pos.symbol)
+                except Exception as price_err:
+                    current_price = detail_price_map.get(pos.symbol, 0) or pos.buy_price
+                    logger.warning(
+                        f"  {pos.symbol} 전량매도 시세 조회 실패({price_err})"
+                        f" — {current_price:,.0f}원으로 대체"
+                    )
+
                 krw_value = actual_units * current_price
 
                 result = self._client.market_sell(pos.symbol, actual_units)
@@ -721,16 +752,14 @@ class TradingEngine:
                     logger.warning(f"  {pos.symbol} 매도 실패: {result}")
                     total_sell_krw += pos.buy_krw  # 실패 시 매수가 기준
 
-                coin_pnl = (
-                    (current_price - pos.buy_price) / pos.buy_price * 100
-                    if pos.buy_price > 0 else 0
-                )
+                # coin pnl은 매수금액 대비 실제 매도금액으로 계산 (price 오류 영향 제거)
+                coin_pnl = (krw_value - pos.buy_krw) / pos.buy_krw * 100 if pos.buy_krw > 0 else 0
                 coin_results.append({
                     "symbol": pos.symbol,
                     "buy_price": pos.buy_price,
                     "buy_krw": pos.buy_krw,
                     "sell_price": current_price,
-                    "sell_krw": krw_value,
+                    "sell_krw": round(krw_value, 0),
                     "pnl_pct": round(coin_pnl, 2),
                     "reason": pos.agent_reason or "",
                 })
@@ -893,11 +922,16 @@ class TradingEngine:
 
             coins_summary_json = json.dumps(coin_results, ensure_ascii=False)
 
-            # 분할 매도(tier1/tier2)까지 포함한 전체 매도 금액 계산
+            # 분할 매도(tier1/tier2)까지 포함한 전체 매도 금액 계산 (Trade 테이블 기준)
             total_sell_all = self._repo.get_portfolio_sell_total(portfolio.id)
             if total_sell_all < total_sell_krw:
-                # Trade 테이블 미반영 시 최종 매도분 fallback
                 total_sell_all = total_sell_krw
+
+            # 실제 매도 기준으로 pnl_pct 재계산 (시세 조회 오류 영향 제거)
+            actual_pnl_pct = (
+                (total_sell_all - portfolio.total_buy_krw) / portfolio.total_buy_krw * 100
+                if portfolio.total_buy_krw > 0 else pnl_pct
+            )
 
             adj = self._last_adjustment or {}
             self._repo.save_evaluation(
@@ -905,7 +939,7 @@ class TradingEngine:
                 portfolio_name=portfolio.name,
                 total_buy_krw=portfolio.total_buy_krw,
                 total_sell_krw=total_sell_all,
-                pnl_pct=pnl_pct,
+                pnl_pct=actual_pnl_pct,
                 held_minutes=held_minutes,
                 exit_type=exit_type,
                 original_tp_pct=portfolio.take_profit_pct,

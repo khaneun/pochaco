@@ -285,8 +285,18 @@ class BithumbClient:
         return float(data["data"].get(key, 0))
 
     def get_current_price(self, symbol: str) -> float:
-        """현재 시장가(closing_price) 반환"""
+        """현재 시장가(closing_price) 반환
+
+        Returns:
+            0 초과의 실제 가격
+
+        Raises:
+            RuntimeError: API 실패 또는 가격이 0원 이하인 경우
+        """
         data = self.get_ticker(symbol)
         if data.get("status") != "0000":
             raise RuntimeError(f"시세 조회 실패: {data}")
-        return float(data["data"]["closing_price"])
+        price = float(data["data"]["closing_price"])
+        if price <= 0:
+            raise RuntimeError(f"비정상 시세 (0원): {symbol}")
+        return price
