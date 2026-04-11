@@ -20,7 +20,7 @@ from core import BithumbClient
 from database import TradeRepository
 from database.models import Portfolio, Position
 from strategy.ai_agent import PortfolioDecision
-from strategy.agent_coordinator import AgentCoordinator
+from strategy.agent_coordinator import AgentCoordinator, InvestmentHoldError
 from strategy.market_analyzer import MarketAnalyzer
 from strategy.strategy_optimizer import StrategyOptimizer
 from strategy.coin_selector import CoinSelector
@@ -37,6 +37,8 @@ _MAX_HOLD_MINUTES = 720  # 12시간
 _BUY_INTERVAL_SEC = 0.5
 # 포트폴리오 최소 코인 수 (이 이하면 생성 실패)
 _MIN_PORTFOLIO_COINS = 3
+# 투자 보류 시 대기 시간 (분) — 자산 운용가가 보류 결정 후 재평가까지 대기
+_HOLD_WAIT_MINUTES = 30
 
 
 # ================================================================== #
@@ -309,10 +311,26 @@ class TradingEngine:
             coin_scores = []
 
         # AI 포트폴리오 선정
-        decision: PortfolioDecision = self._agent.select_portfolio(
-            filtered, eval_stats=eval_stats, coin_scores=coin_scores,
-            krw_balance=krw,
-        )
+        try:
+            decision: PortfolioDecision = self._agent.select_portfolio(
+                filtered, eval_stats=eval_stats, coin_scores=coin_scores,
+                krw_balance=krw,
+            )
+        except InvestmentHoldError as e:
+            hold_reason = str(e)
+            logger.info(f"[투자 보류] {_HOLD_WAIT_MINUTES}분 대기: {hold_reason}")
+            if self._notifier:
+                try:
+                    self._notifier.send(
+                        f"⏸️ <b>중요 알람</b> — 투자 보류\n"
+                        f"{hold_reason}\n"
+                        f"⏱ {_HOLD_WAIT_MINUTES}분 후 시장 재평가"
+                    )
+                except Exception:
+                    pass
+            time.sleep(_HOLD_WAIT_MINUTES * 60)
+            return
+
         symbols_str = ", ".join(c.symbol for c in decision.coins)
         logger.info(
             f"[포트폴리오 선정] [{symbols_str}] "

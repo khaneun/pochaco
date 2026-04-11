@@ -26,6 +26,14 @@ _KST = timezone(timedelta(hours=9))
 logger = logging.getLogger(__name__)
 
 
+class InvestmentHoldError(Exception):
+    """자산 운용가가 투자 보류를 결정했을 때 발생하는 예외.
+
+    일반 오류(RuntimeError)와 구분하여, TradingEngine이
+    '중요 알람' 발송 + 지정 대기 후 조용히 재시도하도록 처리합니다.
+    """
+
+
 class AgentCoordinator:
     """7개 전문가 Agent를 오케스트레이션하는 코디네이터 (포트폴리오 기반)"""
 
@@ -204,9 +212,7 @@ class AgentCoordinator:
         )
 
         if not allocation.should_invest:
-            raise RuntimeError(
-                f"[자산 운용가 판단] 투자 보류: {allocation.reason}"
-            )
+            raise InvestmentHoldError(allocation.reason)
 
         # 3) 특성 분석가 — 후보 코인별 프로파일 수집
         coin_profiles: dict[str, str] = {}
