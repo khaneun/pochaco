@@ -22,7 +22,7 @@ strategy/
     buy_strategist.py    # 매수 전문가 (코인 선정·TP/SL 결정)
     sell_strategist.py   # 매도 전문가 (보유 중 TP/SL 동적 조정)
     portfolio_evaluator.py # 포트폴리오 평가가 (매매 성과 분석·파라미터 제안)
-    meta_evaluator.py    # 총괄 평가가 (6시간 주기 전문가 평가·점수화·피드백)
+    meta_evaluator.py    # 총괄 평가가 (3시간 주기 전문가 평가·점수화·피드백)
   agent_coordinator.py   # AgentCoordinator — 6개 Agent 오케스트레이션
   ai_agent.py            # 데이터 클래스 (AgentDecision, TradeEvaluation) + 레거시 TradingAgent
   trading_engine.py      # 핵심 매매 루프 + 스마트 매도 상태 머신
@@ -35,7 +35,7 @@ database/
   models.py              # SQLAlchemy ORM (Trade, Position, DailyReport, StrategyEvaluation, AgentScore, AgentDecisionLog)
   repository.py          # Thread-safe CRUD (전문가 점수·의사결정 로그 포함)
   backup.py              # SQLite 자동 백업
-scheduler/jobs.py        # APScheduler (리포트, 백업, 6시간 총괄 평가)
+scheduler/jobs.py        # APScheduler (리포트, 백업, 3시간 총괄 평가)
 dashboard/
   terminal_ui.py         # Rich 터미널 실시간 대시보드
   web_server.py          # HTTP 웹 대시보드 (종합 + 전문가 실적표 2페이지)
@@ -124,7 +124,7 @@ logger.error(f"[오류 설명] {e}", exc_info=True)
 # strategy/agents/ — BaseSpecialistAgent를 상속하는 6개 전문가
 # strategy/agent_coordinator.py — 오케스트레이터
 # 매매 파이프라인: MarketAnalyst → AssetManager → BuyStrategist → (보유) → SellStrategist → PortfolioEvaluator
-# 6시간 주기: MetaEvaluator가 5개 전문가 평가 → feedback_prompt 동적 주입
+# 3시간 주기: MetaEvaluator가 5개 전문가 평가 → feedback_prompt 동적 주입
 
 coordinator.select_coin(snapshots, eval_stats, coin_scores)   # 시장분석→배분→코인선정
 coordinator.should_adjust_strategy(...)                        # 매도 전문가 조정

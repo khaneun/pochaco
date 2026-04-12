@@ -132,7 +132,7 @@ class StrategyEvaluation(Base):
 
 
 class AgentScore(Base):
-    """전문가별 점수 기록 (6시간 주기 총괄 평가)"""
+    """전문가별 점수 기록 (3시간 주기 총괄 평가)"""
     __tablename__ = "agent_scores"
 
     id = Column(Integer, primary_key=True, autoincrement=True)

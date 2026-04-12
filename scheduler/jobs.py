@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class TradingScheduler:
-    """일별 성과 기록, SQLite 백업, 6시간 총괄 평가 스케줄러"""
+    """일별 성과 기록, SQLite 백업, 3시간 총괄 평가 스케줄러"""
 
     def __init__(
         self,
@@ -47,16 +47,16 @@ class TradingScheduler:
             id="db_backup",
             replace_existing=True,
         )
-        # 6시간마다 총괄 전문가 평가 (0, 6, 12, 18시)
+        # 3시간마다 총괄 전문가 평가 (0, 3, 6, 9, 12, 15, 18, 21시)
         if self._coordinator:
             self._scheduler.add_job(
                 self._job_meta_evaluation,
-                CronTrigger(hour="0,6,12,18", minute=0),
+                CronTrigger(hour="0,3,6,9,12,15,18,21", minute=0),
                 id="meta_evaluation",
                 replace_existing=True,
             )
         self._scheduler.start()
-        meta_str = " / 0·6·12·18시 총괄평가" if self._coordinator else ""
+        meta_str = " / 3시간 주기 총괄평가" if self._coordinator else ""
         logger.info(f"스케줄러 시작 (23:50 백업 / 23:55 리포트{meta_str})")
 
     def stop(self) -> None:
@@ -127,10 +127,10 @@ class TradingScheduler:
             logger.error(f"일별 리포트 저장 실패: {e}")
 
     # ------------------------------------------------------------------ #
-    #  총괄 전문가 평가 (6시간 주기)                                         #
+    #  총괄 전문가 평가 (3시간 주기)                                         #
     # ------------------------------------------------------------------ #
     def _job_meta_evaluation(self) -> None:
-        """0, 6, 12, 18시에 실행 — 5개 전문가를 종합 평가"""
+        """3시간 주기(0,3,6,...,21시) 실행 — 5개 전문가를 종합 평가"""
         try:
             feedbacks = self._coordinator.run_meta_evaluation()
             logger.info(f"[총괄 평가] {len(feedbacks)}개 Agent 평가 완료")

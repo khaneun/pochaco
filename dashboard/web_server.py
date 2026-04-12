@@ -997,7 +997,7 @@ def _render_html(data: dict) -> str:
         score_cards += '</div>'
         agent_scores_html = score_cards
     else:
-        agent_scores_html = '<div class="no-data">전문가 평가 데이터 없음<br>(6시간 주기 평가 후 표시)</div>'
+        agent_scores_html = '<div class="no-data">전문가 평가 데이터 없음<br>(3시간 주기 평가 후 표시)</div>'
 
     # 수동 청산 이력 HTML
     manual_list = data.get("manual_trades", [])
@@ -2008,7 +2008,7 @@ function closeCoinProfile() {
 <div style="padding:20px;">
   <h2 style="color:#e2e8f0; margin-bottom:16px; font-size:1.1rem;">전문가 Agent 실적표</h2>
   <p style="color:#64748b; font-size:0.82rem; margin-bottom:20px;">
-    6시간 주기(0·6·12·18시) 총괄 평가가가 각 전문가를 평가합니다.
+    3시간 주기(0·3·6·9·12·15·18·21시) 총괄 평가가가 각 전문가를 평가합니다.
     잘하는 부분은 강화, 못하는 부분은 강한 피드백을 부여합니다.
   </p>
   <div style="display:flex; gap:16px; flex-wrap:wrap;">

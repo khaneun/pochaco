@@ -498,13 +498,13 @@ class AgentCoordinator:
         return evaluation
 
     # ------------------------------------------------------------------ #
-    #  총괄 평가 (6시간 주기, 스케줄러에서 호출)                               #
+    #  총괄 평가 (3시간 주기, 스케줄러에서 호출)                               #
     # ------------------------------------------------------------------ #
     def run_meta_evaluation(self) -> list[AgentFeedback]:
         """전체 전문가 평가 실행 → 피드백 주입 + DB 저장"""
         logger.info("[Coordinator] 총괄 평가 시작...")
 
-        decision_logs = self._repo.get_recent_decision_logs(hours=6)
+        decision_logs = self._repo.get_recent_decision_logs(hours=3)
         recent_evals = self._repo.get_recent_evaluations(limit=10)
         current_scores = self.get_agent_scores()
 

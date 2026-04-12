@@ -1,6 +1,6 @@
 """총괄 전문가 평가가
 
-6시간마다 5개 전문가를 종합 평가하고 피드백+점수를 부여합니다.
+3시간마다 5개 전문가를 종합 평가하고 피드백+점수를 부여합니다.
 각 전문가의 다음 판단에 직접 삽입될 구체적인 개선 지시(directive)를 작성합니다.
 """
 import logging
@@ -86,7 +86,7 @@ class MetaEvaluator(BaseSpecialistAgent):
 
         Args:
             context: {
-                "decision_logs": list,    # 최근 6시간 의사결정 기록
+                "decision_logs": list,    # 최근 3시간 의사결정 기록
                 "trade_results": list,    # 최근 매매 결과
                 "current_scores": dict,   # 각 agent 현재 점수 {role: score}
             }
@@ -104,7 +104,7 @@ class MetaEvaluator(BaseSpecialistAgent):
             trade_results_text = self._format_trade_results(trade_results)
             current_scores_text = self._format_current_scores(current_scores)
 
-            task_prompt = f"""최근 6시간 전문가별 의사결정 기록:
+            task_prompt = f"""최근 3시간 전문가별 의사결정 기록:
 {decision_logs_text}
 
 최근 포트폴리오 매매 결과:
