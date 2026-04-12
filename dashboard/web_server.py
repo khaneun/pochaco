@@ -339,20 +339,24 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .badge-green {{ background: #450a0a; color: #f87171; }}
   .badge-red   {{ background: #1e3a5f; color: #60a5fa; }}
   .badge-open  {{ background: #14532d; color: #86efac; }}
-  /* 포트폴리오 거래 카드 */
-  .pf-tx-list  {{ display: flex; flex-direction: column; }}
-  .pf-tx-card  {{ padding: 10px 12px; border-bottom: 1px solid #1e293b;
-                  cursor: pointer; transition: background 0.1s; }}
-  .pf-tx-card:hover {{ background: rgba(51, 65, 85, 0.4); }}
-  .pf-tx-card.pf-tx-open {{ background: rgba(34, 197, 94, 0.06);
-                            border-left: 3px solid #22c55e; padding-left: 9px; }}
-  .pf-tx-line1 {{ display: flex; align-items: center; gap: 10px; }}
-  .pf-tx-line1 .pf-tx-time {{ color: #64748b; font-size: 0.78rem;
-                              min-width: 110px; }}
-  .pf-tx-line1 .pf-tx-name {{ flex: 1; font-size: 0.9rem; }}
-  .pf-tx-line2 {{ display: flex; gap: 14px; margin-top: 5px;
-                  font-size: 0.78rem; color: #94a3b8; padding-left: 110px; }}
-  .pf-tx-line2 .pnl {{ margin-left: auto; font-weight: 600; }}
+  /* 포트폴리오 거래 1줄 행 */
+  .pf-tx-list {{ display: flex; flex-direction: column; }}
+  .pf-tx-row  {{ display: flex; align-items: center; padding: 7px 12px;
+                 border-bottom: 1px solid #1e293b; cursor: pointer;
+                 transition: background 0.1s; gap: 10px; }}
+  .pf-tx-row:hover {{ background: rgba(51,65,85,0.4); }}
+  .pf-tx-row.pf-tx-open {{ background: rgba(34,197,94,0.06);
+                           border-left: 3px solid #22c55e; padding-left: 9px; }}
+  .pf-tx-dt   {{ min-width: 44px; text-align: center; line-height: 1.35; flex-shrink: 0; }}
+  .pf-tx-dt b {{ display: block; color: #fff; font-size: 0.78rem; font-weight: 600; }}
+  .pf-tx-dt small {{ display: block; color: #64748b; font-size: 0.7rem; }}
+  .pf-tx-nm   {{ flex: 1; font-size: 0.88rem; min-width: 0; white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }}
+  .pf-tx-held {{ color: #94a3b8; font-size: 0.75rem; min-width: 44px;
+                 text-align: right; white-space: nowrap; flex-shrink: 0; }}
+  .pf-tx-pnl  {{ min-width: 74px; text-align: right; line-height: 1.35; flex-shrink: 0; }}
+  .pf-tx-pnl-r {{ font-size: 0.88rem; font-weight: 700; }}
+  .pf-tx-pnl-k {{ font-size: 0.7rem; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
   th {{ color: #64748b; text-align: left; padding: 6px 8px;
         border-bottom: 1px solid #334155; font-weight: 500; }}
@@ -780,18 +784,19 @@ def _render_html(data: dict) -> str:
         idx = len(pf_tx_popup_list)
         open_pnl_krw = pf["pnl_krw"]
         open_pnl_color = "green" if open_pnl_krw > 0 else ("red" if open_pnl_krw < 0 else "gray")
-        open_pnl_str = f"{open_pnl_krw:+,.0f}원 ({pf['pnl_pct']:+.2f}%)"
         held_str_open = _fmt_held(pf["held_minutes"])
+        _dt_parts = pf["opened_at"].split(" ")
+        _dt_date = _dt_parts[0] if _dt_parts else ""
+        _dt_time = _dt_parts[1] if len(_dt_parts) > 1 else ""
         pf_tx_cards += (
-            f"<div class='pf-tx-card pf-tx-open' onclick='showPfTx({idx})'>"
-            f"<div class='pf-tx-line1'>"
-            f"<span class='pf-tx-time'>{pf['opened_at']}</span>"
-            f"<span class='pf-tx-name'><b>[{pf['coin_count']}] {pf['name']}</b></span>"
+            f"<div class='pf-tx-row pf-tx-open' onclick='showPfTx({idx})'>"
+            f"<div class='pf-tx-dt'><b>{_dt_date}</b><small>{_dt_time}</small></div>"
+            f"<div class='pf-tx-nm'><b>[{pf['coin_count']}] {pf['name']}</b></div>"
+            f"<span class='pf-tx-held'>⏱ {held_str_open}</span>"
             f"<span class='badge badge-open'>보유중</span>"
-            f"</div>"
-            f"<div class='pf-tx-line2'>"
-            f"<span>⏱ {held_str_open}</span>"
-            f"<span class='pnl {open_pnl_color}'>{open_pnl_str}</span>"
+            f"<div class='pf-tx-pnl'>"
+            f"<div class='pf-tx-pnl-r {open_pnl_color}'>{pf['pnl_pct']:+.2f}%</div>"
+            f"<div class='pf-tx-pnl-k {open_pnl_color}'>{open_pnl_krw:+,.0f}원</div>"
             f"</div>"
             f"</div>"
         )
@@ -822,21 +827,20 @@ def _render_html(data: dict) -> str:
         coin_count = ev.get("coin_count", "?")
         pnl_krw = ev.get("pnl_krw") or 0
         pnl_color = "green" if pnl_krw > 0 else ("red" if pnl_krw < 0 else "gray")
-        pnl_cell = (
-            f"{pnl_krw:+,.0f}원 ({ev['pnl_pct']:+.2f}%)" if pnl_krw != 0
-            else f"{ev['pnl_pct']:+.2f}%"
-        )
         held_str_closed = _fmt_held(ev["held_minutes"])
+        _dt_parts = ev["time"].split(" ")
+        _dt_date = _dt_parts[0] if _dt_parts else ""
+        _dt_time_raw = _dt_parts[1] if len(_dt_parts) > 1 else ""
+        _dt_time = ":".join(_dt_time_raw.split(":")[:2])  # 초 제거
         pf_tx_cards += (
-            f"<div class='pf-tx-card' onclick='showPfTx({idx})'>"
-            f"<div class='pf-tx-line1'>"
-            f"<span class='pf-tx-time'>{ev['time']}</span>"
-            f"<span class='pf-tx-name'><b>[{coin_count}] {ev['portfolio_name']}</b></span>"
+            f"<div class='pf-tx-row' onclick='showPfTx({idx})'>"
+            f"<div class='pf-tx-dt'><b>{_dt_date}</b><small>{_dt_time}</small></div>"
+            f"<div class='pf-tx-nm'><b>[{coin_count}] {ev['portfolio_name']}</b></div>"
+            f"<span class='pf-tx-held'>⏱ {held_str_closed}</span>"
             f"<span class='badge {exit_class}'>{exit_kr}</span>"
-            f"</div>"
-            f"<div class='pf-tx-line2'>"
-            f"<span>⏱ {held_str_closed}</span>"
-            f"<span class='pnl {pnl_color}'>{pnl_cell}</span>"
+            f"<div class='pf-tx-pnl'>"
+            f"<div class='pf-tx-pnl-r {pnl_color}'>{ev['pnl_pct']:+.2f}%</div>"
+            f"<div class='pf-tx-pnl-k {pnl_color}'>{pnl_krw:+,.0f}원</div>"
             f"</div>"
             f"</div>"
         )
