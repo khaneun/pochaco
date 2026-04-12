@@ -368,22 +368,38 @@ class TradeRepository:
             return sorted(by_date.values(), key=lambda x: x["date"], reverse=True)
 
     def get_total_stats(self) -> dict:
-        """전체 누적 통계 (포트폴리오 기반)"""
+        """전체 누적 통계 (포트폴리오 기반).
+
+        승/패 판정은 StrategyEvaluation.exit_type 기준 (포트폴리오 1건 = 1승 or 1패).
+        Trade.note 문자열 검색은 1포트폴리오=8코인 구조에서 단위 불일치를 유발하므로 사용하지 않음.
+        """
         with self._session() as db:
             all_trades = db.query(Trade).all()
-            sell_trades = [t for t in all_trades if t.side == "sell"]
 
-            win_count = sum(1 for t in sell_trades if "익절" in (t.note or ""))
-            loss_count = sum(1 for t in sell_trades if "손절" in (t.note or ""))
+            # ── 포트폴리오 단위 승/패 (StrategyEvaluation 기준) ──
+            evals = db.query(StrategyEvaluation).all()
+            win_count = 0
+            loss_count = 0
+            for e in evals:
+                if e.exit_type == "take_profit":
+                    win_count += 1
+                elif e.exit_type in ("stop_loss", "timeout"):
+                    loss_count += 1
+                elif e.exit_type == "manual":
+                    # 수동 청산은 P&L 기준 판정
+                    if (e.pnl_pct or 0) > 0:
+                        win_count += 1
+                    else:
+                        loss_count += 1
 
-            # 포트폴리오 사이클 수 기준
+            total_cycles = win_count + loss_count
+
+            # 평균 보유 시간은 Portfolio 테이블 기준
             closed_pf = (
                 db.query(Portfolio)
                 .filter(Portfolio.is_open == False, Portfolio.closed_at.isnot(None))
                 .all()
             )
-            total_cycles = len(closed_pf)
-
             hold_minutes = [
                 (pf.closed_at - pf.opened_at).total_seconds() / 60
                 for pf in closed_pf if pf.opened_at and pf.closed_at

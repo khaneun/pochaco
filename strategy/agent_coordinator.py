@@ -514,6 +514,9 @@ class AgentCoordinator:
                 "pnl_pct": ev.pnl_pct,
                 "exit_type": ev.exit_type,
                 "held_minutes": ev.held_minutes,
+                # 익절/손절 시 기술 지표 맥락 포함 → MetaEvaluator 패턴 학습용
+                "evaluation": (ev.evaluation or "")[:200],
+                "lesson": ev.lesson or "",
             }
             for ev in recent_evals
         ]

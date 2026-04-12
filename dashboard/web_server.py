@@ -1638,11 +1638,21 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
             f'</div>'
         )
 
+        # Tools 배지 (외부 API 사용 전문가)
+        tools_badge = ""
+        if role == "market_analyst":
+            tools_badge = (
+                '<span title="Binance Futures · Bybit Public API" '
+                'style="background:#0c4a6e; color:#38bdf8; padding:2px 6px; '
+                'border-radius:4px; font-size:0.65rem; font-weight:600; '
+                'margin-left:6px; vertical-align:middle; cursor:default;">🔗 Tools</span>'
+            )
+
         cards += (
             f'<div style="background:#1e293b; border-radius:12px; padding:20px; '
             f'border:1px solid #334155; flex:1; min-width:280px;">'
             f'<div style="display:flex; justify-content:space-between; align-items:center;">'
-            f'<span style="font-size:1rem;">{a["emoji"]} {name}</span>'
+            f'<span style="font-size:1rem;">{a["emoji"]} {name}{tools_badge}</span>'
             f'{delta_str}'
             f'</div>'
             f'<div style="text-align:center; margin:12px 0;">'

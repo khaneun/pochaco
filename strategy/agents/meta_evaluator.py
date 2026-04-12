@@ -235,7 +235,7 @@ JSON으로만 응답 (마크다운 코드블록 없이):
 
     @staticmethod
     def _format_trade_results(results: list) -> str:
-        """매매 결과를 텍스트로 변환"""
+        """매매 결과를 텍스트로 변환 (익절 시 기술 지표 맥락 포함)"""
         if not results:
             return "최근 매매 없음"
 
@@ -252,6 +252,14 @@ JSON으로만 응답 (마크다운 코드블록 없이):
                 lines.append(
                     f"{i}. {label}: {exit_kr} {pnl:+.2f}% (보유 {held:.0f}분)"
                 )
+                # 익절 시 기술 지표 맥락 → 시장 분석가 directive에 반영할 패턴 학습
+                evaluation = (r.get("evaluation") or "").strip()
+                if exit_type == "take_profit" and evaluation:
+                    lines.append(f"   ✅ 익절 당시 분석: {evaluation[:150]}")
+                # 교훈 (익절/손절 모두 포함)
+                lesson = (r.get("lesson") or "").strip()
+                if lesson:
+                    lines.append(f"   💡 교훈: {lesson[:100]}")
             else:
                 lines.append(f"{i}. {r}")
         return "\n".join(lines)
