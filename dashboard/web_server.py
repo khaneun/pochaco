@@ -939,9 +939,11 @@ def _render_html(data: dict) -> str:
     _role_names = {
         "market_analyst": "시장 분석가",
         "asset_manager": "자산 운용가",
+        "investment_strategist": "투자 전문가",
         "buy_strategist": "매수 전문가",
         "sell_strategist": "매도 전문가",
         "portfolio_evaluator": "포트폴리오 평가가",
+        "meta_evaluator": "총괄 평가가",
         "coin_profile_analyst": "특성 분석가",
     }
     if agent_scores:
@@ -1217,9 +1219,11 @@ document.addEventListener('DOMContentLoaded', function() {
 _ROLE_DISPLAY = {
     "market_analyst": ("시장 분석가", "📊"),
     "asset_manager": ("자산 운용가", "💰"),
+    "investment_strategist": ("투자 전문가", "🚀"),
     "buy_strategist": ("매수 전문가", "🎯"),
     "sell_strategist": ("매도 전문가", "📉"),
     "portfolio_evaluator": ("포트폴리오 평가가", "📋"),
+    "meta_evaluator": ("총괄 평가가", "⚖️"),
     "coin_profile_analyst": ("특성 분석가", "🔍"),
 }
 
