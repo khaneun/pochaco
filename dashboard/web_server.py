@@ -943,7 +943,6 @@ def _render_html(data: dict) -> str:
         "buy_strategist": "매수 전문가",
         "sell_strategist": "매도 전문가",
         "portfolio_evaluator": "포트폴리오 평가가",
-        "meta_evaluator": "총괄 평가가",
         "coin_profile_analyst": "특성 분석가",
     }
     if agent_scores:
@@ -1223,7 +1222,6 @@ _ROLE_DISPLAY = {
     "buy_strategist": ("매수 전문가", "🎯"),
     "sell_strategist": ("매도 전문가", "📉"),
     "portfolio_evaluator": ("포트폴리오 평가가", "📋"),
-    "meta_evaluator": ("총괄 평가가", "⚖️"),
     "coin_profile_analyst": ("특성 분석가", "🔍"),
 }
 
@@ -1270,9 +1268,33 @@ def _build_experts_data(coordinator: "AgentCoordinator | None") -> dict:
 
             agents_data.append(agent_info)
 
+        # ── 총괄 평가가 보고서: 가장 최근 평가 일시 + 전 Agent 지시 요약 ──
+        # latest_scores 의 created_at 중 가장 최신이 마지막 메타평가 시각
+        meta_report: dict | None = None
+        scored_entries = [s for s in latest_scores if s.directive]
+        if scored_entries:
+            latest_eval_time = max(s.created_at for s in scored_entries)
+            _name_map = {r: n for r, (n, _) in _ROLE_DISPLAY.items()}
+            rows = []
+            for s in sorted(scored_entries, key=lambda x: x.created_at, reverse=False):
+                rows.append({
+                    "role": s.agent_role,
+                    "display_name": _name_map.get(s.agent_role, s.agent_role),
+                    "score": round(s.score, 1),
+                    "priority": s.priority or "improve",
+                    "directive": s.directive or "",
+                    "strengths": s.strengths or "",
+                    "weaknesses": s.weaknesses or "",
+                })
+            meta_report = {
+                "evaluated_at": _to_kst(latest_eval_time).strftime("%Y-%m-%d %H:%M"),
+                "rows": rows,
+            }
+
         return {
             "updated_at": _kst_now().strftime("%m-%d %H:%M:%S"),
             "agents": agents_data,
+            "meta_report": meta_report,
         }
     finally:
         repo.close()
@@ -1282,6 +1304,75 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
     """전문가 실적표 HTML 페이지 렌더링"""
     data = _build_experts_data(coordinator)
     version = _VERSION
+
+    # ── 총괄 평가가 보고서 HTML ──
+    meta_report = data.get("meta_report")
+    if meta_report:
+        _priority_cfg = {
+            "critical": ("개선 시급", "#f87171", "#450a0a"),
+            "improve":  ("개선 필요", "#facc15", "#422006"),
+            "reinforce":("강화 유지", "#4ade80", "#14532d"),
+        }
+        report_rows_html = ""
+        for row in meta_report["rows"]:
+            sc = row["score"]
+            sc_color = "#4ade80" if sc >= 70 else "#facc15" if sc >= 40 else "#f87171"
+            p_label, p_fg, p_bg = _priority_cfg.get(
+                row["priority"], ("개선 필요", "#facc15", "#422006")
+            )
+            badge = (
+                f'<span style="background:{p_bg}; color:{p_fg}; padding:2px 7px; '
+                f'border-radius:4px; font-size:0.72rem; font-weight:600; '
+                f'white-space:nowrap;">{p_label}</span>'
+            )
+            directive_html = ""
+            if row["directive"]:
+                directive_html = (
+                    f'<div style="margin-top:5px; color:#94a3b8; font-size:0.78rem; '
+                    f'font-style:italic; border-left:2px solid #334155; padding-left:8px;">'
+                    f'→ {row["directive"]}</div>'
+                )
+            sw_html = ""
+            if row["strengths"] or row["weaknesses"]:
+                sw_html = '<div style="display:flex; gap:12px; margin-top:5px; font-size:0.76rem;">'
+                if row["strengths"]:
+                    sw_html += f'<span style="color:#4ade80;">✓ {row["strengths"]}</span>'
+                if row["weaknesses"]:
+                    sw_html += f'<span style="color:#f87171;">✗ {row["weaknesses"]}</span>'
+                sw_html += "</div>"
+            report_rows_html += (
+                f'<div style="padding:10px 0; border-bottom:1px solid #1e293b;">'
+                f'<div style="display:flex; align-items:center; gap:10px;">'
+                f'<span style="font-weight:600; color:#e2e8f0; min-width:110px;">'
+                f'{row["display_name"]}</span>'
+                f'<span style="font-size:1.1rem; font-weight:700; color:{sc_color}; '
+                f'min-width:36px; text-align:right;">{sc:.0f}</span>'
+                f'<span style="color:#475569; font-size:0.75rem;">/ 100</span>'
+                f'{badge}'
+                f'</div>'
+                f'{sw_html}'
+                f'{directive_html}'
+                f'</div>'
+            )
+        meta_report_html = (
+            f'<div style="background:#1a2535; border:1px solid #334155; border-radius:12px; '
+            f'padding:20px; margin-bottom:28px;">'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; '
+            f'margin-bottom:14px; padding-bottom:12px; border-bottom:2px solid #334155;">'
+            f'<span style="font-size:1rem; font-weight:700; color:#e2e8f0;">⚖️ 총괄 평가가 최신 보고서</span>'
+            f'<span style="font-size:0.8rem; color:#64748b;">{meta_report["evaluated_at"]} 평가</span>'
+            f'</div>'
+            f'{report_rows_html}'
+            f'</div>'
+        )
+    else:
+        meta_report_html = (
+            '<div style="background:#1a2535; border:1px solid #334155; border-radius:12px; '
+            'padding:20px; margin-bottom:28px; color:#475569; font-size:0.85rem; '
+            'font-style:italic; text-align:center;">'
+            '⚖️ 총괄 평가가 보고서 없음 — 첫 번째 6시간 주기 평가 후 표시됩니다.'
+            '</div>'
+        )
 
     # 카드 HTML 빌드
     cards = ""
@@ -1703,6 +1794,7 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
     6시간 주기(0·6·12·18시) 총괄 평가가가 각 전문가를 평가합니다.
     잘하는 부분은 강화, 못하는 부분은 강한 피드백을 부여합니다.
   </p>
+  {meta_report_html}
   <div style="display:flex; gap:16px; flex-wrap:wrap;">
     {cards}
   </div>
