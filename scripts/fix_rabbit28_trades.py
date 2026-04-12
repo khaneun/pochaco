@@ -182,8 +182,21 @@ def main(dry_run: bool) -> None:
                 logger.warning(f"  [{symbol}] 매칭 실패 — 이 종목은 수동 보정 필요")
                 continue
 
-            new_price = best["avg_price"]
-            new_krw = best["executed_funds"]
+            # 빗썸 bulk 목록은 avg_price=0 반환하는 경우가 있으므로 UUID로 재조회
+            try:
+                detail = client.get_order_by_uuid(best["uuid"])
+                if detail and detail.get("avg_price", 0) > 0:
+                    new_price = detail["avg_price"]
+                    new_krw = detail.get("executed_funds", 0)
+                    logger.info(f"  [{symbol}] UUID 재조회로 체결가 확인: {new_price:.4f}원")
+                else:
+                    new_price = best["avg_price"]
+                    new_krw = best["executed_funds"]
+            except Exception as e:
+                logger.warning(f"  [{symbol}] UUID 재조회 실패({e}), bulk 목록 값 사용")
+                new_price = best["avg_price"]
+                new_krw = best["executed_funds"]
+
             if new_krw <= 0 and new_price > 0:
                 new_krw = new_price * tr.units
 
