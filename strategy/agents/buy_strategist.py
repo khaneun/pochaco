@@ -136,89 +136,94 @@ class BuyStrategist(BaseSpecialistAgent):
         raw = self._call_llm(task_prompt, max_tokens=1024)
         logger.info(f"[BuyStrategist] LLM 응답: {raw}")
 
+        # ── JSON 파싱 (실패해도 fallback 자동 보충이 반드시 실행되도록 분리) ──
         try:
             data = self._parse_json(raw)
+        except (ValueError, KeyError) as e:
+            logger.warning(
+                f"[BuyStrategist] JSON 파싱 실패 — 자동 보충으로 전환: {e} "
+                f"| 원문(앞100자): {raw[:100]!r}"
+            )
+            data = {}
 
-            coins_raw = data.get("coins", [])
-            take_profit_pct = float(data.get("take_profit_pct", 5.0))
-            stop_loss_pct = float(data.get("stop_loss_pct", -2.0))
-            portfolio_reason = data.get("portfolio_reason", "")
+        coins_raw = data.get("coins", [])
+        take_profit_pct = float(data.get("take_profit_pct", 5.0))
+        stop_loss_pct = float(data.get("stop_loss_pct", -2.0))
+        portfolio_reason = data.get("portfolio_reason", "AI 파싱 실패 — 자동 보충")
 
-            # ── 코인 파싱 + 검증 ──
-            coins: list[PortfolioCoinPick] = []
-            seen_symbols: set[str] = set()
-            for c in coins_raw:
-                sym = c.get("symbol", "").upper()
-                if sym in seen_symbols or sym not in valid_symbols:
-                    continue
-                seen_symbols.add(sym)
-                coins.append(PortfolioCoinPick(
-                    symbol=sym,
-                    confidence=float(c.get("confidence", 0.5)),
-                    reason=c.get("reason", ""),
-                ))
-                if len(coins) >= _PORTFOLIO_SIZE:
-                    break
+        # ── 코인 파싱 + 검증 ──
+        coins: list[PortfolioCoinPick] = []
+        seen_symbols: set[str] = set()
+        for c in coins_raw:
+            sym = c.get("symbol", "").upper() if isinstance(c, dict) else ""
+            if not sym or sym in seen_symbols or sym not in valid_symbols:
+                continue
+            seen_symbols.add(sym)
+            coins.append(PortfolioCoinPick(
+                symbol=sym,
+                confidence=float(c.get("confidence", 0.5)),
+                reason=c.get("reason", ""),
+            ))
+            if len(coins) >= _PORTFOLIO_SIZE:
+                break
 
-            # ── 부족분 자동 보충 (스코어 상위 후보에서) ──
-            if len(coins) < _PORTFOLIO_SIZE and coin_scores:
-                sorted_scores = sorted(coin_scores, key=lambda s: s.total_score, reverse=True)
-                for sc in sorted_scores:
-                    if sc.symbol not in seen_symbols and sc.symbol in valid_symbols:
-                        seen_symbols.add(sc.symbol)
-                        coins.append(PortfolioCoinPick(
-                            symbol=sc.symbol,
-                            confidence=0.3,
-                            reason="AI 미선정 — 스코어 기반 자동 보충",
-                        ))
-                        logger.warning(f"[BuyStrategist 보충] {sc.symbol} (스코어={sc.total_score:.1f})")
-                        if len(coins) >= _PORTFOLIO_SIZE:
-                            break
+        # ── 부족분 자동 보충 1단계: 스코어 상위 후보 ──
+        if len(coins) < _PORTFOLIO_SIZE and coin_scores:
+            sorted_scores = sorted(coin_scores, key=lambda s: s.total_score, reverse=True)
+            for sc in sorted_scores:
+                if sc.symbol not in seen_symbols and sc.symbol in valid_symbols:
+                    seen_symbols.add(sc.symbol)
+                    coins.append(PortfolioCoinPick(
+                        symbol=sc.symbol,
+                        confidence=0.3,
+                        reason="AI 미선정 — 스코어 기반 자동 보충",
+                    ))
+                    logger.warning(f"[BuyStrategist 보충] {sc.symbol} (스코어={sc.total_score:.1f})")
+                    if len(coins) >= _PORTFOLIO_SIZE:
+                        break
 
-            # 그래도 부족하면 스냅샷에서 보충
-            if len(coins) < _PORTFOLIO_SIZE:
-                for s in snapshots:
-                    if s.symbol not in seen_symbols:
-                        seen_symbols.add(s.symbol)
-                        coins.append(PortfolioCoinPick(
-                            symbol=s.symbol,
-                            confidence=0.2,
-                            reason="AI 미선정 — 후보 목록 자동 보충",
-                        ))
-                        if len(coins) >= _PORTFOLIO_SIZE:
-                            break
+        # ── 부족분 자동 보충 2단계: 스냅샷 전체 후보 ──
+        if len(coins) < _PORTFOLIO_SIZE:
+            for s in snapshots:
+                if s.symbol not in seen_symbols:
+                    seen_symbols.add(s.symbol)
+                    coins.append(PortfolioCoinPick(
+                        symbol=s.symbol,
+                        confidence=0.2,
+                        reason="AI 미선정 — 후보 목록 자동 보충",
+                    ))
+                    logger.warning(f"[BuyStrategist 스냅샷 보충] {s.symbol}")
+                    if len(coins) >= _PORTFOLIO_SIZE:
+                        break
 
-            if len(coins) < 3:
-                raise RuntimeError(
-                    f"[BuyStrategist] 유효한 코인이 {len(coins)}개뿐 — 최소 3개 필요"
-                )
-
-            # ── TP/SL clamp ──
-            take_profit_pct = max(tp_min, min(tp_max, take_profit_pct))
-            if stop_loss_pct > 0:
-                stop_loss_pct = -abs(stop_loss_pct)
-            stop_loss_pct = max(-2.0, min(-0.5, stop_loss_pct))
-
-            decision = PortfolioDecision(
-                coins=coins,
-                take_profit_pct=round(take_profit_pct, 2),
-                stop_loss_pct=round(stop_loss_pct, 2),
-                portfolio_reason=portfolio_reason,
-                confidence=sum(c.confidence for c in coins) / len(coins),
-                llm_provider=self._llm.provider_name,
+        if len(coins) < 3:
+            raise RuntimeError(
+                f"[BuyStrategist] 유효한 코인이 {len(coins)}개뿐 — "
+                f"스냅샷={len(snapshots)}개, 후보 심볼={len(valid_symbols)}개"
             )
 
-            symbols_str = ", ".join(c.symbol for c in coins)
-            logger.info(
-                f"[BuyStrategist] 포트폴리오 구성: [{symbols_str}] / "
-                f"TP=+{decision.take_profit_pct}% / SL={decision.stop_loss_pct}% / "
-                f"코인 수={len(coins)}"
-            )
-            return {"portfolio_decision": decision}
+        # ── TP/SL clamp ──
+        take_profit_pct = max(tp_min, min(tp_max, take_profit_pct))
+        if stop_loss_pct > 0:
+            stop_loss_pct = -abs(stop_loss_pct)
+        stop_loss_pct = max(-2.0, min(-0.5, stop_loss_pct))
 
-        except (KeyError, ValueError) as e:
-            logger.error(f"[BuyStrategist] 응답 파싱 실패: {e}\n원문: {raw}")
-            raise RuntimeError(f"[BuyStrategist] 응답 파싱 실패: {e}")
+        decision = PortfolioDecision(
+            coins=coins,
+            take_profit_pct=round(take_profit_pct, 2),
+            stop_loss_pct=round(stop_loss_pct, 2),
+            portfolio_reason=portfolio_reason,
+            confidence=sum(c.confidence for c in coins) / len(coins),
+            llm_provider=self._llm.provider_name,
+        )
+
+        symbols_str = ", ".join(c.symbol for c in coins)
+        logger.info(
+            f"[BuyStrategist] 포트폴리오 구성: [{symbols_str}] / "
+            f"TP=+{decision.take_profit_pct}% / SL={decision.stop_loss_pct}% / "
+            f"코인 수={len(coins)}"
+        )
+        return {"portfolio_decision": decision}
 
     # ---------------------------------------------------------------- #
     #  유틸리티 메서드                                                     #
