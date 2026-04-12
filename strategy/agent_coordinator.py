@@ -1,7 +1,10 @@
-"""Agent Coordinator — 7개 전문가 Agent 오케스트레이션 (v4.0 — 포트폴리오 기반)
+"""Agent Coordinator — 8개 전문가 Agent 오케스트레이션 (v4.1 — 합의 기반)
 
 TradingEngine은 이 클래스만 의존하며, 포트폴리오 단위로
 코인 선정·전략 조정·성과 평가를 수행합니다.
+
+투자 판단은 자산 운용가(보수적) vs 투자 전문가(공격적) 양측 의견을
+시장 분석가·포트폴리오 평가가·특성 분석가 의견과 종합하여 결정합니다.
 """
 import logging
 from datetime import datetime, timezone, timedelta
@@ -13,6 +16,7 @@ from .coin_selector import CoinScore
 from .agents import (
     MarketAnalyst, MarketCondition,
     AssetManager, AllocationDecision,
+    InvestmentStrategist, InvestmentOpinion,
     BuyStrategist,
     SellStrategist,
     PortfolioEvaluator,
@@ -25,9 +29,15 @@ _KST = timezone(timedelta(hours=9))
 
 logger = logging.getLogger(__name__)
 
+# ── 합의 메커니즘 가중치 ──
+# 자산 운용가(보수) : 투자 전문가(공격) : 시장 분석가(시장 권장 비율)
+_W_ASSET_MANAGER = 0.35
+_W_INVESTMENT_STRATEGIST = 0.40
+_W_MARKET_ANALYST = 0.25
+
 
 class InvestmentHoldError(Exception):
-    """자산 운용가가 투자 보류를 결정했을 때 발생하는 예외.
+    """투자 보류 결정 시 발생하는 예외.
 
     일반 오류(RuntimeError)와 구분하여, TradingEngine이
     '중요 알람' 발송 + 지정 대기 후 조용히 재시도하도록 처리합니다.
@@ -35,12 +45,13 @@ class InvestmentHoldError(Exception):
 
 
 class AgentCoordinator:
-    """7개 전문가 Agent를 오케스트레이션하는 코디네이터 (포트폴리오 기반)"""
+    """8개 전문가 Agent를 오케스트레이션하는 코디네이터 (합의 기반)"""
 
     def __init__(
         self,
         market_analyst: MarketAnalyst,
         asset_manager: AssetManager,
+        investment_strategist: InvestmentStrategist,
         buy_strategist: BuyStrategist,
         sell_strategist: SellStrategist,
         portfolio_evaluator: PortfolioEvaluator,
@@ -51,6 +62,7 @@ class AgentCoordinator:
         self._agents: dict = {
             "market_analyst": market_analyst,
             "asset_manager": asset_manager,
+            "investment_strategist": investment_strategist,
             "buy_strategist": buy_strategist,
             "sell_strategist": sell_strategist,
             "portfolio_evaluator": portfolio_evaluator,
@@ -166,7 +178,76 @@ class AgentCoordinator:
             logger.warning(f"[의사결정 로그 저장 실패] {e}")
 
     # ------------------------------------------------------------------ #
-    #  포트폴리오 선정 (8개 코인)                                            #
+    #  합의 메커니즘: 자산 운용가 vs 투자 전문가 의견 종합                       #
+    # ------------------------------------------------------------------ #
+    def _synthesize_investment_decision(
+        self,
+        allocation: AllocationDecision,
+        opinion: InvestmentOpinion,
+        condition: MarketCondition,
+    ) -> tuple[bool, float, str]:
+        """양측 의견 + 시장 분석을 종합하여 최종 투자 결정
+
+        Returns:
+            (should_invest, final_ratio, consensus_reason)
+        """
+        am_invest = allocation.should_invest
+        is_invest = opinion.should_invest
+
+        # ── 투자 여부 결정 ──
+        if not am_invest and not is_invest:
+            # 양측 모두 반대 → 보류 확정
+            return False, 0.0, (
+                f"[합의: 보류] 운용가: {allocation.reason} / "
+                f"전문가: {opinion.reason}"
+            )
+
+        if am_invest and is_invest:
+            # 양측 모두 찬성 → 가중 평균 비율
+            final_ratio = (
+                allocation.invest_ratio * _W_ASSET_MANAGER
+                + opinion.invest_ratio * _W_INVESTMENT_STRATEGIST
+                + condition.recommended_exposure * _W_MARKET_ANALYST
+            )
+            final_ratio = max(0.3, min(0.95, final_ratio))
+            return True, round(final_ratio, 2), (
+                f"[합의: 투자] 운용가 {allocation.invest_ratio:.0%} + "
+                f"전문가 {opinion.invest_ratio:.0%} + "
+                f"시장 {condition.recommended_exposure:.0%} "
+                f"→ {final_ratio:.0%}"
+            )
+
+        if is_invest and not am_invest:
+            # 투자 전문가만 찬성 → 기회 수준이 높으면 소극 투자
+            if opinion.opportunity_score >= 0.7:
+                # 높은 확신 → 투자하되 보수적 비율
+                conservative_ratio = min(
+                    opinion.invest_ratio * 0.6,
+                    0.6,
+                )
+                conservative_ratio = max(0.3, conservative_ratio)
+                return True, round(conservative_ratio, 2), (
+                    f"[합의: 소극 투자] 운용가 반대, "
+                    f"전문가 기회지수 {opinion.opportunity_score:.1f}로 소극 투자 "
+                    f"({conservative_ratio:.0%})"
+                )
+            else:
+                return False, 0.0, (
+                    f"[합의: 보류] 운용가 반대 + "
+                    f"전문가 기회지수 낮음({opinion.opportunity_score:.1f})"
+                )
+
+        # am_invest and not is_invest
+        # 운용가만 찬성, 투자 전문가 반대 → 보수적 투자
+        conservative_ratio = min(allocation.invest_ratio * 0.7, 0.6)
+        conservative_ratio = max(0.3, conservative_ratio)
+        return True, round(conservative_ratio, 2), (
+            f"[합의: 보수 투자] 전문가 반대, "
+            f"운용가 비율 축소 ({conservative_ratio:.0%})"
+        )
+
+    # ------------------------------------------------------------------ #
+    #  포트폴리오 선정 (8개 코인) — 합의 기반                                 #
     # ------------------------------------------------------------------ #
     def select_portfolio(
         self,
@@ -175,10 +256,10 @@ class AgentCoordinator:
         coin_scores: list[CoinScore] | None = None,
         krw_balance: float = 0.0,
     ) -> PortfolioDecision:
-        """시장 분석 → 자산 배분 → 8개 코인 포트폴리오 선정 파이프라인"""
+        """시장 분석 → 운용가/전문가 합의 → 8개 코인 포트폴리오 선정"""
 
         # 1) 시장 분석가
-        logger.info("[Coordinator] 시장 분석가 분석 중...")
+        logger.info("[Coordinator] 1단계: 시장 분석가 분석 중...")
         market_result = self._agents["market_analyst"].execute({
             "snapshots": snapshots,
         })
@@ -193,8 +274,15 @@ class AgentCoordinator:
             f"{condition.sentiment} / 리스크={condition.risk_level} / 강도={condition.strength:.1f}",
         )
 
-        # 2) 자산 운용가
-        logger.info("[Coordinator] 자산 운용가 배분 결정 중...")
+        # 후보 코인 요약 (투자 전문가 참고용)
+        coin_scores_summary = ""
+        if coin_scores:
+            top_5 = sorted(coin_scores, key=lambda c: c.total_score, reverse=True)[:5]
+            lines = [f"  {c.symbol}: 점수={c.total_score:.1f}" for c in top_5]
+            coin_scores_summary = "\n".join(lines)
+
+        # 2) 자산 운용가 (보수적)
+        logger.info("[Coordinator] 2단계: 자산 운용가 배분 결정 중...")
         alloc_result = self._agents["asset_manager"].execute({
             "market_condition": condition,
             "eval_stats": eval_stats,
@@ -203,7 +291,6 @@ class AgentCoordinator:
         allocation = alloc_result.get("allocation", AllocationDecision(
             should_invest=True, invest_ratio=0.85, reason="기본 배분",
         ))
-        self.last_invest_ratio = allocation.invest_ratio
         self._log_decision(
             "asset_manager", "allocation",
             f"시장={condition.sentiment} 리스크={condition.risk_level}",
@@ -211,10 +298,48 @@ class AgentCoordinator:
             f"비율={allocation.invest_ratio:.0%} | {allocation.reason}",
         )
 
-        if not allocation.should_invest:
-            raise InvestmentHoldError(allocation.reason)
+        # 3) 투자 전문가 (공격적)
+        logger.info("[Coordinator] 2단계: 투자 전문가 기회 판단 중...")
+        invest_result = self._agents["investment_strategist"].execute({
+            "market_condition": condition,
+            "eval_stats": eval_stats,
+            "krw_balance": krw_balance,
+            "coin_scores_summary": coin_scores_summary,
+        })
+        opinion = invest_result.get("opinion", InvestmentOpinion(
+            should_invest=True, invest_ratio=0.80,
+            aggression=0.5, opportunity_score=0.5, reason="기본 의견",
+        ))
+        self._log_decision(
+            "investment_strategist", "opportunity_assessment",
+            f"시장={condition.sentiment} 리스크={condition.risk_level}",
+            f"투자={'Y' if opinion.should_invest else 'N'} "
+            f"비율={opinion.invest_ratio:.0%} 기회={opinion.opportunity_score:.1f} "
+            f"공격={opinion.aggression:.1f} | {opinion.reason}",
+        )
 
-        # 3) 특성 분석가 — 후보 코인별 프로파일 수집
+        # 4) 합의 도출
+        should_invest, final_ratio, consensus_reason = (
+            self._synthesize_investment_decision(allocation, opinion, condition)
+        )
+
+        logger.info(
+            f"[Coordinator] 합의 결과: 투자={'Y' if should_invest else 'N'} "
+            f"비율={final_ratio:.0%} | {consensus_reason}"
+        )
+        self.last_invest_ratio = final_ratio
+
+        if not should_invest:
+            raise InvestmentHoldError(consensus_reason)
+
+        # AllocationDecision에 최종 비율 반영 (매수 전문가에 전달)
+        final_allocation = AllocationDecision(
+            should_invest=True,
+            invest_ratio=final_ratio,
+            reason=consensus_reason,
+        )
+
+        # 5) 특성 분석가 — 후보 코인별 프로파일 수집
         coin_profiles: dict[str, str] = {}
         if self._coin_analyst:
             for s in snapshots:
@@ -227,15 +352,16 @@ class AgentCoordinator:
                     f"{list(coin_profiles.keys())}"
                 )
 
-        # 4) 매수 전문가 — 8개 코인 포트폴리오 선정
-        logger.info("[Coordinator] 매수 전문가 포트폴리오 구성 중...")
+        # 6) 매수 전문가 — 8개 코인 포트폴리오 선정
+        logger.info("[Coordinator] 3단계: 매수 전문가 포트폴리오 구성 중...")
         buy_result = self._agents["buy_strategist"].execute({
             "snapshots": snapshots,
             "market_condition": condition,
-            "allocation": allocation,
+            "allocation": final_allocation,
             "eval_stats": eval_stats,
             "coin_scores": coin_scores,
             "coin_profiles": coin_profiles,
+            "investment_opinion": opinion,
         })
         decision = buy_result.get("portfolio_decision")
         if decision is None:
@@ -244,7 +370,7 @@ class AgentCoordinator:
         symbols = [c.symbol for c in decision.coins]
         self._log_decision(
             "buy_strategist", "portfolio_select",
-            f"후보 {len(snapshots)}개 / 시장={condition.sentiment}",
+            f"후보 {len(snapshots)}개 / 합의비율={final_ratio:.0%}",
             f"{','.join(symbols)} TP=+{decision.take_profit_pct}% "
             f"SL={decision.stop_loss_pct}%",
         )

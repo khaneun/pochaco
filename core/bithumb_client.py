@@ -150,6 +150,91 @@ class BithumbClient:
         ]
         return {"status": "0000", "data": normalized}
 
+    def get_executed_orders(self, symbol: str, limit: int = 20) -> list[dict]:
+        """체결 완료 주문 조회 (state=done)
+
+        Args:
+            symbol: 코인 심볼 (예: "HEMI")
+            limit: 최대 조회 건수 (최대 100)
+
+        Returns:
+            체결 주문 목록. 각 항목:
+              - uuid: 주문 ID
+              - side: "bid" | "ask"
+              - avg_price: 평균 체결가 (float)
+              - executed_volume: 체결 수량 (float)
+              - executed_funds: 체결 금액 합계 (float)
+              - created_at: 주문 생성 시각 (ISO 문자열)
+              - trades: 개별 체결 목록
+        """
+        params: dict = {"market": f"KRW-{symbol}", "state": "done", "limit": min(limit, 100)}
+        raw = self._v2_get("/v1/orders", params)
+        if not isinstance(raw, list):
+            return []
+        result = []
+        for o in raw:
+            avg_price_str = o.get("avg_price") or o.get("price") or "0"
+            exec_vol_str = o.get("executed_volume") or o.get("volume") or "0"
+            # executed_funds = avg_price * exec_vol (일부 API는 직접 제공)
+            avg_price = float(avg_price_str) if avg_price_str else 0.0
+            exec_vol = float(exec_vol_str) if exec_vol_str else 0.0
+            exec_funds = avg_price * exec_vol
+
+            # trades 배열에서 실제 체결 금액(funds) 합산
+            trades = o.get("trades", [])
+            if trades:
+                exec_funds = sum(float(t.get("funds", 0)) for t in trades)
+                if exec_funds > 0 and exec_vol > 0:
+                    avg_price = exec_funds / exec_vol
+
+            result.append({
+                "uuid": o.get("uuid", ""),
+                "side": o.get("side", ""),
+                "avg_price": avg_price,
+                "executed_volume": exec_vol,
+                "executed_funds": exec_funds,
+                "created_at": o.get("created_at", ""),
+                "trades": trades,
+            })
+        return result
+
+    def get_order_by_uuid(self, uuid: str) -> dict | None:
+        """특정 주문 UUID로 체결 상세 조회
+
+        Args:
+            uuid: 빗썸 v2 주문 UUID
+
+        Returns:
+            주문 상세 딕셔너리 또는 None (조회 실패 시)
+        """
+        try:
+            raw = self._v2_get("/v1/order", {"uuid": uuid})
+            if not isinstance(raw, dict):
+                return None
+            avg_price_str = raw.get("avg_price") or raw.get("price") or "0"
+            exec_vol_str = raw.get("executed_volume") or raw.get("volume") or "0"
+            avg_price = float(avg_price_str) if avg_price_str else 0.0
+            exec_vol = float(exec_vol_str) if exec_vol_str else 0.0
+            exec_funds = avg_price * exec_vol
+            trades = raw.get("trades", [])
+            if trades:
+                exec_funds = sum(float(t.get("funds", 0)) for t in trades)
+                if exec_funds > 0 and exec_vol > 0:
+                    avg_price = exec_funds / exec_vol
+            return {
+                "uuid": raw.get("uuid", uuid),
+                "side": raw.get("side", ""),
+                "state": raw.get("state", ""),
+                "avg_price": avg_price,
+                "executed_volume": exec_vol,
+                "executed_funds": exec_funds,
+                "created_at": raw.get("created_at", ""),
+                "trades": trades,
+            }
+        except Exception as e:
+            logger.warning(f"[주문 조회 실패] uuid={uuid}: {e}")
+            return None
+
     def market_buy(self, symbol: str, krw_amount: float) -> dict:
         """시장가 매수 (v2: ord_type=price → KRW 금액으로 즉시 체결)"""
         body = {

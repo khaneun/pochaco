@@ -311,7 +311,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="30">
 <title>Pochaco Monitor</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -339,6 +338,21 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
             font-size: 0.75rem; font-weight: 600; }}
   .badge-green {{ background: #450a0a; color: #f87171; }}
   .badge-red   {{ background: #1e3a5f; color: #60a5fa; }}
+  .badge-open  {{ background: #14532d; color: #86efac; }}
+  /* 포트폴리오 거래 카드 */
+  .pf-tx-list  {{ display: flex; flex-direction: column; }}
+  .pf-tx-card  {{ padding: 10px 12px; border-bottom: 1px solid #1e293b;
+                  cursor: pointer; transition: background 0.1s; }}
+  .pf-tx-card:hover {{ background: rgba(51, 65, 85, 0.4); }}
+  .pf-tx-card.pf-tx-open {{ background: rgba(34, 197, 94, 0.06);
+                            border-left: 3px solid #22c55e; padding-left: 9px; }}
+  .pf-tx-line1 {{ display: flex; align-items: center; gap: 10px; }}
+  .pf-tx-line1 .pf-tx-time {{ color: #64748b; font-size: 0.78rem;
+                              min-width: 110px; }}
+  .pf-tx-line1 .pf-tx-name {{ flex: 1; font-size: 0.9rem; }}
+  .pf-tx-line2 {{ display: flex; gap: 14px; margin-top: 5px;
+                  font-size: 0.78rem; color: #94a3b8; padding-left: 110px; }}
+  .pf-tx-line2 .pnl {{ margin-left: auto; font-weight: 600; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
   th {{ color: #64748b; text-align: left; padding: 6px 8px;
         border-bottom: 1px solid #334155; font-weight: 500; }}
@@ -455,9 +469,59 @@ function initPager(tableId, pagerId, rowsPerPage, rowStep) {{
   render();
 }}
 
+/* 카드 리스트 페이지네이션 */
+function initCardPager(listId, pagerId, cardsPerPage) {{
+  var list = document.getElementById(listId);
+  if (!list) return;
+  var cards = Array.from(list.children);
+  var totalPages = Math.ceil(cards.length / cardsPerPage) || 1;
+  var page = 0;
+  function render() {{
+    cards.forEach(function(c) {{ c.style.display = 'none'; }});
+    var start = page * cardsPerPage;
+    var end = Math.min(start + cardsPerPage, cards.length);
+    for (var j = start; j < end; j++) {{ cards[j].style.display = ''; }}
+    var pager = document.getElementById(pagerId);
+    if (pager) {{
+      pager.querySelector('.pg-info').textContent = (page+1) + ' / ' + totalPages;
+      pager.querySelector('.pg-prev').disabled = (page === 0);
+      pager.querySelector('.pg-next').disabled = (page >= totalPages - 1);
+    }}
+  }}
+  var pager = document.getElementById(pagerId);
+  if (pager) {{
+    pager.querySelector('.pg-prev').onclick = function() {{ if(page>0){{ page--; render(); }} }};
+    pager.querySelector('.pg-next').onclick = function() {{ if(page<totalPages-1){{ page++; render(); }} }};
+  }}
+  render();
+}}
+
+/* 모달이 열려있을 때는 자동 새로고침 일시 정지 */
+function _isAnyModalOpen() {{
+  var ids = ['pf-tx-modal', 'eval-detail-modal', 'prompt-modal', 'chat-modal'];
+  for (var i=0; i<ids.length; i++) {{
+    var m = document.getElementById(ids[i]);
+    if (!m) continue;
+    var disp = m.style.display;
+    if (disp === 'flex' || disp === 'block') return true;
+  }}
+  return false;
+}}
+function _scheduleAutoRefresh(intervalMs) {{
+  setInterval(function() {{
+    if (_isAnyModalOpen()) {{
+      var hint = document.getElementById('refresh-hint');
+      if (hint) hint.textContent = '⏸ 팝업 닫으면 새로고침';
+      return;
+    }}
+    location.reload();
+  }}, intervalMs || 30000);
+}}
+
 document.addEventListener('DOMContentLoaded', function() {{
   initPager('eval-table', 'eval-pager', 5, 1);
-  initPager('trade-table', 'trade-pager', 10);
+  initCardPager('trade-list', 'trade-pager', 10);
+  _scheduleAutoRefresh(30000);
 }});
 {extra_js}
 </script>
@@ -468,7 +532,8 @@ document.addEventListener('DOMContentLoaded', function() {{
     <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
       <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
     <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
-      <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침
+      <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp;
+      <span id="refresh-hint">30초마다 자동 새로고침</span>
     </div>
   </div>
   <nav style="display:flex; gap:8px; align-items:center;">
@@ -701,24 +766,34 @@ def _render_html(data: dict) -> str:
     else:
         position_html = '<div class="no-data">현재 활성 포트폴리오 없음<br>AI 포트폴리오 구성 대기 중...</div>'
 
-    # 포트폴리오 거래 내역 — 포트폴리오 단위 표시 (클릭 → 팝업)
+    # 포트폴리오 거래 내역 — 카드 2줄 형태 (클릭 → 팝업)
     pf_tx_popup_list: list[dict] = []
-    pf_tx_rows = ""
+    pf_tx_cards = ""
+
+    def _fmt_held(minutes: float) -> str:
+        if minutes >= 60:
+            return f"{minutes / 60:.1f}시간"
+        return f"{minutes:.0f}분"
 
     # 현재 보유 중인 포트폴리오 (최상단)
     if pf:
         idx = len(pf_tx_popup_list)
-        open_pnl_color = "green" if pf["pnl_pct"] > 0 else ("red" if pf["pnl_pct"] < 0 else "gray")
         open_pnl_krw = pf["pnl_krw"]
+        open_pnl_color = "green" if open_pnl_krw > 0 else ("red" if open_pnl_krw < 0 else "gray")
         open_pnl_str = f"{open_pnl_krw:+,.0f}원 ({pf['pnl_pct']:+.2f}%)"
-        pf_tx_rows += (
-            f"<tr class='pf-tx-row' onclick='showPfTx({idx})' style='cursor:pointer;'>"
-            f"<td><span class='time-date'>{pf['opened_at']}</span>"
-            f"<span class='time-hms'>보유 중</span></td>"
-            f"<td><b>{pf['name']} ({pf['coin_count']})</b>"
-            f"<span class='badge badge-green' style='margin-left:6px;font-size:0.7rem;'>매수</span></td>"
-            f"<td style='text-align:right' class='{open_pnl_color}'>{open_pnl_str}</td>"
-            f"</tr>"
+        held_str_open = _fmt_held(pf["held_minutes"])
+        pf_tx_cards += (
+            f"<div class='pf-tx-card pf-tx-open' onclick='showPfTx({idx})'>"
+            f"<div class='pf-tx-line1'>"
+            f"<span class='pf-tx-time'>{pf['opened_at']}</span>"
+            f"<span class='pf-tx-name'><b>[{pf['coin_count']}] {pf['name']}</b></span>"
+            f"<span class='badge badge-open'>보유중</span>"
+            f"</div>"
+            f"<div class='pf-tx-line2'>"
+            f"<span>⏱ {held_str_open}</span>"
+            f"<span class='pnl {open_pnl_color}'>{open_pnl_str}</span>"
+            f"</div>"
+            f"</div>"
         )
         pf_tx_popup_list.append({
             "name": pf["name"],
@@ -742,40 +817,40 @@ def _render_html(data: dict) -> str:
     # 종료된 포트폴리오 (평가 기록 기반)
     for ev in data.get("evaluations", []):
         idx = len(pf_tx_popup_list)
-        pnl_color = "green" if ev["pnl_pct"] >= 0 else "red"
         exit_kr = "익절" if ev["exit_type"] == "take_profit" else "손절"
         exit_class = "badge-green" if ev["exit_type"] == "take_profit" else "badge-red"
-        t_parts = ev["time"].split(" ")
-        t_date = t_parts[0] if len(t_parts) > 0 else ev["time"]
-        t_hms  = t_parts[1] if len(t_parts) > 1 else ""
-        buy_krw = ev.get("total_buy_krw", 0)
-        sell_krw = ev.get("total_sell_krw", 0)
         coin_count = ev.get("coin_count", "?")
         pnl_krw = ev.get("pnl_krw") or 0
         pnl_color = "green" if pnl_krw > 0 else ("red" if pnl_krw < 0 else "gray")
-        pnl_cell = f"{pnl_krw:+,.0f}원 ({ev['pnl_pct']:+.2f}%)" if pnl_krw != 0 else f"{ev['pnl_pct']:+.2f}%"
-        pf_tx_rows += (
-            f"<tr class='pf-tx-row' onclick='showPfTx({idx})' style='cursor:pointer;'>"
-            f"<td><span class='time-date'>{t_date}</span>"
-            f"<span class='time-hms'>{t_hms}</span></td>"
-            f"<td><b>{ev['portfolio_name']} ({coin_count})</b>"
-            f"<span class='badge {exit_class}' style='margin-left:6px;font-size:0.7rem;'>{exit_kr}</span></td>"
-            f"<td style='text-align:right' class='{pnl_color}'>{pnl_cell}</td>"
-            f"</tr>"
+        pnl_cell = (
+            f"{pnl_krw:+,.0f}원 ({ev['pnl_pct']:+.2f}%)" if pnl_krw != 0
+            else f"{ev['pnl_pct']:+.2f}%"
         )
-        held = ev["held_minutes"]
-        held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
+        held_str_closed = _fmt_held(ev["held_minutes"])
+        pf_tx_cards += (
+            f"<div class='pf-tx-card' onclick='showPfTx({idx})'>"
+            f"<div class='pf-tx-line1'>"
+            f"<span class='pf-tx-time'>{ev['time']}</span>"
+            f"<span class='pf-tx-name'><b>[{coin_count}] {ev['portfolio_name']}</b></span>"
+            f"<span class='badge {exit_class}'>{exit_kr}</span>"
+            f"</div>"
+            f"<div class='pf-tx-line2'>"
+            f"<span>⏱ {held_str_closed}</span>"
+            f"<span class='pnl {pnl_color}'>{pnl_cell}</span>"
+            f"</div>"
+            f"</div>"
+        )
         pf_tx_popup_list.append({
             "name": ev["portfolio_name"],
             "is_open": False,
             "opened_at": "",
             "closed_at": ev["time"],
             "coin_count": coin_count,
-            "total_buy_krw": buy_krw,
-            "total_sell_krw": sell_krw,
+            "total_buy_krw": ev.get("total_buy_krw", 0),
+            "total_sell_krw": ev.get("total_sell_krw", 0),
             "pnl_pct": ev["pnl_pct"],
             "pnl_krw": ev.get("pnl_krw") or 0,
-            "held_str": held_str,
+            "held_str": held_str_closed,
             "exit_type": ev["exit_type"],
             "take_profit_pct": ev.get("original_tp", ""),
             "stop_loss_pct": ev.get("original_sl", ""),
@@ -784,13 +859,8 @@ def _render_html(data: dict) -> str:
             "lesson": ev.get("lesson", ""),
         })
 
-    if pf_tx_rows:
-        trades_html = (
-            "<table id='trade-table'>"
-            "<tr><th>시간</th><th>포트폴리오</th>"
-            "<th style='text-align:right'>손익</th></tr>"
-            f"{pf_tx_rows}</table>"
-        )
+    if pf_tx_cards:
+        trades_html = f"<div id='trade-list' class='pf-tx-list'>{pf_tx_cards}</div>"
     else:
         trades_html = '<div class="no-data">포트폴리오 거래 내역 없음</div>'
 
@@ -1520,6 +1590,18 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
         if (pm) pm.addEventListener('click', function(e) { if (e.target === this) closePromptModal(); });
         var cm = document.getElementById('chat-modal');
         if (cm) cm.addEventListener('click', function(e) { if (e.target === this) closeChatModal(); });
+
+        /* 30초 자동 새로고침 — 모달 열려있을 때는 스킵 */
+        setInterval(function() {
+            var ids = ['prompt-modal', 'chat-modal'];
+            for (var i=0; i<ids.length; i++) {
+                var m = document.getElementById(ids[i]);
+                if (m && (m.style.display === 'flex' || m.style.display === 'block')) {
+                    return;
+                }
+            }
+            location.reload();
+        }, 30000);
     });
     """
 
@@ -1568,7 +1650,6 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="30">
 <title>Pochaco - 전문가 실적표</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -1596,7 +1677,8 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
     <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
       <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
     <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
-      <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp; 30초마다 자동 새로고침
+      <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp;
+      <span id="refresh-hint">30초마다 자동 새로고침</span>
     </div>
   </div>
   <nav style="display:flex; gap:8px; align-items:center;">

@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 AGENT_ROLES = [
     "market_analyst",
     "asset_manager",
+    "investment_strategist",
     "buy_strategist",
     "sell_strategist",
     "portfolio_evaluator",

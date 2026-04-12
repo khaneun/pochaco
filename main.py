@@ -21,7 +21,7 @@ from core.telegram_bot import TelegramBot
 from database import TradeRepository
 from strategy import MarketAnalyzer, TradingEngine, StrategyOptimizer, CoinSelector, AgentCoordinator
 from strategy.agents import (
-    MarketAnalyst, AssetManager, BuyStrategist,
+    MarketAnalyst, AssetManager, InvestmentStrategist, BuyStrategist,
     SellStrategist, PortfolioEvaluator, MetaEvaluator,
     CoinProfileAnalyst,
 )
@@ -79,22 +79,24 @@ def main() -> None:
     # LLM 공급자 (공유)
     llm = get_llm_provider()
 
-    # 7개 전문가 Agent 생성
-    market_analyst      = MarketAnalyst(llm=llm)
-    asset_manager       = AssetManager(llm=llm)
-    buy_strategist      = BuyStrategist(llm=llm)
-    sell_strategist     = SellStrategist(llm=llm)
-    portfolio_evaluator = PortfolioEvaluator(llm=llm)
-    meta_evaluator      = MetaEvaluator(llm=llm)
-    coin_profile_analyst = CoinProfileAnalyst(
+    # 8개 전문가 Agent 생성
+    market_analyst         = MarketAnalyst(llm=llm)
+    asset_manager          = AssetManager(llm=llm)
+    investment_strategist  = InvestmentStrategist(llm=llm)
+    buy_strategist         = BuyStrategist(llm=llm)
+    sell_strategist        = SellStrategist(llm=llm)
+    portfolio_evaluator    = PortfolioEvaluator(llm=llm)
+    meta_evaluator         = MetaEvaluator(llm=llm)
+    coin_profile_analyst   = CoinProfileAnalyst(
         profile_dir=_APP_DIR / "data" / "coin_profiles",
         llm=llm,
     )
 
-    # 코디네이터 (기존 TradingAgent 대체)
+    # 코디네이터 (합의 기반 의사결정)
     coordinator = AgentCoordinator(
         market_analyst=market_analyst,
         asset_manager=asset_manager,
+        investment_strategist=investment_strategist,
         buy_strategist=buy_strategist,
         sell_strategist=sell_strategist,
         portfolio_evaluator=portfolio_evaluator,
@@ -178,7 +180,7 @@ def main() -> None:
     logger.info(f"pochaco 시작 (HEADLESS={settings.HEADLESS})")
     logger.info(f"LLM 공급자: {settings.LLM_PROVIDER} / 감시 주기: {settings.POSITION_CHECK_INTERVAL}초")
     logger.info(f"포트폴리오 모드: {settings.PORTFOLIO_SIZE}개 코인 균등 분산")
-    logger.info("7개 전문가 Agent 시스템 활성화")
+    logger.info("8개 전문가 Agent 시스템 활성화 (합의 기반)")
 
     if settings.HEADLESS:
         logger.info("헤드리스 모드 — 웹 대시보드 및 텔레그램으로 모니터링하세요.")

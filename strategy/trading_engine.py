@@ -10,6 +10,7 @@
 """
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,6 +40,9 @@ _BUY_INTERVAL_SEC = 0.5
 _MIN_PORTFOLIO_COINS = 3
 # 투자 보류 시 대기 시간 (분) — 자산 운용가가 보류 결정 후 재평가까지 대기
 _HOLD_WAIT_MINUTES = 30
+# 지정가 매도: 시도별 가격 조정 배율 (1→0.998→0.995), 실패 시 시장가
+_LIMIT_SELL_PRICE_ADJ = [1.0, 0.998, 0.995]
+_LIMIT_SELL_WAIT_SEC = 5.0
 
 
 # ================================================================== #
@@ -178,6 +182,138 @@ class TradingEngine:
                 except Exception:
                     total += pos.buy_krw  # 시세 조회 실패 시 매수가 기준
         return total
+
+    # ------------------------------------------------------------------ #
+    #  지정가 매도 (retry + market fallback)                                #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _floor_to_tick(price: float) -> float:
+        """빗썸 KRW 마켓 호가 단위로 내림 (매도 시 체결 확률 최대화)"""
+        if price >= 1_000_000:
+            return math.floor(price / 1000) * 1000
+        elif price >= 100_000:
+            return math.floor(price / 100) * 100
+        elif price >= 10_000:
+            return math.floor(price / 10) * 10
+        elif price >= 1_000:
+            return math.floor(price)
+        elif price >= 100:
+            return math.floor(price * 10) / 10
+        elif price >= 10:
+            return math.floor(price * 100) / 100
+        else:
+            return math.floor(price * 1000) / 1000
+
+    def _limit_sell_with_retry(
+        self, symbol: str, target_price: float, units: float,
+    ) -> dict:
+        """지정가 매도 최대 3회 → 실패 시 시장가 전환
+
+        Args:
+            symbol: 코인 심볼
+            target_price: 목표 매도 가격 (TP/SL 트리거 시점 시세)
+            units: 매도 수량
+
+        Returns:
+            {"status", "order_uuid", "filled_price", "filled_units",
+             "filled_krw", "method"}
+        """
+        remaining = units
+
+        for attempt, multiplier in enumerate(_LIMIT_SELL_PRICE_ADJ, 1):
+            limit_price = self._floor_to_tick(target_price * multiplier)
+            if limit_price <= 0:
+                break
+
+            logger.info(
+                f"  [지정가 매도 {attempt}/{len(_LIMIT_SELL_PRICE_ADJ)}] "
+                f"{symbol} {remaining:.6f}개 @ {limit_price:,.0f}원"
+            )
+
+            result = self._client.limit_sell(symbol, limit_price, remaining)
+            if result.get("status") != "0000":
+                logger.warning(f"  [지정가 주문 실패] {symbol}: {result}")
+                continue
+
+            order_data = result.get("data", {})
+            order_uuid = (
+                order_data.get("uuid", "") if isinstance(order_data, dict) else ""
+            )
+            if not order_uuid:
+                logger.warning(f"  [UUID 없음] {symbol} — 시장가 전환")
+                break
+
+            # 체결 대기
+            time.sleep(_LIMIT_SELL_WAIT_SEC)
+
+            # 주문 상태 확인
+            order_info = self._client.get_order_by_uuid(order_uuid)
+            if order_info and order_info.get("state") == "done":
+                logger.info(
+                    f"  [지정가 체결] {symbol} "
+                    f"@{order_info['avg_price']:,.0f}원 "
+                    f"({order_info['executed_funds']:,.0f}원)"
+                )
+                return {
+                    "status": "0000",
+                    "order_uuid": order_uuid,
+                    "filled_price": order_info["avg_price"],
+                    "filled_units": order_info["executed_volume"],
+                    "filled_krw": order_info["executed_funds"],
+                    "method": f"limit_{attempt}",
+                }
+
+            # 미체결 → 취소
+            logger.info(f"  [미체결 취소] {symbol} attempt {attempt}")
+            self._client.cancel_order("ask", order_uuid, symbol)
+            time.sleep(0.3)
+
+            # 부분 체결 확인
+            order_info = self._client.get_order_by_uuid(order_uuid)
+            if order_info and order_info.get("executed_volume", 0) > 0:
+                filled_vol = order_info["executed_volume"]
+                remaining -= filled_vol
+                if remaining <= 0:
+                    return {
+                        "status": "0000",
+                        "order_uuid": order_uuid,
+                        "filled_price": order_info["avg_price"],
+                        "filled_units": filled_vol,
+                        "filled_krw": order_info["executed_funds"],
+                        "method": f"limit_partial_{attempt}",
+                    }
+                logger.info(
+                    f"  [부분 체결] {symbol} {filled_vol:.6f}개 체결, "
+                    f"잔여 {remaining:.6f}개"
+                )
+
+        # ── 시장가 전환 ──
+        logger.warning(f"  [시장가 전환] {symbol} {remaining:.6f}개")
+        market_result = self._client.market_sell(symbol, remaining)
+        order_data = market_result.get("data", {})
+        order_uuid = (
+            order_data.get("uuid", "") if isinstance(order_data, dict) else ""
+        )
+
+        filled_price = target_price  # 기본 fallback
+        filled_krw = remaining * target_price
+        if order_uuid:
+            time.sleep(1)
+            info = self._client.get_order_by_uuid(order_uuid)
+            if info:
+                if info.get("avg_price", 0) > 0:
+                    filled_price = info["avg_price"]
+                if info.get("executed_funds", 0) > 0:
+                    filled_krw = info["executed_funds"]
+
+        return {
+            "status": market_result.get("status", "9999"),
+            "order_uuid": order_uuid,
+            "filled_price": filled_price,
+            "filled_units": remaining,
+            "filled_krw": filled_krw,
+            "method": "market_fallback",
+        }
 
     # ------------------------------------------------------------------ #
     #  미체결 주문 정리                                                     #
@@ -493,20 +629,33 @@ class TradingEngine:
         pnl_pct, pnl_krw, coin_details = self._calc_portfolio_pnl(positions)
         tracker = self._exit_tracker or _PortfolioExitTracker()
 
+        # 매도 시 목표가 맵 (현재 시세 기준)
+        target_prices = {
+            d["symbol"]: d["current_price"]
+            for d in coin_details
+            if d.get("current_price", 0) > 0
+        }
+
         # 시간 기반 강제 탈출
         holding_minutes = (datetime.utcnow() - portfolio.opened_at).total_seconds() / 60
         if holding_minutes >= _MAX_HOLD_MINUTES:
             self._execute_portfolio_sell(
                 portfolio, positions, pnl_pct, coin_details,
                 f"시간초과 강제매도 ({holding_minutes:.0f}분, {pnl_pct:+.2f}%)",
+                target_prices=target_prices,
             )
             return
 
         # ── 상태 머신 분기 ──
         if tracker.phase == _ExitPhase.TRAILING_TP:
-            self._handle_trailing_tp(portfolio, positions, pnl_pct, coin_details, tracker)
+            self._handle_trailing_tp(
+                portfolio, positions, pnl_pct, coin_details, tracker, target_prices,
+            )
         else:
-            self._handle_monitoring(portfolio, positions, pnl_pct, coin_details, tracker, holding_minutes)
+            self._handle_monitoring(
+                portfolio, positions, pnl_pct, coin_details, tracker,
+                holding_minutes, target_prices,
+            )
 
         self._exit_tracker = tracker
 
@@ -514,6 +663,7 @@ class TradingEngine:
         self, portfolio: Portfolio, positions: list[Position],
         pnl_pct: float, coin_details: list[dict],
         tracker: _PortfolioExitTracker, holding_minutes: float,
+        target_prices: dict[str, float] | None = None,
     ) -> None:
         """일반 감시 — 낙폭별 분할 매도 + 트레일링 익절 진입"""
 
@@ -550,14 +700,16 @@ class TradingEngine:
             self._execute_portfolio_sell(
                 portfolio, positions, pnl_pct, coin_details,
                 f"최종 손절 ({pnl_pct:+.2f}% <= SL {portfolio.stop_loss_pct}%)",
+                target_prices=target_prices,
             )
 
         # ── Tier 2: -1.5% → 33% 추가 매도 ──
         elif not tracker.tier2_sold and tracker.tier1_sold and pnl_pct <= -1.5:
             logger.warning(f"[2차 분할 매도] '{portfolio.name}' {pnl_pct:+.2f}% <= -1.5%")
             self._execute_portfolio_partial_sell(
-                portfolio, positions, ratio=0.5,  # 잔여의 50% ≈ 원래의 33%
+                portfolio, positions, ratio=0.5,
                 reason=f"2차 분할 매도 ({pnl_pct:+.2f}% <= -1.5%)",
+                target_prices=target_prices,
             )
             tracker.tier2_sold = True
 
@@ -567,6 +719,7 @@ class TradingEngine:
             self._execute_portfolio_partial_sell(
                 portfolio, positions, ratio=0.33,
                 reason=f"1차 분할 매도 ({pnl_pct:+.2f}% <= -1.0%)",
+                target_prices=target_prices,
             )
             tracker.tier1_sold = True
 
@@ -580,6 +733,7 @@ class TradingEngine:
         self, portfolio: Portfolio, positions: list[Position],
         pnl_pct: float, coin_details: list[dict],
         tracker: _PortfolioExitTracker,
+        target_prices: dict[str, float] | None = None,
     ) -> None:
         """트레일링 익절 — 고점 추적, 하락 시 매도"""
         if pnl_pct > tracker.peak_pnl_pct:
@@ -598,16 +752,19 @@ class TradingEngine:
             self._execute_portfolio_sell(
                 portfolio, positions, pnl_pct, coin_details,
                 f"트레일링 익절 (고점 {tracker.peak_pnl_pct:+.2f}% → {pnl_pct:+.2f}%)",
+                target_prices=target_prices,
             )
         elif elapsed >= tracker.trailing_timeout:
             self._execute_portfolio_sell(
                 portfolio, positions, pnl_pct, coin_details,
                 f"트레일링 타임아웃 ({elapsed:.0f}초, {pnl_pct:+.2f}%)",
+                target_prices=target_prices,
             )
         elif pnl_pct < portfolio.take_profit_pct * 0.2:
             self._execute_portfolio_sell(
                 portfolio, positions, pnl_pct, coin_details,
                 f"트레일링 모멘텀 상실 ({pnl_pct:+.2f}% < TP의 20%)",
+                target_prices=target_prices,
             )
 
     # ------------------------------------------------------------------ #
@@ -619,8 +776,9 @@ class TradingEngine:
         positions: list[Position],
         ratio: float,
         reason: str,
+        target_prices: dict[str, float] | None = None,
     ) -> None:
-        """8개 코인 각각 ratio만큼 분할 매도"""
+        """8개 코인 각각 ratio만큼 분할 매도 (지정가 3회 → 시장가)"""
         logger.info(f"[분할 매도] '{portfolio.name}' {ratio*100:.0f}% | {reason}")
 
         for pos in positions:
@@ -631,43 +789,44 @@ class TradingEngine:
 
                 sell_units = actual_units * ratio
 
-                # 시세 조회 — 실패 시 매수가 fallback (0원 저장 방지)
-                try:
-                    current_price = self._client.get_current_price(pos.symbol)
-                except Exception as price_err:
-                    current_price = pos.buy_price
-                    logger.warning(
-                        f"  {pos.symbol} 분할매도 시세 조회 실패({price_err})"
-                        f" — 매수가 {current_price:,.0f}원으로 대체"
-                    )
+                # 목표 매도가 결정
+                tgt_price = (target_prices or {}).get(pos.symbol, 0)
+                if tgt_price <= 0:
+                    try:
+                        tgt_price = self._client.get_current_price(pos.symbol)
+                    except Exception:
+                        tgt_price = pos.buy_price
 
-                krw_value = sell_units * current_price
-
-                if krw_value < settings.MIN_ORDER_KRW:
-                    logger.debug(f"  {pos.symbol} 소액({krw_value:.0f}원) 스킵")
+                krw_est = sell_units * tgt_price
+                if krw_est < settings.MIN_ORDER_KRW:
+                    logger.debug(f"  {pos.symbol} 소액({krw_est:.0f}원) 스킵")
                     continue
 
-                result = self._client.market_sell(pos.symbol, sell_units)
-                if result.get("status") == "0000":
+                fill = self._limit_sell_with_retry(pos.symbol, tgt_price, sell_units)
+                if fill["status"] == "0000":
                     self._repo.save_trade(
                         symbol=pos.symbol, side="sell",
-                        price=current_price, units=sell_units,
-                        krw_amount=krw_value, note=reason,
+                        price=fill["filled_price"],
+                        units=fill["filled_units"],
+                        krw_amount=fill["filled_krw"],
+                        note=f"{reason} [{fill['method']}]",
+                        order_id=fill["order_uuid"],
                         portfolio_id=portfolio.id,
+                        target_price=tgt_price,
                     )
-                    # 잔여 수량·투입금액 업데이트 — P&L 기준 보정
-                    remaining_units = actual_units - sell_units
+                    remaining_units = actual_units - fill["filled_units"]
                     remaining_ratio = remaining_units / actual_units if actual_units > 0 else 0.0
                     remaining_buy_krw = pos.buy_krw * remaining_ratio
                     self._repo.update_position_after_partial_sell(
                         pos.id, remaining_units, remaining_buy_krw,
                     )
                     logger.info(
-                        f"  {pos.symbol} {sell_units:.6f}개 매도 ({krw_value:,.0f}원) "
-                        f"잔여={remaining_units:.6f}개 ({remaining_buy_krw:,.0f}원 기준)"
+                        f"  {pos.symbol} {fill['filled_units']:.6f}개 매도 "
+                        f"({fill['filled_krw']:,.0f}원, 체결가={fill['filled_price']:,.0f}원, "
+                        f"목표가={tgt_price:,.0f}원) [{fill['method']}]"
                     )
                 else:
-                    logger.warning(f"  {pos.symbol} 분할 매도 실패: {result}")
+                    logger.warning(f"  {pos.symbol} 분할 매도 실패")
             except Exception as e:
                 logger.error(f"  {pos.symbol} 분할 매도 오류: {e}")
 
@@ -690,19 +849,22 @@ class TradingEngine:
         pnl_pct: float,
         coin_details: list[dict],
         reason: str,
+        target_prices: dict[str, float] | None = None,
     ) -> None:
-        """8개 코인 전량 매도 → 포트폴리오 종료"""
+        """8개 코인 전량 매도 → 포트폴리오 종료 (지정가 3회 → 시장가)"""
         logger.info(f"[포트폴리오 매도] '{portfolio.name}' | {reason}")
 
         total_sell_krw = 0.0
         coin_results = []
 
-        # 직전 감시 루프에서 계산된 가격 — 시세 재조회 실패 시 fallback용
+        # 직전 감시 루프에서 계산된 가격 — 목표가 소스
         detail_price_map: dict[str, float] = {
             d["symbol"]: d["current_price"]
             for d in coin_details
             if d.get("current_price", 0) > 0
         }
+        # 호출자가 전달한 target_prices 우선, 없으면 detail_price_map 사용
+        tgt_map = target_prices or detail_price_map
 
         for pos in positions:
             try:
@@ -721,50 +883,62 @@ class TradingEngine:
                         "sell_price": 0,
                         "sell_krw": round(coin_sell_krw, 0),
                         "pnl_pct": round(coin_pnl, 2),
+                        "target_price": tgt_map.get(pos.symbol, 0),
                         "reason": pos.agent_reason or "",
                     })
                     self._repo.close_position(pos.id)
                     continue
 
-                # 시세 조회 — 실패 시 fallback 체인: 직전가 → 매수가
-                try:
-                    current_price = self._client.get_current_price(pos.symbol)
-                except Exception as price_err:
-                    current_price = detail_price_map.get(pos.symbol, 0) or pos.buy_price
-                    logger.warning(
-                        f"  {pos.symbol} 전량매도 시세 조회 실패({price_err})"
-                        f" — {current_price:,.0f}원으로 대체"
-                    )
+                # 목표 매도가 결정
+                tgt_price = tgt_map.get(pos.symbol, 0)
+                if tgt_price <= 0:
+                    try:
+                        tgt_price = self._client.get_current_price(pos.symbol)
+                    except Exception:
+                        tgt_price = detail_price_map.get(pos.symbol, 0) or pos.buy_price
 
-                krw_value = actual_units * current_price
+                fill = self._limit_sell_with_retry(pos.symbol, tgt_price, actual_units)
+                if fill["status"] == "0000":
+                    krw_value = fill["filled_krw"]
+                    filled_price = fill["filled_price"]
 
-                result = self._client.market_sell(pos.symbol, actual_units)
-                if result.get("status") == "0000":
                     self._repo.save_trade(
                         symbol=pos.symbol, side="sell",
-                        price=current_price, units=actual_units,
-                        krw_amount=krw_value, note=reason,
+                        price=filled_price,
+                        units=fill["filled_units"],
+                        krw_amount=krw_value,
+                        note=f"{reason} [{fill['method']}]",
+                        order_id=fill["order_uuid"],
                         portfolio_id=portfolio.id,
+                        target_price=tgt_price,
                     )
                     total_sell_krw += krw_value
-                    logger.info(f"  {pos.symbol} 전량 매도 ({krw_value:,.0f}원)")
+                    logger.info(
+                        f"  {pos.symbol} 전량 매도 ({krw_value:,.0f}원, "
+                        f"체결가={filled_price:,.0f}원, 목표가={tgt_price:,.0f}원) "
+                        f"[{fill['method']}]"
+                    )
                 else:
-                    logger.warning(f"  {pos.symbol} 매도 실패: {result}")
-                    total_sell_krw += pos.buy_krw  # 실패 시 매수가 기준
+                    logger.warning(f"  {pos.symbol} 매도 실패")
+                    krw_value = pos.buy_krw
+                    filled_price = tgt_price
+                    total_sell_krw += pos.buy_krw
 
-                # coin pnl은 매수금액 대비 실제 매도금액으로 계산 (price 오류 영향 제거)
+                # coin pnl은 매수금액 대비 실제 매도금액으로 계산
                 coin_pnl = (krw_value - pos.buy_krw) / pos.buy_krw * 100 if pos.buy_krw > 0 else 0
                 coin_results.append({
                     "symbol": pos.symbol,
                     "buy_price": pos.buy_price,
                     "buy_krw": pos.buy_krw,
-                    "sell_price": current_price,
+                    "sell_price": filled_price,
                     "sell_krw": round(krw_value, 0),
                     "pnl_pct": round(coin_pnl, 2),
+                    "target_price": tgt_price,
+                    "units": fill.get("filled_units", actual_units),
                     "reason": pos.agent_reason or "",
                 })
                 self._repo.close_position(pos.id)
-                time.sleep(_BUY_INTERVAL_SEC)  # API 간격
+                time.sleep(_BUY_INTERVAL_SEC)
             except Exception as e:
                 logger.error(f"  {pos.symbol} 매도 오류: {e}")
                 self._repo.close_position(pos.id)

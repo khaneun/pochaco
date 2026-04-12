@@ -76,6 +76,8 @@ class PortfolioEvaluator(BaseSpecialistAgent):
         try:
             # 개별 코인 결과 텍스트
             coin_lines = []
+            slippage_lines = []
+            total_slippage_krw = 0.0
             winners = 0
             losers = 0
             for cr in coin_results:
@@ -89,7 +91,21 @@ class PortfolioEvaluator(BaseSpecialistAgent):
                     winners += 1
                 else:
                     losers += 1
+
+                # 체결 품질 (목표가 vs 실제 체결가)
+                tp = cr.get("target_price", 0)
+                sp = cr.get("sell_price", 0)
+                coin_units = cr.get("units", 0)
+                if tp > 0 and sp > 0:
+                    slip_pct = (sp - tp) / tp * 100
+                    slip_krw = (sp - tp) * coin_units
+                    total_slippage_krw += slip_krw
+                    slippage_lines.append(
+                        f"  - {cr['symbol']}: 목표 {tp:,.0f}원 → "
+                        f"체결 {sp:,.0f}원 ({slip_pct:+.2f}%)"
+                    )
             coin_text = "\n".join(coin_lines) if coin_lines else "  (정보 없음)"
+            slippage_text = "\n".join(slippage_lines) if slippage_lines else "  (데이터 없음)"
 
             # 누적 성과 요약
             history_summary = ""
@@ -120,6 +136,10 @@ class PortfolioEvaluator(BaseSpecialistAgent):
 
 **개별 코인 결과:**
 {coin_text}
+
+**체결 품질 (목표가 vs 실제 체결가):**
+{slippage_text}
+총 슬리피지: {total_slippage_krw:+,.0f}원
 {history_summary}
 
 **평가 관점:**
@@ -127,6 +147,8 @@ class PortfolioEvaluator(BaseSpecialistAgent):
 2. 익절이 너무 높아서 도달하지 못했는가? → 낮추기 (단, 최소 4.0% 유지)
 3. 손절이 너무 좁아서 반등 기회 없이 매도되었는가? → 소폭 넓히기 (최대 -2.0%)
 4. 보유 시간이 길었다면 익절을 낮춰 빠른 트레일링 진입 도모
+5. ★체결 품질★: 목표가 대비 실제 체결가 편차가 큰 코인은 유동성 부족.
+   슬리피지가 -0.3% 이상이면 다음 포트폴리오에서 해당 코인 재선정 불가 권고.
 
 반드시 아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
 {{

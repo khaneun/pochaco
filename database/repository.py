@@ -199,12 +199,14 @@ class TradeRepository:
         order_id: str = "",
         note: str = "",
         portfolio_id: int | None = None,
+        target_price: float | None = None,
     ) -> Trade:
         with self._session() as db:
             trade = Trade(
                 portfolio_id=portfolio_id,
                 symbol=symbol, side=side, price=price, units=units,
                 krw_amount=krw_amount, fee=fee, order_id=order_id, note=note,
+                target_price=target_price,
             )
             db.add(trade)
             db.flush()

@@ -75,6 +75,7 @@ class Trade(Base):
     krw_amount = Column(Float, nullable=False)
     fee = Column(Float, default=0.0)
     order_id = Column(String(50), index=True)
+    target_price = Column(Float, nullable=True)   # 목표 체결가 (지정가 매도 기준가)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     note = Column(Text)
 
@@ -247,3 +248,32 @@ _backup_and_reset_db()
 engine = _make_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base.metadata.create_all(engine)
+
+
+def _ensure_schema_updates() -> None:
+    """create_all이 기존 테이블에 추가하지 못하는 컬럼을 ALTER로 보완"""
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    db_url = settings.DATABASE_URL
+    if db_url:
+        return  # 외부 DB는 수동 마이그레이션 필요
+
+    db_path = settings.DB_PATH
+    if not os.path.exists(db_path):
+        return
+
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.execute("PRAGMA table_info(trades)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "target_price" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN target_price FLOAT")
+            conn.commit()
+            _log.info("[DB 스키마] trades.target_price 컬럼 추가 완료")
+    finally:
+        conn.close()
+
+
+_ensure_schema_updates()
