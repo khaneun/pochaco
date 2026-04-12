@@ -16,6 +16,7 @@ _APP_DIR = Path(__file__).parent
 
 from config import settings
 from core import BithumbClient
+from core.derivatives_client import DerivativesClient
 from core.llm_provider import get_llm_provider
 from core.telegram_bot import TelegramBot
 from database import TradeRepository
@@ -70,11 +71,12 @@ def main() -> None:
     check_config()
 
     # 인프라 의존성
-    client    = BithumbClient()
-    repo      = TradeRepository()
-    analyzer  = MarketAnalyzer(client)
-    optimizer = StrategyOptimizer()
-    selector  = CoinSelector()
+    client      = BithumbClient()
+    repo        = TradeRepository()
+    derivatives = DerivativesClient()
+    analyzer    = MarketAnalyzer(client, derivatives=derivatives)
+    optimizer   = StrategyOptimizer()
+    selector    = CoinSelector()
 
     # LLM 공급자 (공유)
     llm = get_llm_provider()

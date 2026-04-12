@@ -155,6 +155,7 @@ class BaseSpecialistAgent(ABC):
         )
         messages = list(history or [])
         messages.append({"role": "user", "content": message})
+        self._llm._current_agent = self.ROLE_NAME or "unknown"
         return self._llm.chat_with_system(system, messages, max_tokens=1024)
 
     # ---------------------------------------------------------------- #
@@ -175,6 +176,7 @@ class BaseSpecialistAgent(ABC):
     def _call_llm(self, task_prompt: str, max_tokens: int = 512) -> str:
         """시스템 컨텍스트 + 작업 프롬프트로 LLM 호출"""
         full_prompt = f"{self._build_system_context()}\n\n---\n\n{task_prompt}"
+        self._llm._current_agent = self.ROLE_NAME or "unknown"
         return self._llm.chat(full_prompt, max_tokens=max_tokens)
 
     def _parse_json(self, raw: str) -> dict:

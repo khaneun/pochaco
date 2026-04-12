@@ -1,22 +1,27 @@
-"""종목 선정 전담 Agent — 변동성·거래량·모멘텀 기반 사전 필터링
+"""종목 선정 전담 Agent — 기술적 분석 지표 기반 사전 필터링
 
-문제: 24h 등락폭이 ±1% 수준인 코인에 2~3% 익절을 기대하는 것은 비현실적.
-해결: AI에게 넘기기 전에 수학적으로 필터링 + 스코어링.
+핵심 원칙: 이미 급등한 코인에 진입하면 조정/하락을 맞음.
+→ RSI 과매수, 가짜 상승(가격↑+거래량↓), 볼린저 상단 이탈 등을 적극 차단.
 
-동작:
+필터링 파이프라인:
   1. 변동폭(고저차) < 목표 익절 × 1.5 → 제외 (변동성 부족)
   2. 거래대금 < 50억 → 제외 (유동성 부족)
-  3. 하락 추세 → 제외 (다중 기준 복합 판정 — 아래 _check_downtrend 참고)
-  4. 나머지를 [변동성 × 모멘텀 × 거래량] 가중 스코어로 정렬
-  5. 상위 10개만 AI에게 전달 → AI는 검증된 후보풀에서만 선택
+  3. 하락 추세 → 제외 (다중 기준 복합 판정)
+  4. ★ RSI > 75 → 제외 (과매수 — 조정 임박)
+  5. ★ 가격↑ + 거래량↓ 다이버전스 → 제외 (가짜 상승)
+  6. 나머지를 기술 지표 포함 가중 스코어로 정렬
+  7. 상위 20개만 AI에게 전달
 
-하락 추세 판정 기준 (하나라도 해당 시 제외):
-  A. 24h 변동률 < -2.0%               — 강한 일봉 하락
-  B. 최근 3h 변화율 < -1.5%           — 현재 단기 급락 중
-  C. 최근 4캔들 중 3개 이상 하락       — 단, 24h < 1.0% 조건 병행 (강한 상승 조정은 허용)
-  D. 24h < -1.0% 이고 최근 2h도 하락  — 중단기 동반 하락 확인
-  E. 저가 근처(하위 15%) + 최근 2h 하락 — 바닥 다이빙
+스코어링 가중치 (개편):
+  - 기술 신호 강도 (signal_strength)  30%  ← 신규: RSI+MACD+OBV+BB 종합
+  - 모멘텀 (캔들 기반)                20%
+  - 변동성                            15%
+  - 거래량/거래대금                    15%
+  - 현재가 위치 (밴드 내)              10%
+  - MACD 방향 보너스                  10%
 """
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 
@@ -36,10 +41,16 @@ _DOWN_2H_ANY        =  0.0   # 24h mild 하락 + 단기 이 이하면 제외
 _DOWN_CONSEC_RATIO  =  3     # 연속 하락 캔들 수 (최근 4개 중)
 _LOW_POSITION_PCT   = 15.0   # 저가 근처 기준 (%)
 
+# 기술 지표 필터 임계값
+_RSI_OVERBOUGHT          = 75     # RSI 이상 → 과매수 제외
+
+# 파생 지표 필터 임계값
+_FUNDING_EXTREME_LONG    = 0.10   # 펀딩비 이상 → 극단 롱과열 제외 (8h %)
+
 
 @dataclass
 class CoinScore:
-    """코인 사전 분석 결과"""
+    """코인 사전 분석 결과 (기술 지표 + 파생 데이터 포함)"""
     symbol: str
     total_score: float
     volatility_pct: float      # 24h 고저 변동폭 %
@@ -47,6 +58,18 @@ class CoinScore:
     momentum: float            # 캔들 기반 모멘텀 (-10 ~ +10)
     volume_score: float        # 거래량 점수
     reason: str                # 선별/제외 이유
+    # 기술 지표 요약 (AI 프롬프트에 전달)
+    rsi: float = 50.0
+    macd_trend: str = "중립"
+    obv_trend: str = "횡보"
+    bb_position: float = 0.5
+    signal_strength: float = 50.0
+    overall_signal: str = "중립"
+    technical_summary: str = ""
+    # 파생 데이터 요약 (AI 프롬프트에 전달)
+    funding_rate: float = 0.0
+    funding_signal: str = "중립"
+    derivatives_summary: str = ""
 
 
 class CoinSelector:
@@ -116,8 +139,9 @@ class CoinSelector:
         for sc in result_scores[:5]:
             logger.info(
                 f"  #{result_scores.index(sc)+1} {sc.symbol}: "
-                f"score={sc.total_score:.2f} 변동폭={sc.volatility_pct:.1f}% "
-                f"모멘텀={sc.momentum:+.1f} 위치={sc.price_position:.0f}%"
+                f"score={sc.total_score:.2f} RSI={sc.rsi:.0f} "
+                f"MACD={sc.macd_trend} OBV={sc.obv_trend} "
+                f"신호={sc.overall_signal}({sc.signal_strength:.0f})"
             )
 
         return result_snapshots, result_scores
@@ -178,6 +202,40 @@ class CoinSelector:
                 rejected += 1
                 continue
 
+            ti = s.technical  # TechnicalIndicators
+
+            # ── 기술 지표 필터 ──
+
+            # RSI 과매수 필터: RSI > 75 → 조정 임박, 진입 금지
+            if ti.rsi_14 >= _RSI_OVERBOUGHT:
+                logger.debug(
+                    f"  [제외] {s.symbol}: RSI 과매수 {ti.rsi_14:.0f} "
+                    f"(≥{_RSI_OVERBOUGHT})"
+                )
+                rejected += 1
+                continue
+
+            # 가격-거래량 다이버전스 필터: 가격↑+거래량↓ → 가짜 상승
+            if ti.price_volume_divergence and s.change_pct_24h > 2.0:
+                logger.debug(
+                    f"  [제외] {s.symbol}: 가짜 상승 의심 "
+                    f"(24h +{s.change_pct_24h:.1f}% but 거래량 다이버전스)"
+                )
+                rejected += 1
+                continue
+
+            # ── 파생 지표 필터 ──
+
+            # 극단 롱과열 필터: 펀딩비 > 0.10% → 롱 쏠림 극심, 조정 고위험
+            deriv = s.derivatives
+            if deriv.available and deriv.funding_rate > _FUNDING_EXTREME_LONG:
+                logger.debug(
+                    f"  [제외] {s.symbol}: 극단 롱과열 "
+                    f"펀딩비 {deriv.funding_rate:+.3f}% (>{_FUNDING_EXTREME_LONG}%)"
+                )
+                rejected += 1
+                continue
+
             # 현재가 위치
             price_range = s.high_price - s.low_price
             price_position = (
@@ -187,20 +245,49 @@ class CoinSelector:
 
             momentum = self._analyze_candle_momentum(s.candlestick_1h)
 
-            vol_score   = min(volatility_pct / 2.0, 5.0)
-            trend_score = min(max(s.change_pct_24h, 0) * 2, 5.0)
-            mom_score   = max(momentum, 0) / 2.0
-            v_score     = min(s.volume_krw_24h / 2e10, 3.0)
-            pos_score   = 2.0 if 50 <= price_position <= 80 else (
-                1.0 if 30 <= price_position <= 90 else 0.0
-            )
+            # ── 개편된 스코어링 (기술 지표 반영) ──
+
+            # 기술 신호 강도 (30%) — RSI+MACD+OBV+BB 종합
+            tech_score = ti.signal_strength / 20.0  # 0~5 스케일
+
+            # 모멘텀 (20%)
+            mom_score = max(momentum, 0) / 2.0      # 0~5 스케일
+
+            # 변동성 (15%)
+            vol_score = min(volatility_pct / 2.0, 5.0)
+
+            # 거래량 (15%)
+            v_score = min(s.volume_krw_24h / 2e10, 3.0)
+
+            # 현재가 위치 — 볼린저 밴드 기준 (10%)
+            # BB 하단~중간이 매수 적정 (0.2~0.5)
+            if 0.2 <= ti.bb_position <= 0.5:
+                pos_score = 3.0     # 이상적 매수 구간
+            elif 0.1 <= ti.bb_position <= 0.65:
+                pos_score = 1.5
+            elif ti.bb_position > 0.85:
+                pos_score = -1.0    # 상단 이탈 — 감점
+            else:
+                pos_score = 0.5
+
+            # MACD 보너스 (10%)
+            macd_bonus = 0.0
+            if ti.macd_trend == "골든크로스":
+                macd_bonus = 3.0
+            elif ti.macd_trend == "상승":
+                macd_bonus = 1.5
+            elif ti.macd_trend == "데드크로스":
+                macd_bonus = -2.0
+            elif ti.macd_trend == "하락":
+                macd_bonus = -0.5
 
             total = (
-                vol_score * 0.25
-                + trend_score * 0.25
-                + mom_score * 0.25
+                tech_score * 0.30
+                + mom_score * 0.20
+                + vol_score * 0.15
                 + v_score * 0.15
                 + pos_score * 0.10
+                + macd_bonus * 0.10
             )
 
             score = CoinScore(
@@ -211,8 +298,19 @@ class CoinSelector:
                 momentum=round(momentum, 2),
                 volume_score=round(v_score, 2),
                 reason=self._make_reason(
-                    volatility_pct, s.change_pct_24h, momentum, price_position
+                    volatility_pct, s.change_pct_24h, momentum,
+                    price_position, ti, s.derivatives if s.derivatives.available else None,
                 ),
+                rsi=round(ti.rsi_14, 1),
+                macd_trend=ti.macd_trend,
+                obv_trend=ti.obv_trend,
+                bb_position=round(ti.bb_position, 2),
+                signal_strength=round(ti.signal_strength, 1),
+                overall_signal=ti.overall_signal,
+                technical_summary=ti.summary,
+                funding_rate=round(deriv.funding_rate, 4) if deriv.available else 0.0,
+                funding_signal=deriv.funding_signal if deriv.available else "중립",
+                derivatives_summary=deriv.summary if deriv.available else "",
             )
             scored.append((s, score))
 
@@ -342,29 +440,57 @@ class CoinSelector:
             return 0.0
 
     @staticmethod
-    def _make_reason(volatility: float, change: float, momentum: float, position: float) -> str:
-        """코인 선별 이유 생성"""
+    def _make_reason(
+        volatility: float,
+        change: float,
+        momentum: float,
+        position: float,
+        ti: "TechnicalIndicators | None" = None,
+        deriv: "DerivativesData | None" = None,
+    ) -> str:
+        """코인 선별 이유 생성 (기술 지표 + 파생 데이터 포함)"""
         parts = []
+
+        # 기술 지표 기반 (우선)
+        if ti:
+            if ti.rsi_14 <= 35:
+                parts.append(f"RSI 과매도({ti.rsi_14:.0f})")
+            elif ti.rsi_14 >= 65:
+                parts.append(f"RSI 높음({ti.rsi_14:.0f})")
+            else:
+                parts.append(f"RSI {ti.rsi_14:.0f}")
+
+            if ti.macd_trend == "골든크로스":
+                parts.append("MACD 골든크로스")
+            elif ti.macd_trend == "상승":
+                parts.append("MACD 상승")
+
+            if ti.obv_trend == "상승":
+                parts.append("OBV 상승(실질 매수세)")
+            elif ti.obv_trend == "하락":
+                parts.append("OBV 하락 주의")
+
+            if ti.bb_position <= 0.3:
+                parts.append("BB 하단(저평가)")
+            elif ti.bb_position >= 0.85:
+                parts.append("BB 상단(고평가)")
+
+        # 파생 데이터
+        if deriv:
+            if deriv.funding_signal in ("롱과열", "극단롱과열"):
+                parts.append(f"펀딩비 {deriv.funding_rate:+.3f}%({deriv.funding_signal})")
+            elif deriv.funding_signal == "숏과열":
+                parts.append(f"펀딩비 {deriv.funding_rate:+.3f}%(숏과열→반등주목)")
+            if deriv.oi_trend in ("급증", "증가"):
+                parts.append(f"OI {deriv.oi_trend}")
+
+        # 기존 지표
         if volatility > 8:
             parts.append("고변동성")
         elif volatility > 4:
             parts.append("적정 변동성")
 
-        if change > 3:
-            parts.append("강한 상승세")
-        elif change > 1:
-            parts.append("상승 추세")
-        elif change > 0:
-            parts.append("약간 상승")
-
         if momentum > 3:
-            parts.append("상승 모멘텀 강함")
-        elif momentum > 0:
-            parts.append("모멘텀 양호")
-
-        if 50 <= position <= 80:
-            parts.append("매수 적정 위치")
-        elif position > 85:
-            parts.append("고가 근접 주의")
+            parts.append("모멘텀 강함")
 
         return ", ".join(parts) if parts else "일반"

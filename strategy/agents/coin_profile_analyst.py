@@ -34,14 +34,15 @@ class CoinProfileAnalyst(BaseSpecialistAgent):
         self._base_prompt = (
             "당신은 코인별 매매 특성을 누적 학습하는 전문가입니다.\n\n"
             "【핵심 임무】\n"
-            "매매가 완료될 때마다 해당 코인의 프로파일을 업데이트합니다.\n"
+            "매매가 완료될 때마다 해당 코인의 프로파일을 기술적 분석 데이터 기반으로 업데이트합니다.\n"
             "이 프로파일은 매수 전문가가 포트폴리오 구성 시 직접 참고하므로,\n"
-            "실전에서 즉시 활용 가능한 구체적 인사이트를 작성해야 합니다.\n\n"
-            "【프로파일 작성 원칙】\n"
-            "★ '이 코인을 다시 매수해야 할까?' 질문에 답할 수 있어야 합니다\n"
-            "★ 패턴 인식: 반복되는 가격 행동이 있으면 반드시 기록\n"
-            "★ 최적 조건: 어떤 시장 상황에서 이 코인이 잘 움직이는지\n"
-            "★ 위험 신호: 과거에 손절당한 상황의 공통점\n"
+            "막연한 서술 대신 구체적 기술 지표 수치와 패턴을 기록해야 합니다.\n\n"
+            "【프로파일 작성 원칙 — 기술 지표 중심】\n"
+            "★ 매매 이력에 진입 시점의 RSI·MACD·OBV 상태를 반드시 기록\n"
+            "★ 손절 시: RSI가 몇이었는지, MACD 방향, OBV 추세, BB 위치 기록\n"
+            "★ 익절 시: 어떤 기술 지표 조건에서 진입해서 성공했는지 기록\n"
+            "★ '이 코인의 최적 진입 RSI는?', '어떤 MACD 상태에서 성공률이 높은가?' 에 답할 수 있어야 합니다\n"
+            "★ 반복 패턴: RSI 과매수 진입 후 손절 반복이면 반드시 경고 기록\n"
             "★ 매매 이력은 최신 10건만 유지 (초과 시 오래된 것 제거)"
         )
 
@@ -167,7 +168,7 @@ class CoinProfileAnalyst(BaseSpecialistAgent):
 
     @staticmethod
     def _format_trade(ctx: dict) -> str:
-        """새 거래 데이터를 프롬프트용 텍스트로 포맷"""
+        """새 거래 데이터를 프롬프트용 텍스트로 포맷 (기술 지표 포함)"""
         exit_kr = {
             "take_profit": "익절",
             "stop_loss":   "손절",
@@ -175,6 +176,11 @@ class CoinProfileAnalyst(BaseSpecialistAgent):
         sl1       = ctx.get("original_sl_1st")
         sl1_str   = f"{sl1}%" if sl1 else "없음"
         partial   = "실행" if ctx.get("partial_sl_executed") else "미실행"
+
+        # 기술 지표 (진입 시점)
+        tech = ctx.get("technical_summary", "")
+        tech_line = f"기술지표  : {tech}\n" if tech else ""
+
         return (
             f"거래일시  : {ctx.get('trade_time', '')}\n"
             f"결과      : {exit_kr} {ctx.get('pnl_pct', 0):+.2f}%\n"
@@ -182,6 +188,7 @@ class CoinProfileAnalyst(BaseSpecialistAgent):
             f"보유 시간 : {ctx.get('held_minutes', 0):.0f}분\n"
             f"설정      : TP +{ctx.get('original_tp', 0)}% / "
             f"SL1 {sl1_str} / SL2 {ctx.get('original_sl', 0)}% / 1차손절 {partial}\n"
+            f"{tech_line}"
             f"매수 이유 : {ctx.get('agent_reason', '')}\n"
             f"AI 평가   : {ctx.get('evaluation', '')}\n"
             f"교훈      : {ctx.get('lesson', '')}"
@@ -201,24 +208,29 @@ class CoinProfileAnalyst(BaseSpecialistAgent):
             f"**새로 완료된 거래 데이터:**\n{new_trade}\n\n"
             f"위 정보를 바탕으로 {symbol} 특성 프로파일을 작성·업데이트하세요.\n\n"
             f"**작성 규칙:**\n"
-            f"- 전체 분량: 500자 이내 (간결하게)\n"
+            f"- 전체 분량: 600자 이내 (간결하게)\n"
             f"- 매매 이력: 최신 10건만 유지 (초과 시 가장 오래된 항목 제거)\n"
+            f"- ★ 기술 지표(RSI, MACD, OBV) 수치를 반드시 포함할 것\n"
+            f"- 막연한 서술('변동성 크다') 금지, 구체적 수치('RSI 72 진입→손절') 필수\n"
             f"- 아래 마크다운 형식을 정확히 따를 것 (코드블록 없이 순수 마크다운)\n\n"
             f"---\n"
             f"# {symbol} 특성 프로파일\n"
             f"*마지막 업데이트: {today}*\n\n"
-            f"## 가격 특성\n"
-            f"- (변동성·패턴·고유 특징 2~3줄)\n\n"
+            f"## 기술 지표 패턴\n"
+            f"- 최적 진입 RSI: (경험 기반, 예: 35~50)\n"
+            f"- 위험 진입 RSI: (과매수 진입 후 손절 패턴이 있으면 기록)\n"
+            f"- MACD 성공 패턴: (골든크로스 진입 성공률 등)\n"
+            f"- OBV 특이사항: (가짜 상승 경험 등)\n\n"
             f"## 매매 이력 (최신순, 최대 10건)\n"
-            f"| 날짜 | 결과 | 수익률 | 보유 | 핵심 교훈 |\n"
-            f"|------|------|--------|------|-----------|\n"
-            f"| YYYY-MM-DD | 익절/손절 | +X.X% | X분 | ... |\n\n"
+            f"| 날짜 | 결과 | 수익률 | 보유 | RSI | MACD | 핵심교훈 |\n"
+            f"|------|------|--------|------|-----|------|---------|\n"
+            f"| YYYY-MM-DD | 익절/손절 | +X.X% | X분 | 65 | 상승 | ... |\n\n"
             f"## 전략 권고\n"
-            f"- 최적 TP: (경험 기반 범위)\n"
-            f"- SL 기준: (경험 기반 범위)\n"
-            f"- 유리한 진입 조건: (조건)\n\n"
+            f"- 최적 TP/SL: (경험 기반 범위)\n"
+            f"- 유리한 진입 조건: (RSI·MACD·OBV 조합)\n"
+            f"- 회피 조건: (어떤 기술 상태에서 손절 반복되는지)\n\n"
             f"## 주의사항\n"
-            f"- (이 코인 매매 시 특히 주의할 점)\n"
+            f"- (이 코인 매매 시 특히 주의할 기술적 신호)\n"
             f"---"
         )
 

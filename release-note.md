@@ -2,6 +2,52 @@
 
 ---
 
+## v4.1.0 (2026-04-12)
+
+### 기술적·파생 분석 고도화 — RSI/MACD/OBV/BB + Binance Futures 연동
+
+#### 핵심 신규: 기술적 분석 지표 엔진
+- **`strategy/technical_analyzer.py` 신규**: RSI(14), MACD(12/26/9), SMA/EMA, 볼린저밴드(20/2σ), OBV 순수 계산 모듈
+  - `TechnicalIndicators` 데이터클래스: 20개 지표 필드 + 종합 신호(overall_signal, signal_strength)
+  - 빗썸 캔들 50개 기반 계산 (기존 24개 → 50개, MACD 35 커버)
+- **`CoinSelector` 필터링 강화**:
+  - RSI ≥ 75 → 과매수 제외 (조정 임박 차단)
+  - 가격↑+거래량↓ 다이버전스 → 가짜 상승 제외
+  - 스코어링 개편: 기술신호 30% + 모멘텀 20% + 변동성 15% + 거래량 15% + BB위치 10% + MACD보너스 10%
+
+#### 핵심 신규: 파생상품 데이터 통합
+- **`core/derivatives_client.py` 신규**: Binance Futures + Bybit Public API 클라이언트 (인증 불필요)
+  - `GET /fapi/v1/premiumIndex` 배치 1회 호출 → 전체 펀딩비 수집 (60초 캐시)
+  - `GET /fapi/v1/openInterest` + `/futures/data/openInterestHist` → 주요 5종 OI 및 1h 변화율
+  - Binance 실패 시 Bybit `/v5/market/tickers` 자동 폴백
+  - 60개+ 빗썸 심볼 ↔ USDT 선물 심볼 자동 매핑
+- **`CoinSnapshot`에 `derivatives: DerivativesData` 필드 추가**
+- **펀딩비 과열 필터**: 극단 롱과열(> 0.10% / 8h) 코인 진입 자동 차단
+
+#### MarketAnalyst 프롬프트 대폭 강화
+- **파생 경고 섹션 신규**: 펀딩비 0.05% → 롱과열 경보, 0.10% → risk_level=high 강제
+- **익절 성공 패턴 8가지 명시**: RSI 35~55 반전, MACD 골든크로스 직후, OBV 상승+가격 횡보, BB 밴드 수축 등
+- 파생 통계 섹션 (`_build_tech_stats()`): 펀딩비 평균·롱과열 비율·OI 증가 건수 포함
+
+#### 손절 자동 감점 시스템 (MetaEvaluator)
+- 손절률 ≥ 50% → 시장 분석가 -10점, 매수 전문가 -10점
+- 손절률 ≥ 70% → 각 -15점, -20점
+- 손절률 100% → 각 -30점, -20점 + priority="critical" 자동 격상
+
+#### LLM 사용량 추적 (`/system` 페이지)
+- `_UsageTracker` 싱글톤: 세션당 Input/Output 토큰, USD/KRW 비용 실시간 집계
+- `/system` 웹 페이지: Agent별 토큰·비용 테이블 + 최근 100건 호출 로그
+
+#### 특성 분석가 기술 지표 중심 개편
+- 프로파일 템플릿: `## 기술 지표 패턴` 섹션 + 매매이력 테이블에 RSI/MACD 컬럼
+- `_format_trade()`: `technical_summary` 필드 추가 → 진입 시 기술 지표 기록
+
+#### 대시보드 개선
+- 수동 청산 내역이 포트폴리오 거래 내역에 표시 (`exit_type="manual"`, 주황 배지)
+- 포트폴리오 거래 내역 카드에서 매매구분 배지 제거 (P&L 색상으로 구분)
+
+---
+
 ## v4.0.0 (2026-04-11)
 
 ### 8코인 분산 포트폴리오 매매 시스템 전면 전환 + Agent 프롬프트 강화

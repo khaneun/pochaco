@@ -24,6 +24,7 @@ from config import settings
 from database import TradeRepository
 from database.models import Position
 from strategy import cooldown as cooldown_registry
+from core.llm_provider import usage_tracker
 
 if TYPE_CHECKING:
     from core import BithumbClient
@@ -338,7 +339,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
             font-size: 0.75rem; font-weight: 600; }}
   .badge-green {{ background: #450a0a; color: #f87171; }}
   .badge-red   {{ background: #1e3a5f; color: #60a5fa; }}
-  .badge-open  {{ background: #14532d; color: #86efac; }}
+  .badge-open   {{ background: #14532d; color: #86efac; }}
+  .badge-manual {{ background: #422006; color: #fb923c; }}
   /* 포트폴리오 거래 1줄 행 */
   .pf-tx-list {{ display: flex; flex-direction: column; }}
   .pf-tx-row  {{ display: flex; align-items: center; padding: 7px 12px;
@@ -545,6 +547,8 @@ document.addEventListener('DOMContentLoaded', function() {{
        border-radius:6px; background:{nav_dashboard_bg};">종합 대시보드</a>
     <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
        border-radius:6px; background:{nav_experts_bg};">전문가 실적표</a>
+    <a href="/system" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:{nav_system_bg};">시스템</a>
   </nav>
 </header>
 
@@ -793,7 +797,6 @@ def _render_html(data: dict) -> str:
             f"<div class='pf-tx-dt'><b>{_dt_date}</b><small>{_dt_time}</small></div>"
             f"<div class='pf-tx-nm'><b>[{pf['coin_count']}] {pf['name']}</b></div>"
             f"<span class='pf-tx-held'>⏱ {held_str_open}</span>"
-            f"<span class='badge badge-open'>보유중</span>"
             f"<div class='pf-tx-pnl'>"
             f"<div class='pf-tx-pnl-r {open_pnl_color}'>{pf['pnl_pct']:+.2f}%</div>"
             f"<div class='pf-tx-pnl-k {open_pnl_color}'>{open_pnl_krw:+,.0f}원</div>"
@@ -822,8 +825,12 @@ def _render_html(data: dict) -> str:
     # 종료된 포트폴리오 (평가 기록 기반)
     for ev in data.get("evaluations", []):
         idx = len(pf_tx_popup_list)
-        exit_kr = "익절" if ev["exit_type"] == "take_profit" else "손절"
-        exit_class = "badge-green" if ev["exit_type"] == "take_profit" else "badge-red"
+        if ev["exit_type"] == "take_profit":
+            exit_kr, exit_class = "익절", "badge-green"
+        elif ev["exit_type"] == "manual":
+            exit_kr, exit_class = "수동", "badge-manual"
+        else:
+            exit_kr, exit_class = "손절", "badge-red"
         coin_count = ev.get("coin_count", "?")
         pnl_krw = ev.get("pnl_krw") or 0
         pnl_color = "green" if pnl_krw > 0 else ("red" if pnl_krw < 0 else "gray")
@@ -837,7 +844,6 @@ def _render_html(data: dict) -> str:
             f"<div class='pf-tx-dt'><b>{_dt_date}</b><small>{_dt_time}</small></div>"
             f"<div class='pf-tx-nm'><b>[{coin_count}] {ev['portfolio_name']}</b></div>"
             f"<span class='pf-tx-held'>⏱ {held_str_closed}</span>"
-            f"<span class='badge {exit_class}'>{exit_kr}</span>"
             f"<div class='pf-tx-pnl'>"
             f"<div class='pf-tx-pnl-r {pnl_color}'>{ev['pnl_pct']:+.2f}%</div>"
             f"<div class='pf-tx-pnl-k {pnl_color}'>{pnl_krw:+,.0f}원</div>"
@@ -910,7 +916,12 @@ def _render_html(data: dict) -> str:
             )
             held = ev["held_minutes"]
             held_str_popup = f"{held/60:.1f}시간" if held >= 60 else f"{held:.0f}분"
-            exit_label = "익절" if ev["exit_type"] == "take_profit" else "손절"
+            if ev["exit_type"] == "take_profit":
+                exit_label = "익절"
+            elif ev["exit_type"] == "manual":
+                exit_label = "수동청산"
+            else:
+                exit_label = "손절"
             eval_popup_list.append({
                 "symbol": ev_label,
                 "time": ev["time"],
@@ -1054,6 +1065,8 @@ function showPfTx(idx) {
     ? '<span style="background:#1d4ed8;color:#bfdbfe;padding:2px 8px;border-radius:4px;font-size:0.78rem;">보유 중</span>'
     : (d.exit_type === 'take_profit'
       ? '<span style="background:#166534;color:#bbf7d0;padding:2px 8px;border-radius:4px;font-size:0.78rem;">익절</span>'
+      : d.exit_type === 'manual'
+      ? '<span style="background:#7c2d12;color:#fdba74;padding:2px 8px;border-radius:4px;font-size:0.78rem;">수동청산</span>'
       : '<span style="background:#991b1b;color:#fecaca;padding:2px 8px;border-radius:4px;font-size:0.78rem;">손절</span>');
   var timeStr = d.is_open ? ('매수: ' + d.opened_at) : ('종료: ' + d.closed_at);
   var heldStr = d.is_open
@@ -1189,6 +1202,7 @@ document.addEventListener('DOMContentLoaded', function() {
         version=data.get("version", ""),
         nav_dashboard_bg="#334155",
         nav_experts_bg="transparent",
+        nav_system_bg="transparent",
         total_assets_fmt=fmt_krw(bal["total_assets"]),
         krw_fmt=fmt_krw(bal["krw"]),
         pos_asset_line=pos_asset_line,
@@ -1213,6 +1227,227 @@ document.addEventListener('DOMContentLoaded', function() {
         extra_css=extra_css,
         extra_js=extra_js,
     )
+
+
+def _render_system_page() -> str:
+    """시스템 페이지 — LLM 토큰 사용량 & 비용 대시보드"""
+    from core.llm_provider import usage_tracker
+    stats = usage_tracker.get_stats()
+
+    version = _VERSION
+    now_str = _kst_now().strftime("%m-%d %H:%M:%S")
+
+    # ── 요약 카드 ──
+    total_calls    = stats["total_calls"]
+    total_in       = stats["total_input_tokens"]
+    total_out      = stats["total_output_tokens"]
+    total_tok      = stats["total_tokens"]
+    cost_usd       = stats["total_cost_usd"]
+    cost_krw       = int(stats["total_cost_krw"])
+    session_start  = stats["session_start"]
+
+    summary_cards = f"""
+    <div style="display:flex; flex-wrap:wrap; gap:14px; margin-bottom:24px;">
+      <div class="sys-card">
+        <div class="sys-card-label">세션 시작</div>
+        <div class="sys-card-val" style="font-size:1.1rem;">{session_start}</div>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-label">총 LLM 호출</div>
+        <div class="sys-card-val">{total_calls:,}</div>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-label">Input 토큰</div>
+        <div class="sys-card-val">{total_in:,}</div>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-label">Output 토큰</div>
+        <div class="sys-card-val">{total_out:,}</div>
+      </div>
+      <div class="sys-card">
+        <div class="sys-card-label">총 토큰</div>
+        <div class="sys-card-val">{total_tok:,}</div>
+      </div>
+      <div class="sys-card" style="border-color:#38bdf8;">
+        <div class="sys-card-label">예상 비용 (USD)</div>
+        <div class="sys-card-val" style="color:#38bdf8;">${cost_usd:.4f}</div>
+      </div>
+      <div class="sys-card" style="border-color:#4ade80;">
+        <div class="sys-card-label">예상 비용 (KRW)</div>
+        <div class="sys-card-val" style="color:#4ade80;">₩{cost_krw:,}</div>
+      </div>
+    </div>
+    """
+
+    # ── Agent별 집계 테이블 ──
+    by_agent = stats.get("by_agent", {})
+    agent_rows = ""
+    for agent_name, ag in by_agent.items():
+        ag_cost_krw = int(ag["cost_usd"] * 1380)
+        agent_rows += (
+            f'<tr>'
+            f'<td>{agent_name}</td>'
+            f'<td style="text-align:right;">{ag["calls"]:,}</td>'
+            f'<td style="text-align:right;">{ag["input"]:,}</td>'
+            f'<td style="text-align:right;">{ag["output"]:,}</td>'
+            f'<td style="text-align:right; color:#38bdf8;">${ag["cost_usd"]:.4f}</td>'
+            f'<td style="text-align:right; color:#4ade80;">₩{ag_cost_krw:,}</td>'
+            f'</tr>'
+        )
+    if not agent_rows:
+        agent_rows = '<tr><td colspan="6" style="text-align:center; color:#475569;">데이터 없음</td></tr>'
+
+    agent_table = f"""
+    <div style="margin-bottom:28px;">
+      <h3 style="color:#94a3b8; font-size:0.9rem; font-weight:600; margin-bottom:12px; text-transform:uppercase; letter-spacing:0.05em;">
+        Agent별 비용
+      </h3>
+      <div style="overflow-x:auto;">
+        <table class="sys-table">
+          <thead>
+            <tr>
+              <th>Agent</th><th>호출수</th><th>Input</th><th>Output</th>
+              <th>비용 USD</th><th>비용 KRW</th>
+            </tr>
+          </thead>
+          <tbody>{agent_rows}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+    # ── 최근 호출 로그 테이블 ──
+    recent = stats.get("recent", [])
+    recent_rows = ""
+    for r in recent:
+        recent_rows += (
+            f'<tr>'
+            f'<td style="color:#94a3b8;">{r["ts"]}</td>'
+            f'<td>{r["agent"]}</td>'
+            f'<td style="color:#64748b; font-size:0.75rem;">{r["model"]}</td>'
+            f'<td style="text-align:right;">{r["input_tokens"]:,}</td>'
+            f'<td style="text-align:right;">{r["output_tokens"]:,}</td>'
+            f'<td style="text-align:right; color:#38bdf8;">${r["cost_usd"]:.5f}</td>'
+            f'<td style="text-align:right; color:#4ade80;">₩{r["cost_krw"]:,.1f}</td>'
+            f'</tr>'
+        )
+    if not recent_rows:
+        recent_rows = '<tr><td colspan="7" style="text-align:center; color:#475569;">아직 기록 없음</td></tr>'
+
+    recent_table = f"""
+    <div>
+      <h3 style="color:#94a3b8; font-size:0.9rem; font-weight:600; margin-bottom:12px; text-transform:uppercase; letter-spacing:0.05em;">
+        최근 LLM 호출 로그 (최대 100건)
+      </h3>
+      <div style="overflow-x:auto; max-height:520px; overflow-y:auto;">
+        <table class="sys-table">
+          <thead style="position:sticky; top:0; background:#0f172a; z-index:1;">
+            <tr>
+              <th>시각</th><th>Agent</th><th>모델</th>
+              <th>Input</th><th>Output</th><th>비용 USD</th><th>비용 KRW</th>
+            </tr>
+          </thead>
+          <tbody>{recent_rows}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+    sys_css = """
+    .sys-card {
+        background:#1e293b; border:1px solid #334155; border-radius:10px;
+        padding:14px 20px; min-width:130px; flex:1;
+    }
+    .sys-card-label { font-size:0.75rem; color:#64748b; margin-bottom:6px; }
+    .sys-card-val { font-size:1.6rem; font-weight:700; color:#e2e8f0; }
+    .sys-table {
+        width:100%; border-collapse:collapse; font-size:0.82rem; color:#e2e8f0;
+    }
+    .sys-table th {
+        background:#0f172a; color:#64748b; font-weight:600; padding:8px 12px;
+        border-bottom:1px solid #334155; text-align:left; white-space:nowrap;
+    }
+    .sys-table td {
+        padding:7px 12px; border-bottom:1px solid #1e293b; white-space:nowrap;
+    }
+    .sys-table tbody tr:hover { background:#1e293b; }
+    """
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pochaco - 시스템</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }}
+  header {{ background: #1e293b; padding: 16px 24px; border-bottom: 1px solid #334155;
+            display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }}
+  header h1 {{ font-size: 1.4rem; color: #38bdf8; font-weight: 700; }}
+  .profile-img {{ width: 2rem; height: 2rem; border-radius: 50%;
+                  object-fit: cover; margin-right: 10px; vertical-align: middle;
+                  border: 2px solid #334155; }}
+  .health-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                 background: #4ade80; box-shadow: 0 0 6px #4ade80; margin-right: 6px;
+                 animation: pulse 2s infinite; vertical-align: middle; }}
+  @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.5; }} }}
+  footer {{ text-align: center; padding: 12px; color: #334155; font-size: 0.75rem; }}
+  .sys-card {{
+      background:#1e293b; border:1px solid #334155; border-radius:10px;
+      padding:14px 20px; min-width:130px; flex:1;
+  }}
+  .sys-card-label {{ font-size:0.75rem; color:#64748b; margin-bottom:6px; }}
+  .sys-card-val {{ font-size:1.6rem; font-weight:700; color:#e2e8f0; }}
+  .sys-table {{
+      width:100%; border-collapse:collapse; font-size:0.82rem; color:#e2e8f0;
+  }}
+  .sys-table th {{
+      background:#0f172a; color:#64748b; font-weight:600; padding:8px 12px;
+      border-bottom:1px solid #334155; text-align:left; white-space:nowrap;
+  }}
+  .sys-table td {{
+      padding:7px 12px; border-bottom:1px solid #1e293b; white-space:nowrap;
+  }}
+  .sys-table tbody tr:hover {{ background:#1e293b; }}
+</style>
+<script>
+  setInterval(function() {{ location.reload(); }}, 30000);
+</script>
+</head>
+<body>
+<header>
+  <div>
+    <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
+      <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
+    <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
+      <span class="health-dot"></span>갱신: {now_str} &nbsp;|&nbsp;
+      <span>30초마다 자동 새로고침</span>
+    </div>
+  </div>
+  <nav style="display:flex; gap:8px; align-items:center;">
+    <a href="/" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:transparent;">종합 대시보드</a>
+    <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:transparent;">전문가 실적표</a>
+    <a href="/system" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:#334155;">시스템</a>
+  </nav>
+</header>
+
+<div style="max-width:1100px; margin:0 auto; padding:24px 16px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+    <h2 style="font-size:1.1rem; color:#e2e8f0; margin:0;">⚙️ 시스템 — LLM 사용량</h2>
+    <span style="font-size:0.75rem; color:#475569;">{now_str} 기준</span>
+  </div>
+  {summary_cards}
+  {agent_table}
+  {recent_table}
+</div>
+
+<footer>pochaco — AI 자동매매 시스템 &nbsp;|&nbsp; 데이터는 30초마다 갱신됩니다</footer>
+</body>
+</html>"""
 
 
 _ROLE_DISPLAY = {
@@ -1304,75 +1539,6 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
     """전문가 실적표 HTML 페이지 렌더링"""
     data = _build_experts_data(coordinator)
     version = _VERSION
-
-    # ── 총괄 평가가 보고서 HTML ──
-    meta_report = data.get("meta_report")
-    if meta_report:
-        _priority_cfg = {
-            "critical": ("개선 시급", "#f87171", "#450a0a"),
-            "improve":  ("개선 필요", "#facc15", "#422006"),
-            "reinforce":("강화 유지", "#4ade80", "#14532d"),
-        }
-        report_rows_html = ""
-        for row in meta_report["rows"]:
-            sc = row["score"]
-            sc_color = "#4ade80" if sc >= 70 else "#facc15" if sc >= 40 else "#f87171"
-            p_label, p_fg, p_bg = _priority_cfg.get(
-                row["priority"], ("개선 필요", "#facc15", "#422006")
-            )
-            badge = (
-                f'<span style="background:{p_bg}; color:{p_fg}; padding:2px 7px; '
-                f'border-radius:4px; font-size:0.72rem; font-weight:600; '
-                f'white-space:nowrap;">{p_label}</span>'
-            )
-            directive_html = ""
-            if row["directive"]:
-                directive_html = (
-                    f'<div style="margin-top:5px; color:#94a3b8; font-size:0.78rem; '
-                    f'font-style:italic; border-left:2px solid #334155; padding-left:8px;">'
-                    f'→ {row["directive"]}</div>'
-                )
-            sw_html = ""
-            if row["strengths"] or row["weaknesses"]:
-                sw_html = '<div style="display:flex; gap:12px; margin-top:5px; font-size:0.76rem;">'
-                if row["strengths"]:
-                    sw_html += f'<span style="color:#4ade80;">✓ {row["strengths"]}</span>'
-                if row["weaknesses"]:
-                    sw_html += f'<span style="color:#f87171;">✗ {row["weaknesses"]}</span>'
-                sw_html += "</div>"
-            report_rows_html += (
-                f'<div style="padding:10px 0; border-bottom:1px solid #1e293b;">'
-                f'<div style="display:flex; align-items:center; gap:10px;">'
-                f'<span style="font-weight:600; color:#e2e8f0; min-width:110px;">'
-                f'{row["display_name"]}</span>'
-                f'<span style="font-size:1.1rem; font-weight:700; color:{sc_color}; '
-                f'min-width:36px; text-align:right;">{sc:.0f}</span>'
-                f'<span style="color:#475569; font-size:0.75rem;">/ 100</span>'
-                f'{badge}'
-                f'</div>'
-                f'{sw_html}'
-                f'{directive_html}'
-                f'</div>'
-            )
-        meta_report_html = (
-            f'<div style="background:#1a2535; border:1px solid #334155; border-radius:12px; '
-            f'padding:20px; margin-bottom:28px;">'
-            f'<div style="display:flex; justify-content:space-between; align-items:center; '
-            f'margin-bottom:14px; padding-bottom:12px; border-bottom:2px solid #334155;">'
-            f'<span style="font-size:1rem; font-weight:700; color:#e2e8f0;">⚖️ 총괄 평가가 최신 보고서</span>'
-            f'<span style="font-size:0.8rem; color:#64748b;">{meta_report["evaluated_at"]} 평가</span>'
-            f'</div>'
-            f'{report_rows_html}'
-            f'</div>'
-        )
-    else:
-        meta_report_html = (
-            '<div style="background:#1a2535; border:1px solid #334155; border-radius:12px; '
-            'padding:20px; margin-bottom:28px; color:#475569; font-size:0.85rem; '
-            'font-style:italic; text-align:center;">'
-            '⚖️ 총괄 평가가 보고서 없음 — 첫 번째 6시간 주기 평가 후 표시됩니다.'
-            '</div>'
-        )
 
     # 카드 HTML 빌드
     cards = ""
@@ -1696,7 +1862,7 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
 
         /* 30초 자동 새로고침 — 모달 열려있을 때는 스킵 */
         setInterval(function() {
-            var ids = ['prompt-modal', 'chat-modal'];
+            var ids = ['prompt-modal', 'chat-modal', 'coin-profile-modal'];
             for (var i=0; i<ids.length; i++) {
                 var m = document.getElementById(ids[i]);
                 if (m && (m.style.display === 'flex' || m.style.display === 'block')) {
@@ -1824,6 +1990,8 @@ function closeCoinProfile() {
        border-radius:6px; background:transparent;">종합 대시보드</a>
     <a href="/experts" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
        border-radius:6px; background:#334155;">전문가 실적표</a>
+    <a href="/system" style="color:#38bdf8; text-decoration:none; font-size:0.82rem; padding:4px 12px;
+       border-radius:6px; background:transparent;">시스템</a>
   </nav>
 </header>
 
@@ -1833,7 +2001,6 @@ function closeCoinProfile() {
     6시간 주기(0·6·12·18시) 총괄 평가가가 각 전문가를 평가합니다.
     잘하는 부분은 강화, 못하는 부분은 강한 피드백을 부여합니다.
   </p>
-  {meta_report_html}
   <div style="display:flex; gap:16px; flex-wrap:wrap;">
     {cards}
   </div>
@@ -1893,7 +2060,12 @@ def _liquidate_position(client: "BithumbClient") -> dict:
 
                 total_krw_received += krw_value
                 total_buy_krw += pos.buy_krw
-                sold_coins.append({"symbol": pos.symbol, "pnl_pct": round(coin_pnl_pct, 2)})
+                sold_coins.append({
+                    "symbol": pos.symbol,
+                    "buy_krw": round(pos.buy_krw, 0),
+                    "sell_krw": round(krw_value, 0),
+                    "pnl_pct": round(coin_pnl_pct, 2),
+                })
             except Exception as e:
                 logger.error(f"[포트폴리오 청산] {pos.symbol} 오류: {e}")
                 repo.close_position(pos.id)
@@ -1901,6 +2073,32 @@ def _liquidate_position(client: "BithumbClient") -> dict:
         repo.close_portfolio(pf.id)
 
         pnl_pct = (total_krw_received - total_buy_krw) / total_buy_krw * 100 if total_buy_krw > 0 else 0
+        held_min = (
+            (datetime.utcnow() - pf.opened_at.replace(tzinfo=None)).total_seconds() / 60
+            if pf.opened_at else 0
+        )
+
+        # 수동 청산 평가 기록 — 포트폴리오 거래 내역에 표시되기 위해 저장
+        try:
+            repo.save_evaluation(
+                portfolio_id=pf.id,
+                portfolio_name=pf.name,
+                total_buy_krw=total_buy_krw,
+                total_sell_krw=total_krw_received,
+                pnl_pct=round(pnl_pct, 2),
+                held_minutes=round(held_min, 1),
+                exit_type="manual",
+                original_tp_pct=pf.take_profit_pct or 0.0,
+                original_sl_pct=pf.stop_loss_pct or 0.0,
+                evaluation="대시보드 수동 청산",
+                suggested_tp_pct=pf.take_profit_pct or 0.0,
+                suggested_sl_pct=pf.stop_loss_pct or 0.0,
+                coins_summary=json.dumps(sold_coins, ensure_ascii=False),
+                lesson="",
+            )
+        except Exception as e:
+            logger.warning(f"[포트폴리오 청산] 평가 기록 저장 실패 (무시): {e}")
+
         krw = client.get_krw_balance()
         logger.info(
             f"[대시보드 포트폴리오 청산] '{pf.name}' "
@@ -1936,6 +2134,22 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(200, "text/html; charset=utf-8", body)
             except Exception as e:
                 self._respond(500, "text/plain", f"Error: {e}".encode())
+
+        elif self.path == "/system":
+            try:
+                body = _render_system_page().encode("utf-8")
+                self._respond(200, "text/html; charset=utf-8", body)
+            except Exception as e:
+                self._respond(500, "text/plain", f"Error: {e}".encode())
+
+        elif self.path == "/api/system":
+            try:
+                from core.llm_provider import usage_tracker
+                data = usage_tracker.get_stats()
+                body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                self._respond(500, "application/json", json.dumps({"error": str(e)}).encode())
 
         elif self.path == "/experts":
             try:

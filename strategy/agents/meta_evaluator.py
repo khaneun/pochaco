@@ -52,15 +52,20 @@ class MetaEvaluator(BaseSpecialistAgent):
             "4. 추상적 표현 금지 ('더 잘하세요'는 무의미)\n\n"
             "【전문가별 평가 기준】\n"
             "■ market_analyst (시장 분석가)\n"
+            "  - ★ 손절률이 높으면 자동 감점됩니다 (50%→-10, 70%→-20, 100%→-30)\n"
             "  - 시장 심리 판단이 실제 결과와 일치했는가?\n"
+            "  - RSI 과매수 종목 진입을 허용했는가? → 허용 시 강한 감점\n"
+            "  - 가격-거래량 다이버전스(가짜 상승)를 감지했는가?\n"
             "  - bearish 판단 후 포트폴리오가 익절이면 → 과도한 보수성\n"
             "  - bullish 판단 후 포트폴리오가 손절이면 → 위험 감지 실패\n\n"
             "■ asset_manager (자산 운용가)\n"
             "  - 투자 비율이 적절했는가? (손절 후 비율 축소, 익절 후 비율 유지/확대)\n"
             "  - 투자 보류 판단이 합당했는가?\n\n"
             "■ buy_strategist (매수 전문가)\n"
+            "  - ★ 손절률이 높으면 자동 감점됩니다 (50%→-10, 70%→-15, 100%→-20)\n"
+            "  - RSI 과매수(>70) 코인을 포트폴리오에 포함했는가? → 즉시 감점\n"
+            "  - MACD 하락/데드크로스인 코인 비중이 높았는가?\n"
             "  - 선정된 8개 코인의 분산 효과는?\n"
-            "  - 하락 코인이 다수 포함되었는가?\n"
             "  - TP/SL 설정이 현실적이었는가?\n\n"
             "■ sell_strategist (매도 전문가)\n"
             "  - TP/SL 조정 타이밍이 적절했는가?\n"
@@ -141,6 +146,9 @@ JSON으로만 응답 (마크다운 코드블록 없이):
             data = self._parse_json(raw)
             agents_data = data.get("agents", [])
 
+            # ── 손절률 기반 명시적 감점 계산 ──
+            stop_loss_penalty = self._calc_stop_loss_penalty(trade_results)
+
             feedbacks: list[AgentFeedback] = []
             for agent_data in agents_data:
                 role = agent_data.get("role", "")
@@ -151,9 +159,23 @@ JSON으로만 응답 (마크다운 코드블록 없이):
                 # 점수 0~100 clamp
                 score = max(0.0, min(100.0, float(agent_data.get("score", 50))))
 
+                # ★ 손절 패널티 적용 (LLM 판단 + 명시적 감점 합산)
+                if role in stop_loss_penalty:
+                    penalty = stop_loss_penalty[role]
+                    original = score
+                    score = max(0.0, score - penalty)
+                    logger.info(
+                        f"[MetaEvaluator] {role}: 손절 패널티 "
+                        f"-{penalty:.0f}점 적용 ({original:.0f} → {score:.0f})"
+                    )
+
                 priority = agent_data.get("priority", "improve")
                 if priority not in ("reinforce", "improve", "critical"):
                     priority = "improve"
+
+                # 손절 패널티가 크면 priority 자동 격상
+                if role in stop_loss_penalty and stop_loss_penalty[role] >= 10:
+                    priority = "critical"
 
                 feedback = AgentFeedback(
                     agent_role=role,
@@ -252,6 +274,53 @@ JSON으로만 응답 (마크다운 코드블록 없이):
             name = role_names.get(role, role)
             lines.append(f"- {name}({role}): {score:.1f}점")
         return "\n".join(lines)
+
+    @staticmethod
+    def _calc_stop_loss_penalty(trade_results: list) -> dict[str, float]:
+        """손절률 기반으로 시장 분석가·매수 전문가에 명시적 감점 산출
+
+        손절이 반복되면 LLM 판단과 무관하게 자동 감점됩니다.
+        이는 '쓰레기 종목만 선정하는' 패턴을 확실히 벌하기 위함입니다.
+
+        Returns:
+            {role: penalty_points} — 해당 role에 차감할 점수
+        """
+        if not trade_results:
+            return {}
+
+        total = len(trade_results)
+        stop_losses = sum(
+            1 for r in trade_results
+            if isinstance(r, dict) and r.get("exit_type") == "stop_loss"
+        )
+
+        if total == 0:
+            return {}
+
+        sl_rate = stop_losses / total
+        penalty: dict[str, float] = {}
+
+        # 손절률 50% 이상: 시장 분석가 -10, 매수 전문가 -10
+        # 손절률 70% 이상: 시장 분석가 -20, 매수 전문가 -15
+        # 손절률 100%:     시장 분석가 -30, 매수 전문가 -20
+
+        if sl_rate >= 1.0:
+            penalty["market_analyst"] = 30
+            penalty["buy_strategist"] = 20
+        elif sl_rate >= 0.7:
+            penalty["market_analyst"] = 20
+            penalty["buy_strategist"] = 15
+        elif sl_rate >= 0.5:
+            penalty["market_analyst"] = 10
+            penalty["buy_strategist"] = 10
+
+        if penalty:
+            logger.info(
+                f"[MetaEvaluator] 손절률 {sl_rate:.0%} "
+                f"({stop_losses}/{total}건) → 감점: {penalty}"
+            )
+
+        return penalty
 
     @staticmethod
     def _default_feedbacks(current_scores: dict) -> list[AgentFeedback]:

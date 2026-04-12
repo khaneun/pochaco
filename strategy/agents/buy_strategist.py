@@ -37,11 +37,21 @@ class BuyStrategist(BaseSpecialistAgent):
             "★ 대형주(BTC,ETH,XRP 등) 2~3개 + 중형 알트코인 3~4개 + 소형 모멘텀 코인 1~2개로 구성하세요.\n"
             "★ 같은 섹터(예: AI 코인끼리, 밈코인끼리) 중복 선정을 피하세요.\n"
             "★ 변동폭이 너무 작은 코인(< 2%)은 포트폴리오에 기여하지 못합니다.\n\n"
+            "【★ 기술 지표 기반 선정 — 가장 중요 ★】\n"
+            "각 코인의 기술 지표(RSI, MACD, OBV, 볼린저밴드)를 반드시 확인하세요.\n"
+            "- RSI > 65인 코인은 과매수 접근 중 → 선정 시 감점 사유\n"
+            "- RSI > 70인 코인은 조정 임박 → 선정 금지\n"
+            "- MACD 하락/데드크로스인 코인 → 상승 모멘텀 소진, 3개 이하로 제한\n"
+            "- OBV 하락 + 가격 상승 → 가짜 상승, 선정 금지\n"
+            "- 볼린저밴드 상단(>80%) → 밴드 회귀 임박, 선정 자제\n"
+            "- 이상적 진입: RSI 35~55, MACD 상승/골든크로스, OBV 상승, BB 하단~중간\n\n"
             "【선정 금지 규칙 — 반드시 준수】\n"
             "1. 24h 변동률이 -3% 이하인 코인은 절대 선정 금지 (강한 하락세)\n"
             "2. 현재가 위치가 15% 이하인 코인 금지 (바닥 다이빙 위험)\n"
             "3. 24h 거래대금 50억원 미만 금지 (유동성 부족)\n"
-            "4. 최근 포트폴리오에 포함된 종목은 가급적 회피\n\n"
+            "4. RSI > 70인 코인 선정 금지 (과매수)\n"
+            "5. 가격-거래량 다이버전스 코인 선정 금지 (가짜 상승)\n"
+            "6. 최근 포트폴리오에 포함된 종목은 가급적 회피\n\n"
             "【TP/SL 설정 원칙】\n"
             "- TP: 포트폴리오 종합 수익률 기준. 8개 코인 평균이므로 개별 코인보다 낮게 설정.\n"
             "- SL: 최대 -2.0% (절대 초과 불가). 분할 매도로 리스크 관리.\n"
@@ -256,13 +266,18 @@ class BuyStrategist(BaseSpecialistAgent):
                 f"- {s.symbol}: "
                 f"현재가={s.current_price:,.0f}원, "
                 f"24h변동={s.change_pct_24h:+.2f}%, "
-                f"24h거래대금={s.volume_krw_24h / 1e8:.1f}억원, "
-                f"고가={s.high_price:,.0f}, 저가={s.low_price:,.0f}, "
-                f"변동폭={vol_pct:.1f}%, 현재가위치={pos_pct:.0f}%"
+                f"거래대금={s.volume_krw_24h / 1e8:.0f}억원, "
+                f"변동폭={vol_pct:.1f}%"
             )
             sc = score_map.get(s.symbol)
-            if sc:
-                line += f" (모멘텀={sc.momentum:+.1f}, 스코어={sc.total_score:.1f})"
+            if sc and sc.technical_summary:
+                line += f" | {sc.technical_summary}"
+                if sc.derivatives_summary:
+                    line += f" | {sc.derivatives_summary}"
+            elif sc:
+                line += f" (스코어={sc.total_score:.1f})"
+                if sc.derivatives_summary:
+                    line += f" | {sc.derivatives_summary}"
             lines.append(line)
         return "\n".join(lines)
 
