@@ -339,9 +339,11 @@ class AgentCoordinator:
             reason=consensus_reason,
         )
 
-        # 5) 특성 분석가 — 후보 코인별 프로파일 수집
+        # 5) 특성 분석가 — 후보 코인별 프로파일 수집 + 적극 조언
         coin_profiles: dict[str, str] = {}
+        coin_profile_advisory: str = ""
         if self._coin_analyst:
+            candidate_symbols = [s.symbol for s in snapshots]
             for s in snapshots:
                 profile = self._coin_analyst.get_profile(s.symbol)
                 if profile:
@@ -351,6 +353,10 @@ class AgentCoordinator:
                     f"[Coordinator] 특성 분석가 프로파일 로드: "
                     f"{list(coin_profiles.keys())}"
                 )
+                logger.info("[Coordinator] 특성 분석가 조언 요청 중...")
+                coin_profile_advisory = self._coin_analyst.consult(candidate_symbols)
+                if coin_profile_advisory:
+                    logger.info(f"[Coordinator] 특성 분석가 조언:\n{coin_profile_advisory}")
 
         # 6) 매수 전문가 — 8개 코인 포트폴리오 선정
         logger.info("[Coordinator] 3단계: 매수 전문가 포트폴리오 구성 중...")
@@ -361,6 +367,7 @@ class AgentCoordinator:
             "eval_stats": eval_stats,
             "coin_scores": coin_scores,
             "coin_profiles": coin_profiles,
+            "coin_profile_advisory": coin_profile_advisory,
             "investment_opinion": opinion,
         })
         decision = buy_result.get("portfolio_decision")

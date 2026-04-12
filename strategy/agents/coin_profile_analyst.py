@@ -67,6 +67,57 @@ class CoinProfileAnalyst(BaseSpecialistAgent):
         """프로파일이 존재하는 코인 심볼 목록 반환"""
         return sorted(p.stem for p in self._profile_dir.glob("*.md"))
 
+    def consult(self, candidate_symbols: list[str]) -> str:
+        """포트폴리오 구성 전 후보 코인들에 대한 적극적 조언 제공.
+
+        프로파일이 있는 후보 코인들을 분석하여 매수 선호·주의·회피 여부를
+        판단하고, BuyStrategist가 즉시 반영할 수 있는 텍스트를 반환합니다.
+
+        Args:
+            candidate_symbols: 후보 코인 심볼 목록
+
+        Returns:
+            조언 텍스트 (프로파일 없는 코인만 있으면 빈 문자열)
+        """
+        profiled = {
+            sym: self.get_profile(sym)
+            for sym in candidate_symbols
+            if self.get_profile(sym)
+        }
+        if not profiled:
+            return ""
+
+        profiles_block = "\n\n".join(
+            f"### {sym}\n{profile}" for sym, profile in profiled.items()
+        )
+        task_prompt = (
+            f"다음은 과거 매매 이력이 있는 코인들의 특성 프로파일입니다.\n\n"
+            f"{profiles_block}\n\n"
+            f"포트폴리오 구성 전 이 코인들에 대한 조언을 제공하세요.\n\n"
+            f"JSON으로만 응답 (마크다운 코드블록 없이):\n"
+            f'{{"recommend": [{{"symbol": "COIN", "reason": "선호 이유 (30자 이내)"}}], '
+            f'"caution": [{{"symbol": "COIN", "reason": "주의 이유 (30자 이내)"}}], '
+            f'"avoid": [{{"symbol": "COIN", "reason": "회피 이유 (30자 이내)"}}]}}'
+        )
+        try:
+            raw = self._call_llm(task_prompt, max_tokens=600)
+            data = self._parse_json(raw)
+
+            lines = ["[특성 분석가 조언]"]
+            for item in data.get("recommend", []):
+                lines.append(f"  ✅ {item['symbol']}: {item.get('reason', '')}")
+            for item in data.get("caution", []):
+                lines.append(f"  ⚠️ {item['symbol']}: {item.get('reason', '')}")
+            for item in data.get("avoid", []):
+                lines.append(f"  ❌ {item['symbol']}: {item.get('reason', '')}")
+
+            result = "\n".join(lines)
+            logger.info(f"[특성 분석가] 조언 완료: {len(profiled)}개 코인 분석")
+            return result
+        except Exception as e:
+            logger.warning(f"[특성 분석가] 조언 생성 실패: {e}")
+            return ""
+
     # ── 프로파일 업데이트 (LLM 호출) ────────────────────────────── #
 
     def execute(self, context: dict) -> dict:

@@ -70,6 +70,7 @@ class BuyStrategist(BaseSpecialistAgent):
         eval_stats: dict | None = context.get("eval_stats")
         coin_scores: list[CoinScore] | None = context.get("coin_scores")
         coin_profiles: dict[str, str] = context.get("coin_profiles", {})
+        coin_profile_advisory: str = context.get("coin_profile_advisory", "")
 
         if not snapshots:
             raise RuntimeError("[BuyStrategist] 스냅샷이 비어있음 — 매수 불가")
@@ -78,6 +79,10 @@ class BuyStrategist(BaseSpecialistAgent):
         market_text = self._snapshots_to_text(snapshots, scores=coin_scores)
         history_text = self._eval_stats_to_text(eval_stats) if eval_stats else ""
         profiles_text = self._profiles_to_text(coin_profiles) if coin_profiles else ""
+        advisory_text = (
+            f"\n**[⚠️ 특성 분석가 조언 — 반드시 반영]**\n{coin_profile_advisory}\n"
+            if coin_profile_advisory else ""
+        )
         specialist_context = self._build_specialist_context(market_condition, allocation)
 
         # clamp 범위
@@ -105,6 +110,7 @@ class BuyStrategist(BaseSpecialistAgent):
 
 {market_text}
 {history_text}
+{advisory_text}
 {profiles_text}
 
 **포트폴리오 구성 원칙 (8개 코인 선정)**

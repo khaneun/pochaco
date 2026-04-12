@@ -502,7 +502,7 @@ function initCardPager(listId, pagerId, cardsPerPage) {{
 
 /* 모달이 열려있을 때는 자동 새로고침 일시 정지 */
 function _isAnyModalOpen() {{
-  var ids = ['pf-tx-modal', 'eval-detail-modal', 'prompt-modal', 'chat-modal'];
+  var ids = ['pf-tx-modal', 'eval-detail-modal', 'prompt-modal', 'chat-modal', 'coin-profile-modal'];
   for (var i=0; i<ids.length; i++) {{
     var m = document.getElementById(ids[i]);
     if (!m) continue;
@@ -1411,22 +1411,26 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
                 f'justify-content:center; height:45px; margin-top:8px;">{bars}</div>'
             )
 
-        # 특성 분석가 전용: 관리 중인 코인 목록
+        # 특성 분석가 전용: 관리 중인 코인 목록 (클릭 → 프로파일 팝업)
         profiled_html = ""
         if role == "coin_profile_analyst":
             coins = a.get("profiled_coins", [])
             if coins:
                 tags = "".join(
-                    f'<span style="background:#0f172a; border:1px solid #334155; '
+                    f'<span onclick="showCoinProfile(\'{c}\')" '
+                    f'style="background:#0f172a; border:1px solid #334155; '
                     f'border-radius:4px; padding:2px 7px; font-size:0.73rem; '
-                    f'color:#94a3b8; margin:2px 2px 0 0; display:inline-block;">'
+                    f'color:#38bdf8; margin:2px 2px 0 0; display:inline-block; '
+                    f'cursor:pointer;" '
+                    f'onmouseover="this.style.borderColor=\'#38bdf8\'" '
+                    f'onmouseout="this.style.borderColor=\'#334155\'">'
                     f'{c}</span>'
                     for c in coins
                 )
                 profiled_html = (
                     f'<div style="margin-top:10px; padding-top:10px; border-top:1px solid #334155;">'
                     f'<div style="font-size:0.75rem; color:#64748b; margin-bottom:6px;">'
-                    f'프로파일 관리 중 ({len(coins)}개)</div>'
+                    f'프로파일 관리 중 ({len(coins)}개) — 클릭하면 상세 내용 확인</div>'
                     f'{tags}</div>'
                 )
             else:
@@ -1742,6 +1746,41 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
     </div>
   </div>
 </div>
+
+<div id="coin-profile-modal" class="modal-overlay" onclick="if(event.target===this)closeCoinProfile()">
+  <div class="modal-box" style="max-width:640px;">
+    <div class="modal-header">
+      <span id="cpm-title" class="modal-title">코인 프로파일</span>
+      <button class="modal-close" onclick="closeCoinProfile()">&#215;</button>
+    </div>
+    <div id="cpm-body" class="modal-body"
+         style="font-family:'Courier New',monospace; font-size:0.82rem;
+                line-height:1.6; white-space:pre-wrap; word-break:break-word;">
+      로딩 중...
+    </div>
+  </div>
+</div>
+
+<script>
+function showCoinProfile(symbol) {
+  document.getElementById('cpm-title').textContent = symbol + ' 특성 프로파일';
+  document.getElementById('cpm-body').textContent = '로딩 중...';
+  document.getElementById('coin-profile-modal').style.display = 'flex';
+  fetch('/api/coin_profile?symbol=' + encodeURIComponent(symbol))
+    .then(r => r.json())
+    .then(d => {
+      if (d.content) {
+        document.getElementById('cpm-body').textContent = d.content;
+      } else {
+        document.getElementById('cpm-body').textContent = '프로파일 없음: ' + (d.error || '');
+      }
+    })
+    .catch(e => { document.getElementById('cpm-body').textContent = '조회 실패: ' + e; });
+}
+function closeCoinProfile() {
+  document.getElementById('coin-profile-modal').style.display = 'none';
+}
+</script>
 """
 
     return f"""<!DOCTYPE html>
@@ -1936,6 +1975,28 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
                     self._respond(200, "application/json; charset=utf-8", body)
+
+        elif self.path.startswith("/api/coin_profile"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            symbol = params.get("symbol", [None])[0]
+            if not symbol:
+                body = json.dumps({"error": "symbol 파라미터 없음"}).encode()
+                self._respond(400, "application/json; charset=utf-8", body)
+            else:
+                profile_text = None
+                if self.coordinator and hasattr(self.coordinator, "_coin_analyst") \
+                        and self.coordinator._coin_analyst:
+                    profile_text = self.coordinator._coin_analyst.get_profile(symbol.upper())
+                if profile_text:
+                    body = json.dumps(
+                        {"symbol": symbol.upper(), "content": profile_text},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self._respond(200, "application/json; charset=utf-8", body)
+                else:
+                    body = json.dumps({"error": f"{symbol} 프로파일 없음"}).encode()
+                    self._respond(404, "application/json; charset=utf-8", body)
 
         elif self.path == "/profile.png":
             img_path = _APP_DIR / "profile.png"
