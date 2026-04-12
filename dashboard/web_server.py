@@ -776,8 +776,8 @@ def _render_html(data: dict) -> str:
 
     def _fmt_held(minutes: float) -> str:
         if minutes >= 60:
-            return f"{minutes / 60:.1f}시간"
-        return f"{minutes:.0f}분"
+            return f"{minutes / 60:.1f}H"
+        return f"{minutes:.0f}M"
 
     # 현재 보유 중인 포트폴리오 (최상단)
     if pf:
@@ -863,8 +863,19 @@ def _render_html(data: dict) -> str:
             "lesson": ev.get("lesson", ""),
         })
 
+    _tx_header = (
+        "<div style='display:flex;align-items:center;gap:10px;"
+        "padding:5px 12px;border-bottom:2px solid #334155;"
+        "font-size:0.72rem;color:#64748b;font-weight:600;'>"
+        "<div style='min-width:44px;text-align:center;'>날짜/시간</div>"
+        "<div style='flex:1;'>포트폴리오</div>"
+        "<div style='min-width:44px;text-align:right;'>보유</div>"
+        "<div style='min-width:36px;text-align:center;'>구분</div>"
+        "<div style='min-width:74px;text-align:right;'>손익</div>"
+        "</div>"
+    )
     if pf_tx_cards:
-        trades_html = f"<div id='trade-list' class='pf-tx-list'>{pf_tx_cards}</div>"
+        trades_html = f"<div id='trade-list' class='pf-tx-list'>{_tx_header}{pf_tx_cards}</div>"
     else:
         trades_html = '<div class="no-data">포트폴리오 거래 내역 없음</div>'
 
