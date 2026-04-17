@@ -17,7 +17,7 @@ from datetime import datetime
 from enum import Enum
 
 from config import settings
-from core import BithumbClient
+from core import BaseExchangeClient
 from database import TradeRepository
 from database.models import Portfolio, Position
 from strategy.ai_agent import PortfolioDecision
@@ -76,7 +76,7 @@ class TradingEngine:
 
     def __init__(
         self,
-        client: BithumbClient,
+        client: BaseExchangeClient,
         repo: TradeRepository,
         agent: AgentCoordinator,
         analyzer: MarketAnalyzer,

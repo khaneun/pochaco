@@ -8,7 +8,7 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from core import BithumbClient
+from core import BaseExchangeClient
 from database import TradeRepository, backup_sqlite
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ class TradingScheduler:
 
     def __init__(
         self,
-        client: BithumbClient,
+        client: BaseExchangeClient,
         repo: TradeRepository,
         get_daily_start_krw,          # callable: () -> float
         notifier=None,                # TelegramBot (선택)

@@ -27,12 +27,20 @@ from strategy import cooldown as cooldown_registry
 from core.llm_provider import usage_tracker
 
 if TYPE_CHECKING:
-    from core import BithumbClient
+    from core import BaseExchangeClient
     from strategy.agent_coordinator import AgentCoordinator
 
 logger = logging.getLogger(__name__)
 
 _KST = timezone(timedelta(hours=9))
+
+# 거래소별 모니터 명칭·프로파일 이미지 분기
+if settings.EXCHANGE_PROVIDER == "upbit":
+    _MONITOR_NAME = "Kuromi Monitor"
+    _PROFILE_IMG  = _APP_DIR / "kuromi.png"
+else:
+    _MONITOR_NAME = "Pochaco Monitor"
+    _PROFILE_IMG  = _APP_DIR / "profile.png"
 
 
 def _to_kst(dt: datetime) -> datetime:
@@ -73,7 +81,7 @@ def _parse_manual_note(note: str) -> tuple[float | None, float | None, float | N
     return pnl_pct, pnl_krw, held_min
 
 
-def _build_json_status(client: "BithumbClient", coordinator: "AgentCoordinator | None" = None) -> dict:
+def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordinator | None" = None) -> dict:
     """현재 상태를 JSON 직렬화 가능한 dict로 반환 (포트폴리오 기반)"""
     from database.models import Portfolio
     repo = TradeRepository()
@@ -312,7 +320,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pochaco Monitor</title>
+<title>{monitor_name}</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }}
@@ -535,7 +543,7 @@ document.addEventListener('DOMContentLoaded', function() {{
 <body>
 <header>
   <div>
-    <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
+    <h1><img src="/profile.png" class="profile-img" alt="">{monitor_name}
       <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
     <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
       <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp;
@@ -1198,6 +1206,7 @@ document.addEventListener('DOMContentLoaded', function() {
     )
 
     return _HTML_TEMPLATE.format(
+        monitor_name=_MONITOR_NAME,
         updated_at=data["updated_at"],
         version=data.get("version", ""),
         nav_dashboard_bg="#334155",
@@ -1378,7 +1387,7 @@ def _render_system_page() -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pochaco - 시스템</title>
+<title>{_MONITOR_NAME} - 시스템</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }}
@@ -1418,7 +1427,7 @@ def _render_system_page() -> str:
 <body>
 <header>
   <div>
-    <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
+    <h1><img src="/profile.png" class="profile-img" alt="">{_MONITOR_NAME}
       <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
     <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
       <span class="health-dot"></span>갱신: {now_str} &nbsp;|&nbsp;
@@ -1964,7 +1973,7 @@ function closeCoinProfile() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pochaco - 전문가 실적표</title>
+<title>{_MONITOR_NAME} - 전문가 실적표</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; }}
@@ -1988,7 +1997,7 @@ function closeCoinProfile() {
 <body>
 <header>
   <div>
-    <h1><img src="/profile.png" class="profile-img" alt="">Pochaco Monitor
+    <h1><img src="/profile.png" class="profile-img" alt="">{_MONITOR_NAME}
       <span style="font-size:0.55em; color:#475569; font-weight:400; margin-left:6px;">{version}</span></h1>
     <div style="margin-top:6px; font-size:0.82rem; color:#64748b;">
       <span class="health-dot"></span>갱신: {updated_at} &nbsp;|&nbsp;
@@ -2023,7 +2032,7 @@ function closeCoinProfile() {
 </html>"""
 
 
-def _liquidate_position(client: "BithumbClient") -> dict:
+def _liquidate_position(client: "BaseExchangeClient") -> dict:
     """현재 활성 포트폴리오를 일괄 청산 (8개 코인 전량 매도)"""
     from database.models import Portfolio
     repo = TradeRepository()
@@ -2130,7 +2139,7 @@ def _liquidate_position(client: "BithumbClient") -> dict:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    client: "BithumbClient"
+    client: "BaseExchangeClient"
     coordinator: "AgentCoordinator | None" = None
 
     def log_message(self, fmt, *args):
@@ -2223,7 +2232,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._respond(404, "application/json; charset=utf-8", body)
 
         elif self.path == "/profile.png":
-            img_path = _APP_DIR / "profile.png"
+            img_path = _PROFILE_IMG
             if img_path.exists():
                 body = img_path.read_bytes()
                 self._respond(200, "image/png", body)
@@ -2294,7 +2303,7 @@ class WebDashboard:
 
     def __init__(
         self,
-        client: "BithumbClient",
+        client: "BaseExchangeClient",
         host: str,
         port: int,
         coordinator: "AgentCoordinator | None" = None,

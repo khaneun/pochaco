@@ -39,12 +39,21 @@ _load_aws_secrets()
 
 class Settings(BaseSettings):
     # ---------------------------------------------------------------- #
-    #  빗썸 API                                                          #
+    #  거래소 선택                                                        #
+    #  EXCHANGE_PROVIDER: "bithumb" | "upbit"                          #
     # ---------------------------------------------------------------- #
+    EXCHANGE_PROVIDER: Literal["bithumb", "upbit"] = "bithumb"
+
+    # ── 빗썸 API ──
     BITHUMB_API_KEY: str = ""
     BITHUMB_SECRET_KEY: str = ""
     BITHUMB_BASE_URL: str = "https://api.bithumb.com"
     BITHUMB_WS_URL: str = "wss://pubwss.bithumb.com/pub/ws"
+
+    # ── 업비트 API ──
+    UPBIT_ACCESS_KEY: str = ""
+    UPBIT_SECRET_KEY: str = ""
+    UPBIT_BASE_URL: str = "https://api.upbit.com"
 
     # ---------------------------------------------------------------- #
     #  LLM 공급자 선택                                                   #

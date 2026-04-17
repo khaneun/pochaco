@@ -15,7 +15,7 @@ from pathlib import Path
 _APP_DIR = Path(__file__).parent
 
 from config import settings
-from core import BithumbClient
+from core import get_exchange_client
 from core.derivatives_client import DerivativesClient
 from core.llm_provider import get_llm_provider
 from core.telegram_bot import TelegramBot
@@ -49,10 +49,17 @@ logger = logging.getLogger(__name__)
 def check_config() -> None:
     """필수 설정값 확인"""
     missing = []
-    if not settings.BITHUMB_API_KEY:
-        missing.append("BITHUMB_API_KEY")
-    if not settings.BITHUMB_SECRET_KEY:
-        missing.append("BITHUMB_SECRET_KEY")
+    exchange = settings.EXCHANGE_PROVIDER
+    if exchange == "bithumb":
+        if not settings.BITHUMB_API_KEY:
+            missing.append("BITHUMB_API_KEY")
+        if not settings.BITHUMB_SECRET_KEY:
+            missing.append("BITHUMB_SECRET_KEY")
+    elif exchange == "upbit":
+        if not settings.UPBIT_ACCESS_KEY:
+            missing.append("UPBIT_ACCESS_KEY")
+        if not settings.UPBIT_SECRET_KEY:
+            missing.append("UPBIT_SECRET_KEY")
 
     provider = settings.LLM_PROVIDER
     if provider == "anthropic" and not settings.ANTHROPIC_API_KEY:
@@ -71,7 +78,7 @@ def main() -> None:
     check_config()
 
     # 인프라 의존성
-    client      = BithumbClient()
+    client      = get_exchange_client()
     repo        = TradeRepository()
     derivatives = DerivativesClient()
     analyzer    = MarketAnalyzer(client, derivatives=derivatives)
@@ -180,7 +187,7 @@ def main() -> None:
     engine_thread.start()
 
     logger.info(f"pochaco 시작 (HEADLESS={settings.HEADLESS})")
-    logger.info(f"LLM 공급자: {settings.LLM_PROVIDER} / 감시 주기: {settings.POSITION_CHECK_INTERVAL}초")
+    logger.info(f"거래소: {settings.EXCHANGE_PROVIDER} / LLM 공급자: {settings.LLM_PROVIDER} / 감시 주기: {settings.POSITION_CHECK_INTERVAL}초")
     logger.info(f"포트폴리오 모드: {settings.PORTFOLIO_SIZE}개 코인 균등 분산")
     logger.info("8개 전문가 Agent 시스템 활성화 (합의 기반)")
 

@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from core import BithumbClient
+from core import BaseExchangeClient
 from database import TradeRepository
 from database.models import Portfolio, Position
 
@@ -111,7 +111,7 @@ class Dashboard:
 
     REFRESH_INTERVAL = 5  # 초
 
-    def __init__(self, client: BithumbClient, repo: TradeRepository):
+    def __init__(self, client: BaseExchangeClient, repo: TradeRepository):
         self._client = client
         self._repo = repo
         self._running = False

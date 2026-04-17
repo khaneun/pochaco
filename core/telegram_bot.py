@@ -28,7 +28,7 @@ from database import TradeRepository
 from database.models import Portfolio, Position
 
 if TYPE_CHECKING:
-    from core import BithumbClient
+    from core import BaseExchangeClient
     from strategy.trading_engine import TradingEngine
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class TelegramBot:
         self,
         token: str,
         chat_id: str,
-        client: "BithumbClient",
+        client: "BaseExchangeClient",
         repo: TradeRepository,
         engine: "TradingEngine",
     ):

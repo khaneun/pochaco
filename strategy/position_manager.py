@@ -3,7 +3,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from core import BithumbClient
+from core import BaseExchangeClient
 from database import TradeRepository
 from database.models import Position
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class PositionManager:
     """보유 포지션의 현재가를 주기적으로 확인해 익절/손절 실행"""
 
-    def __init__(self, client: BithumbClient, repo: TradeRepository):
+    def __init__(self, client: BaseExchangeClient, repo: TradeRepository):
         self._client = client
         self._repo = repo
         self._running = False
