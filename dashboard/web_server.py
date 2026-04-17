@@ -7,6 +7,7 @@ GET /api/experts — JSON 전문가 데이터
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -2145,7 +2146,30 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # 액세스 로그 억제
 
+    def _check_auth(self) -> bool:
+        """HTTP Basic Auth 검증. 실패 시 401 응답 후 False 반환."""
+        monitor_id = settings.POCHACO_MONITOR_ID
+        monitor_pw = settings.POCHACO_MONITOR_PW
+        if not monitor_id or not monitor_pw:
+            return True  # 설정 없으면 인증 스킵
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth[6:]).decode("utf-8")
+                uid, pwd = decoded.split(":", 1)
+                if uid == monitor_id and pwd == monitor_pw:
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", f'Basic realm="{_MONITOR_NAME}"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def do_GET(self):
+        if not self._check_auth():
+            return
         if self.path in ("/", "/index.html"):
             try:
                 data = _build_json_status(self.client, self.coordinator)
@@ -2243,6 +2267,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain", b"Not Found")
 
     def do_POST(self):
+        if not self._check_auth():
+            return
         if self.path == "/api/liquidate":
             try:
                 result = _liquidate_position(self.client)

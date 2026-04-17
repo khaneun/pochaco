@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     DASHBOARD_ENABLED: bool = True
     DASHBOARD_HOST: str = "0.0.0.0"
     DASHBOARD_PORT: int = 8080
+    POCHACO_MONITOR_ID: str = ""           # Basic Auth 아이디 (미설정 시 인증 스킵)
+    POCHACO_MONITOR_PW: str = ""           # Basic Auth 비밀번호
 
     # ---------------------------------------------------------------- #
     #  로깅                                                              #
