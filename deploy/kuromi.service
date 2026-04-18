@@ -1,0 +1,43 @@
+[Unit]
+Description=kuromi AI 자동매매 시스템 (Upbit)
+Documentation=https://github.com/khaneun/pochaco
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kuromi
+
+# AWS Secrets Manager에서 민감 정보 자동 로드
+Environment="AWS_SECRET_NAME=kuromi/prod"
+Environment="AWS_REGION=ap-northeast-2"
+Environment="HEADLESS=true"
+Environment="LLM_PROVIDER=openai"
+
+# 경로 오버라이드 (/opt/pochaco 기본값 대신 /opt/kuromi 사용)
+Environment="DB_PATH=/opt/kuromi/data/kuromi.db"
+Environment="DB_BACKUP_DIR=/opt/kuromi/backup"
+Environment="LOG_FILE=/opt/kuromi/logs/kuromi.log"
+
+# 가상환경 Python으로 실행
+ExecStart=/opt/kuromi/.venv/bin/python main.py
+
+# 비정상 종료 시 10초 후 재시작
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# 표준 출력/에러를 journald로 수집
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kuromi
+
+# 보안 강화
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

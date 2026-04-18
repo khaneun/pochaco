@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 # =============================================================================
-# pochaco 코드 배포 스크립트 (로컬에서 실행)
+# pochaco/kuromi 코드 배포 스크립트 (로컬에서 실행)
 #
 # 사용법:
-#   EC2_HOST=ubuntu@<퍼블릭IP>  bash deploy/deploy.sh
-#   EC2_HOST=ubuntu@13.125.x.x bash deploy/deploy.sh
+#   # pochaco (빗썸)
+#   EC2_HOST=ec2-user@<IP> SSH_KEY=~/kitty-key.pem bash deploy/deploy.sh
+#
+#   # kuromi (업비트)
+#   SERVICE_NAME=kuromi EC2_HOST=ubuntu@<IP> SSH_KEY=~/kitty-key.pem bash deploy/deploy.sh
 #
 # 환경변수:
-#   EC2_HOST  — SSH 접속 주소 (필수)
-#   SSH_KEY   — PEM 키 경로 (기본: ~/.ssh/id_rsa)
-#   APP_DIR   — EC2 앱 디렉터리 (기본: /opt/pochaco)
+#   EC2_HOST      — SSH 접속 주소 (필수)
+#   SSH_KEY       — PEM 키 경로 (기본: ~/.ssh/id_rsa)
+#   SERVICE_NAME  — 서비스명 (기본: pochaco) → kuromi 배포 시 kuromi 지정
+#   APP_DIR       — EC2 앱 디렉터리 (기본: /opt/<SERVICE_NAME>)
 # =============================================================================
 set -euo pipefail
 
 EC2_HOST="${EC2_HOST:?'EC2_HOST 환경변수를 설정하세요. 예: EC2_HOST=ubuntu@1.2.3.4'}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"
-APP_DIR="${APP_DIR:-/opt/pochaco}"
+SERVICE_NAME="${SERVICE_NAME:-pochaco}"
+APP_DIR="${APP_DIR:-/opt/${SERVICE_NAME}}"
 SSH_OPTS="-i ${SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 info() { echo -e "\033[0;34m[INFO]\033[0m  $*"; }
@@ -46,6 +51,18 @@ ok "코드 동기화 완료"
 info "EC2 패키지 업데이트 및 서비스 재시작 중..."
 ssh ${SSH_OPTS} "${EC2_HOST}" bash <<REMOTE
 set -euo pipefail
+
+# ── 최초 배포 시 필수 도구 확인 ──
+if ! command -v uv &>/dev/null; then
+    echo "[EC2] uv 설치 중..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="\$HOME/.local/bin:\$PATH"
+fi
+
+# 앱 디렉터리 및 하위 폴더 생성
+sudo mkdir -p "${APP_DIR}"/{data,logs,backup}
+sudo chown -R \$(whoami):\$(whoami) "${APP_DIR}"
+
 cd "${APP_DIR}"
 
 # 가상환경이 없으면 생성
@@ -59,24 +76,24 @@ echo "[EC2] 패키지 설치 중..."
 uv pip install -r requirements.txt -q
 
 # systemd 서비스 파일 갱신
-if [[ -f "deploy/pochaco.service" ]]; then
-    sudo cp deploy/pochaco.service /etc/systemd/system/pochaco.service
+if [[ -f "deploy/${SERVICE_NAME}.service" ]]; then
+    sudo cp "deploy/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.service"
     sudo systemctl daemon-reload
 fi
 
 # 서비스 재시작
-if sudo systemctl is-enabled pochaco &>/dev/null; then
-    sudo systemctl restart pochaco
+if sudo systemctl is-enabled "${SERVICE_NAME}" &>/dev/null; then
+    sudo systemctl restart "${SERVICE_NAME}"
     sleep 2
-    STATUS=\$(sudo systemctl is-active pochaco)
+    STATUS=\$(sudo systemctl is-active "${SERVICE_NAME}")
     echo "[EC2] 서비스 상태: \${STATUS}"
 else
-    sudo systemctl enable --now pochaco
+    sudo systemctl enable --now "${SERVICE_NAME}"
     echo "[EC2] 서비스 시작됨"
 fi
 REMOTE
 
 ok "=== 배포 완료 ==="
 echo ""
-echo "  로그 확인:    ssh ${SSH_OPTS} ${EC2_HOST} 'journalctl -u pochaco -f'"
-echo "  서비스 상태:  ssh ${SSH_OPTS} ${EC2_HOST} 'systemctl status pochaco'"
+echo "  로그 확인:    ssh ${SSH_OPTS} ${EC2_HOST} 'journalctl -u ${SERVICE_NAME} -f'"
+echo "  서비스 상태:  ssh ${SSH_OPTS} ${EC2_HOST} 'systemctl status ${SERVICE_NAME}'"
