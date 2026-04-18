@@ -63,18 +63,22 @@ class MarketAnalyzer:
         self,
         symbol: str,
         derivatives: DerivativesData | None = None,
+        prefetched_ticker: dict | None = None,
     ) -> CoinSnapshot:
         """특정 코인의 상세 스냅샷 수집.
 
         Args:
-            symbol: 빗썸 심볼
+            symbol: 거래소 심볼
             derivatives: 사전 로드된 파생 데이터 (없으면 기본값 사용)
+            prefetched_ticker: 배치 조회로 미리 받은 ticker 데이터 (있으면 API 호출 생략)
         """
-        ticker = self._client.get_ticker(symbol)
-        if ticker.get("status") != "0000":
-            raise RuntimeError(f"{symbol} ticker 조회 실패: {ticker}")
-
-        d = ticker["data"]
+        if prefetched_ticker is not None:
+            d = prefetched_ticker
+        else:
+            ticker = self._client.get_ticker(symbol)
+            if ticker.get("status") != "0000":
+                raise RuntimeError(f"{symbol} ticker 조회 실패: {ticker}")
+            d = ticker["data"]
         current_price = float(d["closing_price"])
         open_price = float(d.get("opening_price", current_price))
 
@@ -123,11 +127,22 @@ class MarketAnalyzer:
             except Exception as e:
                 logger.warning(f"[MarketAnalyzer] 파생 데이터 배치 조회 실패: {e}")
 
+        # 티커 배치 조회 — 코인마다 개별 요청 대신 한 번에 전체 수집
+        ticker_cache: dict[str, dict] = {}
+        try:
+            bulk = self._client.get_ticker("ALL")
+            if bulk.get("status") == "0000":
+                ticker_cache = bulk["data"]
+                logger.debug(f"[MarketAnalyzer] 티커 배치 로드: {len(ticker_cache)}개")
+        except Exception as e:
+            logger.warning(f"[MarketAnalyzer] 티커 배치 조회 실패, 개별 조회로 폴백: {e}")
+
         snapshots = []
         for symbol in symbols:
             try:
                 deriv = deriv_map.get(symbol.upper())
-                snapshots.append(self.get_coin_snapshot(symbol, deriv))
+                prefetched = ticker_cache.get(symbol) or ticker_cache.get(symbol.upper())
+                snapshots.append(self.get_coin_snapshot(symbol, deriv, prefetched))
             except Exception as e:
                 logger.warning(f"{symbol} 스냅샷 수집 실패: {e}")
         return snapshots

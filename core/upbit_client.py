@@ -8,6 +8,7 @@ Private API : /v1/accounts, /v1/orders 등 (JWT HS256 인증)
 """
 import hashlib
 import logging
+import threading
 import time
 import urllib.parse
 import uuid as _uuid_mod
@@ -19,6 +20,22 @@ from config import settings
 from .exchange_client import BaseExchangeClient
 
 logger = logging.getLogger(__name__)
+
+# 업비트 public API: 초당 10req, private: 초당 8req
+# 안전 마진을 두어 0.13s 간격 유지 (~7.5 req/s)
+_REQ_INTERVAL = 0.13
+_rate_lock = threading.Lock()
+_last_req_time: float = 0.0
+
+
+def _rate_limit() -> None:
+    """업비트 rate limit 보호 — 연속 요청 간 최소 간격 보장."""
+    global _last_req_time
+    with _rate_lock:
+        elapsed = time.monotonic() - _last_req_time
+        if elapsed < _REQ_INTERVAL:
+            time.sleep(_REQ_INTERVAL - elapsed)
+        _last_req_time = time.monotonic()
 
 # ── 업비트 캔들 interval → (타입, 단위) 매핑 ──────────────────────── #
 _INTERVAL_MAP: dict[str, tuple[str, int | None]] = {
@@ -64,9 +81,13 @@ class UpbitClient(BaseExchangeClient):
         token = jwt.encode(payload, self._secret_key, algorithm="HS256")
         return {"Authorization": f"Bearer {token}"}
 
+    def _req_get(self, url: str, **kwargs) -> requests.Response:
+        _rate_limit()
+        return self._session.get(url, **kwargs)
+
     def _v2_get(self, path: str, params: dict | None = None) -> any:
         headers = self._jwt_header(params)
-        resp = self._session.get(
+        resp = self._req_get(
             self.BASE_URL + path, params=params, headers=headers, timeout=10
         )
         resp.raise_for_status()
@@ -74,6 +95,7 @@ class UpbitClient(BaseExchangeClient):
 
     def _v2_post(self, path: str, body: dict) -> any:
         headers = {**self._jwt_header(body), "Content-Type": "application/json"}
+        _rate_limit()
         resp = self._session.post(
             self.BASE_URL + path, json=body, headers=headers, timeout=10
         )
@@ -82,6 +104,7 @@ class UpbitClient(BaseExchangeClient):
 
     def _v2_delete(self, path: str, params: dict) -> any:
         headers = self._jwt_header(params)
+        _rate_limit()
         resp = self._session.delete(
             self.BASE_URL + path, params=params, headers=headers, timeout=10
         )
@@ -94,7 +117,7 @@ class UpbitClient(BaseExchangeClient):
     def _get_krw_markets(self) -> list[str]:
         """KRW 마켓 목록 반환 (세션 내 캐시)"""
         if self._markets_cache is None:
-            resp = self._session.get(
+            resp = self._req_get(
                 f"{self.BASE_URL}/v1/market/all",
                 params={"isDetails": "false"},
                 timeout=10,
@@ -131,7 +154,7 @@ class UpbitClient(BaseExchangeClient):
             ticker_data: dict = {}
             for i in range(0, len(markets), 100):
                 batch = markets[i:i + 100]
-                resp = self._session.get(
+                resp = self._req_get(
                     f"{self.BASE_URL}/v1/ticker",
                     params={"markets": ",".join(batch)},
                     timeout=15,
@@ -142,7 +165,7 @@ class UpbitClient(BaseExchangeClient):
                     ticker_data[sym] = self._norm_ticker(t)
             return {"status": "0000", "data": ticker_data}
         else:
-            resp = self._session.get(
+            resp = self._req_get(
                 f"{self.BASE_URL}/v1/ticker",
                 params={"markets": f"KRW-{symbol}"},
                 timeout=10,
@@ -155,7 +178,7 @@ class UpbitClient(BaseExchangeClient):
 
     def get_orderbook(self, symbol: str) -> dict:
         """호가 정보 조회"""
-        resp = self._session.get(
+        resp = self._req_get(
             f"{self.BASE_URL}/v1/orderbook",
             params={"markets": f"KRW-{symbol}"},
             timeout=10,
@@ -165,7 +188,7 @@ class UpbitClient(BaseExchangeClient):
 
     def get_transaction_history(self, symbol: str, count: int = 20) -> dict:
         """최근 체결 내역 조회"""
-        resp = self._session.get(
+        resp = self._req_get(
             f"{self.BASE_URL}/v1/trades/ticks",
             params={"market": f"KRW-{symbol}", "count": count},
             timeout=10,
@@ -185,7 +208,7 @@ class UpbitClient(BaseExchangeClient):
         else:
             url = f"{self.BASE_URL}/v1/candles/days"
 
-        resp = self._session.get(
+        resp = self._req_get(
             url,
             params={"market": f"KRW-{symbol}", "count": 50},
             timeout=10,
