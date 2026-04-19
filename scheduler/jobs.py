@@ -68,19 +68,30 @@ class TradingScheduler:
     def _job_save_daily_report(self) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
         try:
-            # 종료 총자산 = KRW + 보유 코인 평가액
-            ending_krw = self._client.get_krw_balance()
-            open_pf = self._repo.get_open_portfolio()
-            if open_pf:
-                try:
-                    for pos in self._repo.get_portfolio_positions(open_pf.id):
+            # 종료 총자산 = KRW(available+locked) + 실제 보유 코인 평가액 (API 기준)
+            try:
+                detail = self._client.get_krw_balance_detail()
+                ending_krw = detail["total"]
+            except Exception:
+                ending_krw = self._client.get_krw_balance()
+            try:
+                bal_data = self._client.get_balance("ALL")
+                if bal_data.get("status") == "0000":
+                    for key, value in bal_data["data"].items():
+                        if not key.startswith("total_"):
+                            continue
+                        sym = key.replace("total_", "").upper()
+                        if sym == "KRW":
+                            continue
+                        amt = float(value)
+                        if amt <= 0:
+                            continue
                         try:
-                            cur_price = self._client.get_current_price(pos.symbol)
-                            ending_krw += pos.units * cur_price
+                            ending_krw += amt * self._client.get_current_price(sym)
                         except Exception:
-                            ending_krw += pos.buy_krw
-                except Exception as pe:
-                    logger.warning(f"포트폴리오 평가액 조회 실패: {pe}")
+                            pass
+            except Exception as pe:
+                logger.warning(f"포트폴리오 평가액 조회 실패: {pe}")
 
             starting_krw = self._get_daily_start_krw()
 

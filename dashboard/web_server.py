@@ -93,17 +93,20 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
 
         pf: Portfolio | None = repo.get_open_portfolio()
 
-        # ── 거래소 실제 보유 코인 잔고 ──
+        # ── 거래소 실제 보유 코인 잔고 (available + locked 합산) ──
         pf_symbols: set[str] = set()
         holdings = []
-        actual_coin_units: dict[str, float] = {}
+        actual_coin_units: dict[str, float] = {}  # sym → total 수량 (available+locked)
+        balance_fetched = False
         try:
             bal_data = client.get_balance("ALL")
             if bal_data.get("status") == "0000":
+                balance_fetched = True
                 for key, value in bal_data["data"].items():
-                    if not key.startswith("available_"):
+                    # total_ = available + locked (미체결 매도 주문 중 코인 포함)
+                    if not key.startswith("total_"):
                         continue
-                    sym = key.replace("available_", "").upper()
+                    sym = key.replace("total_", "").upper()
                     if sym == "KRW":
                         continue
                     amt = float(value)
@@ -117,28 +120,37 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
             positions = repo.get_portfolio_positions(pf.id)
             pf_symbols = {p.symbol for p in positions}
             total_buy = 0.0
-            total_current = 0.0
+            total_current = 0.0   # P&L 계산용 (실현 매도금 포함)
+            total_coin_value = 0.0  # 총 자산 계산용 (미실현 코인 평가액만)
             coins_data = []
 
             for pos in positions:
                 try:
                     cur = client.get_current_price(pos.symbol)
-                    actual_units = actual_coin_units.get(pos.symbol, pos.units)
-                    coin_value = actual_units * cur
-                    coin_pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100 if pos.buy_price > 0 else 0
-                    coin_pnl_krw = (cur - pos.buy_price) * actual_units
-                    # 분할 매도 후 actual_units < pos.units 인 경우 cost basis 비례 조정
-                    if pos.units > 0 and actual_units < pos.units * 0.99:
-                        effective_buy_krw = pos.buy_krw * (actual_units / pos.units)
+                    # 잔고 조회 성공 시 API 실제 수량 우선 사용 (DB-API 불일치 방지)
+                    # 잔고 조회 실패 시에만 DB pos.units fallback
+                    if balance_fetched:
+                        actual_units = actual_coin_units.get(pos.symbol, 0.0)
                     else:
-                        effective_buy_krw = pos.buy_krw
-                    total_buy += effective_buy_krw
-                    total_current += coin_value
+                        actual_units = pos.units
+                    coin_value = actual_units * cur
+
+                    # 분할 매도가 있으면 원매수금·이미 실현된 매도금 조회해 정확한 손익 계산
+                    original_buy_krw = repo.get_coin_buy_total(pf.id, pos.symbol) or pos.buy_krw
+                    sold_krw = repo.get_coin_sell_total(pf.id, pos.symbol)
+                    # sold_krw는 KRW 잔고에 이미 반영됨 → P&L 계산에만 포함, 총 자산 계산에서 제외
+                    true_total_value = coin_value + sold_krw
+                    coin_pnl_krw = true_total_value - original_buy_krw
+                    coin_pnl_pct = coin_pnl_krw / original_buy_krw * 100 if original_buy_krw > 0 else 0.0
+
+                    total_buy += original_buy_krw
+                    total_current += true_total_value
+                    total_coin_value += coin_value
                     coins_data.append({
                         "symbol": pos.symbol,
                         "units": round(actual_units, 6),
                         "buy_price": pos.buy_price,
-                        "buy_krw": round(pos.buy_krw, 0),
+                        "buy_krw": round(original_buy_krw, 0),
                         "current_price": cur,
                         "current_value": round(coin_value, 0),
                         "pnl_pct": round(coin_pnl_pct, 2),
@@ -146,9 +158,10 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                         "reason": pos.agent_reason or "",
                     })
                 except Exception:
+                    fallback_units = pos.units if not balance_fetched else actual_coin_units.get(pos.symbol, pos.units)
                     coins_data.append({
                         "symbol": pos.symbol,
-                        "units": round(pos.units, 6),
+                        "units": round(fallback_units, 6),
                         "buy_price": pos.buy_price,
                         "buy_krw": round(pos.buy_krw, 0),
                         "current_price": pos.buy_price,
@@ -159,17 +172,21 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                     })
                     total_buy += pos.buy_krw
                     total_current += pos.buy_krw
+                    total_coin_value += pos.buy_krw
 
             pf_pnl_pct = (total_current - total_buy) / total_buy * 100 if total_buy > 0 else 0
             pf_pnl_krw = total_current - total_buy
-            total = krw + total_current
+            # total_coin_value만 더함 — sold_krw는 krw 잔고에 이미 포함됨 (이중 계산 방지)
+            total = krw + total_coin_value
             held_min = (datetime.now(tz=timezone.utc) - pf.opened_at.replace(tzinfo=timezone.utc)).total_seconds() / 60
 
             portfolio_data = {
                 "id": pf.id,
                 "name": pf.name,
                 "total_buy_krw": round(total_buy, 0),
-                "total_current_value": round(total_current, 0),
+                # total_coin_value: 실제 보유 코인 현재 시세 평가액 (분할 매도로 실현된 금액 제외)
+                # sold_krw는 이미 KRW 잔고에 반영되어 있으므로 여기서 포함 시 이중 계산됨
+                "total_current_value": round(total_coin_value, 0),
                 "pnl_pct": round(pf_pnl_pct, 2),
                 "pnl_krw": round(pf_pnl_krw, 0),
                 "take_profit_pct": pf.take_profit_pct,

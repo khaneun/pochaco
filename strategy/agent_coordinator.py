@@ -36,6 +36,14 @@ _W_INVESTMENT_STRATEGIST = 0.40
 _W_MARKET_ANALYST = 0.25
 
 
+class InsufficientCandidatesError(Exception):
+    """매수 후보 코인 부족 시 발생하는 예외.
+
+    쿨다운·필터 등으로 유효한 후보가 3개 미만일 때 발생하며,
+    TradingEngine이 조용히 대기 후 재시도하도록 처리합니다.
+    """
+
+
 class InvestmentHoldError(Exception):
     """투자 보류 결정 시 발생하는 예외.
 
@@ -372,7 +380,7 @@ class AgentCoordinator:
         })
         decision = buy_result.get("portfolio_decision")
         if decision is None:
-            raise RuntimeError("[매수 전문가] 포트폴리오 구성 실패")
+            raise InsufficientCandidatesError("[매수 전문가] 유효 후보 코인 부족 — 이번 사이클 스킵")
 
         symbols = [c.symbol for c in decision.coins]
         self._log_decision(

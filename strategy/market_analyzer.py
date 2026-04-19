@@ -113,9 +113,32 @@ class MarketAnalyzer:
     def build_market_summary(self, top_n: int = 20) -> list[CoinSnapshot]:
         """상위 N개 코인 스냅샷 목록 반환 (Agent 분석용).
 
+        get_ticker("ALL") 1회 호출로 거래대금 상위 선별 + 스냅샷 티커 공용 처리.
         파생 데이터 클라이언트가 주입된 경우 배치 사전 로드 후 통합합니다.
         """
-        symbols = self.get_top_volume_coins(top_n)
+        # ── 티커 배치 1회 조회 — 상위 선별 + 스냅샷 공용 ──
+        ticker_cache: dict[str, dict] = {}
+        symbols: list[str] = []
+        try:
+            bulk = self._client.get_ticker("ALL")
+            if bulk.get("status") == "0000":
+                raw = {k: v for k, v in bulk["data"].items() if k != "date"}
+                ticker_cache = raw
+                ranked = sorted(
+                    raw.items(),
+                    key=lambda x: float(x[1].get("acc_trade_value_24H", 0)),
+                    reverse=True,
+                )
+                symbols = [sym for sym, _ in ranked[:top_n]]
+                logger.debug(
+                    f"[MarketAnalyzer] 티커 배치 로드: {len(ticker_cache)}개 "
+                    f"→ 상위 {len(symbols)}개 선별"
+                )
+        except Exception as e:
+            logger.warning(f"[MarketAnalyzer] 티커 배치 조회 실패, 개별 조회로 폴백: {e}")
+
+        if not symbols:
+            symbols = self.get_top_volume_coins(top_n)
 
         # 파생 데이터 배치 로드 (Binance premiumIndex 1회 + 주요 OI 수집)
         deriv_map: dict[str, DerivativesData] = {}
@@ -126,16 +149,6 @@ class MarketAnalyzer:
                 logger.info(f"[MarketAnalyzer] 파생 데이터 로드: {avail}/{len(symbols)}개 심볼")
             except Exception as e:
                 logger.warning(f"[MarketAnalyzer] 파생 데이터 배치 조회 실패: {e}")
-
-        # 티커 배치 조회 — 코인마다 개별 요청 대신 한 번에 전체 수집
-        ticker_cache: dict[str, dict] = {}
-        try:
-            bulk = self._client.get_ticker("ALL")
-            if bulk.get("status") == "0000":
-                ticker_cache = bulk["data"]
-                logger.debug(f"[MarketAnalyzer] 티커 배치 로드: {len(ticker_cache)}개")
-        except Exception as e:
-            logger.warning(f"[MarketAnalyzer] 티커 배치 조회 실패, 개별 조회로 폴백: {e}")
 
         snapshots = []
         for symbol in symbols:

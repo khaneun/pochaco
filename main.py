@@ -186,7 +186,7 @@ def main() -> None:
     )
     engine_thread.start()
 
-    logger.info(f"pochaco 시작 (HEADLESS={settings.HEADLESS})")
+    logger.info(f"{settings.APP_NAME} 시작 (HEADLESS={settings.HEADLESS})")
     logger.info(f"거래소: {settings.EXCHANGE_PROVIDER} / LLM 공급자: {settings.LLM_PROVIDER} / 감시 주기: {settings.POSITION_CHECK_INTERVAL}초")
     logger.info(f"포트폴리오 모드: {settings.PORTFOLIO_SIZE}개 코인 균등 분산")
     logger.info("8개 전문가 Agent 시스템 활성화 (합의 기반)")

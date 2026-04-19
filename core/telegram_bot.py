@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_HELP_TEXT = """📋 <b>pochaco 명령어 목록</b>
+_HELP_TEXT = f"""📋 <b>{settings.APP_NAME} 명령어 목록</b>
 
 /status   — 전체 상태 요약
 /balance  — KRW 잔고 조회
@@ -95,7 +95,7 @@ class TelegramBot:
     # ------------------------------------------------------------------ #
     def notify_start(self) -> None:
         self.send(
-            "🚀 <b>pochaco 시작</b>\n"
+            f"🚀 <b>{settings.APP_NAME} 시작</b>\n"
             f"LLM: {settings.LLM_PROVIDER}\n"
             f"감시주기: {settings.POSITION_CHECK_INTERVAL}초\n"
             f"시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -221,7 +221,7 @@ class TelegramBot:
 
             sign = "+" if total_pnl_pct >= 0 else ""
             self.send(
-                f"📊 <b>pochaco 상태</b>\n"
+                f"📊 <b>{settings.APP_NAME} 상태</b>\n"
                 f"\n"
                 f"💰 KRW 잔고: {krw:,.0f} 원\n"
                 f"🏦 총 자산: {total:,.0f} 원\n"
@@ -410,7 +410,7 @@ class TelegramBot:
             f"<code>ssh ubuntu@{pub_ip}</code>\n"
             f"\n"
             f"📋 서비스 로그 확인:\n"
-            f"<code>journalctl -u pochaco -f</code>"
+            f"<code>journalctl -u {settings.APP_NAME} -f</code>"
         )
 
     # ------------------------------------------------------------------ #

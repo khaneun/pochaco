@@ -213,10 +213,12 @@ class BuyStrategist(BaseSpecialistAgent):
                         break
 
         if len(coins) < 3:
-            raise RuntimeError(
-                f"[BuyStrategist] 유효한 코인이 {len(coins)}개뿐 — "
-                f"스냅샷={len(snapshots)}개, 후보 심볼={len(valid_symbols)}개"
+            logger.warning(
+                f"[BuyStrategist] 유효한 코인 부족({len(coins)}개) — "
+                f"스냅샷={len(snapshots)}개, 후보 심볼={len(valid_symbols)}개 "
+                f"→ 이번 사이클 매수 스킵"
             )
+            return {"portfolio_decision": None}
 
         # ── TP/SL clamp ──
         take_profit_pct = max(tp_min, min(tp_max, take_profit_pct))

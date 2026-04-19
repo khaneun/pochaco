@@ -250,6 +250,31 @@ class TradeRepository:
             )
             return sum(t.krw_amount for t in trades)
 
+    def get_coin_buy_total(self, portfolio_id: int, symbol: str) -> float:
+        """특정 코인의 포트폴리오 내 원래 매수 금액 합산.
+
+        분할 매도 후 pos.buy_krw는 잔여분으로 줄어들므로,
+        원매수금을 정확히 구하려면 trades 테이블을 직접 조회해야 합니다.
+
+        Args:
+            portfolio_id: 포트폴리오 ID
+            symbol: 코인 심볼
+
+        Returns:
+            해당 코인의 buy side 거래 krw_amount 합계
+        """
+        with self._session() as db:
+            trades = (
+                db.query(Trade)
+                .filter(
+                    Trade.portfolio_id == portfolio_id,
+                    Trade.symbol == symbol,
+                    Trade.side == "buy",
+                )
+                .all()
+            )
+            return sum(t.krw_amount for t in trades)
+
     def get_portfolio_sell_total(self, portfolio_id: int) -> float:
         """포트폴리오의 전체 매도 금액 합산 (분할 매도 포함).
 

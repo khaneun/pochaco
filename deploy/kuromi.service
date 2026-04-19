@@ -3,6 +3,8 @@ Description=kuromi AI 자동매매 시스템 (Upbit)
 Documentation=https://github.com/khaneun/pochaco
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -15,11 +17,13 @@ Environment="AWS_SECRET_NAME=kuromi/prod"
 Environment="AWS_REGION=ap-northeast-2"
 Environment="HEADLESS=true"
 Environment="LLM_PROVIDER=openai"
+Environment="TELEGRAM_ENABLED=true"
 
 # 경로 오버라이드 (/opt/pochaco 기본값 대신 /opt/kuromi 사용)
 Environment="DB_PATH=/opt/kuromi/data/kuromi.db"
 Environment="DB_BACKUP_DIR=/opt/kuromi/backup"
 Environment="LOG_FILE=/opt/kuromi/logs/kuromi.log"
+Environment="APP_NAME=kuromi"
 
 # 가상환경 Python으로 실행
 ExecStart=/opt/kuromi/.venv/bin/python main.py
@@ -27,8 +31,6 @@ ExecStart=/opt/kuromi/.venv/bin/python main.py
 # 비정상 종료 시 10초 후 재시작
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
 # 표준 출력/에러를 journald로 수집
 StandardOutput=journal

@@ -21,7 +21,7 @@ from core import BaseExchangeClient
 from database import TradeRepository
 from database.models import Portfolio, Position
 from strategy.ai_agent import PortfolioDecision
-from strategy.agent_coordinator import AgentCoordinator, InvestmentHoldError
+from strategy.agent_coordinator import AgentCoordinator, InvestmentHoldError, InsufficientCandidatesError
 from strategy.market_analyzer import MarketAnalyzer
 from strategy.strategy_optimizer import StrategyOptimizer
 from strategy.coin_selector import CoinSelector
@@ -170,8 +170,37 @@ class TradingEngine:
     #  총자산 계산 헬퍼                                                     #
     # ------------------------------------------------------------------ #
     def _calc_total_assets(self) -> float:
-        """KRW 잔고 + 보유 코인 평가액"""
-        total = self._client.get_krw_balance()
+        """KRW 잔고(available+locked) + 실제 보유 코인 평가액 (API 기준)"""
+        # available+locked KRW 합산 — 미체결 주문에 묶인 KRW 포함
+        try:
+            detail = self._client.get_krw_balance_detail()
+            total = detail["total"]
+        except Exception:
+            total = self._client.get_krw_balance()
+
+        # 실제 API 잔고 기준 코인 평가액
+        try:
+            bal_data = self._client.get_balance("ALL")
+            if bal_data.get("status") == "0000":
+                for key, value in bal_data["data"].items():
+                    if not key.startswith("total_"):
+                        continue
+                    sym = key.replace("total_", "").upper()
+                    if sym == "KRW":
+                        continue
+                    amt = float(value)
+                    if amt <= 0:
+                        continue
+                    try:
+                        price = self._client.get_current_price(sym)
+                        total += amt * price
+                    except Exception:
+                        pass
+                return total
+        except Exception:
+            pass
+
+        # fallback: DB 포지션 기준
         portfolio = self._repo.get_open_portfolio()
         if portfolio:
             positions = self._repo.get_portfolio_positions(portfolio.id)
@@ -180,7 +209,7 @@ class TradingEngine:
                     price = self._client.get_current_price(pos.symbol)
                     total += pos.units * price
                 except Exception:
-                    total += pos.buy_krw  # 시세 조회 실패 시 매수가 기준
+                    total += pos.buy_krw
         return total
 
     # ------------------------------------------------------------------ #
@@ -298,13 +327,10 @@ class TradingEngine:
         filled_price = target_price  # 기본 fallback
         filled_krw = remaining * target_price
         if order_uuid:
-            time.sleep(1)
-            info = self._client.get_order_by_uuid(order_uuid)
-            if info:
-                if info.get("avg_price", 0) > 0:
-                    filled_price = info["avg_price"]
-                if info.get("executed_funds", 0) > 0:
-                    filled_krw = info["executed_funds"]
+            # 업비트 시장가 주문: state=wait → done 전환까지 최대 5초 폴링
+            filled_price, filled_krw = self._wait_market_fill(
+                order_uuid, filled_price, filled_krw
+            )
 
         return {
             "status": market_result.get("status", "9999"),
@@ -314,6 +340,43 @@ class TradingEngine:
             "filled_krw": filled_krw,
             "method": "market_fallback",
         }
+
+    # ------------------------------------------------------------------ #
+    #  시장가 체결 대기 헬퍼                                                 #
+    # ------------------------------------------------------------------ #
+    def _wait_market_fill(
+        self, order_uuid: str, fallback_price: float, fallback_krw: float,
+        max_wait: float = 5.0, interval: float = 1.0,
+    ) -> tuple[float, float]:
+        """시장가 주문 체결 확인 — state=done 될 때까지 최대 max_wait초 폴링.
+
+        업비트는 시장가 주문 제출 직후 state='wait'를 반환하므로
+        체결 완료(state='done') 확인 없이 진행하면 DB와 실제 잔고가 불일치함.
+
+        Returns:
+            (filled_price, filled_krw): 체결가/체결금액, 실패 시 fallback 값
+        """
+        elapsed = 0.0
+        while elapsed < max_wait:
+            time.sleep(interval)
+            elapsed += interval
+            try:
+                info = self._client.get_order_by_uuid(order_uuid)
+                if not info:
+                    continue
+                if info.get("executed_funds", 0) > 0:
+                    logger.debug(
+                        f"  [시장가 체결 확인] {order_uuid[:8]} "
+                        f"@{info.get('avg_price', 0):,.0f}원 "
+                        f"({info['executed_funds']:,.0f}원, {elapsed:.0f}초)"
+                    )
+                    return info.get("avg_price") or fallback_price, info["executed_funds"]
+            except Exception as e:
+                logger.warning(f"  [체결 확인 오류] {order_uuid[:8]}: {e}")
+        logger.warning(
+            f"  [시장가 체결 타임아웃] {order_uuid[:8]} {max_wait:.0f}초 후 fallback 사용"
+        )
+        return fallback_price, fallback_krw
 
     # ------------------------------------------------------------------ #
     #  미체결 주문 정리                                                     #
@@ -367,13 +430,23 @@ class TradingEngine:
 
                 result = self._client.market_sell(symbol, amount)
                 if result.get("status") == "0000":
+                    # 업비트 시장가: state=wait → done 체결 확인 후 실제 금액 기록
+                    order_data = result.get("data", {})
+                    order_uuid = (
+                        order_data.get("uuid", "") if isinstance(order_data, dict) else ""
+                    )
+                    filled_price, filled_krw = current_price, krw_value
+                    if order_uuid:
+                        filled_price, filled_krw = self._wait_market_fill(
+                            order_uuid, current_price, krw_value
+                        )
                     self._repo.save_trade(
                         symbol=symbol, side="sell",
-                        price=current_price, units=amount,
-                        krw_amount=krw_value, note=note,
+                        price=filled_price, units=amount,
+                        krw_amount=filled_krw, note=note,
                     )
                     sold_any = True
-                    logger.info(f"  {symbol} {amount}개 → {krw_value:,.0f}원 매도 완료")
+                    logger.info(f"  {symbol} {amount}개 → {filled_krw:,.0f}원 매도 완료")
                 else:
                     logger.warning(f"  {symbol} 매도 실패: {result}")
             except Exception as e:
@@ -441,8 +514,11 @@ class TradingEngine:
         filtered, coin_scores = self._selector.filter_and_rank(
             snapshots, target_tp=target_tp, cooldown_symbols=cooldown_symbols
         )
-        if not filtered:
-            logger.warning("[CoinSelector] 조건 충족 코인 없음 — 전체 목록으로 폴백")
+        if len(filtered) < _MIN_PORTFOLIO_COINS:
+            logger.warning(
+                f"[CoinSelector] 후보 {len(filtered)}개 부족 "
+                f"(최소 {_MIN_PORTFOLIO_COINS}개) — 전체 목록으로 폴백"
+            )
             filtered = snapshots
             coin_scores = []
 
@@ -465,6 +541,10 @@ class TradingEngine:
                 except Exception:
                     pass
             time.sleep(_HOLD_WAIT_MINUTES * 60)
+            return
+        except InsufficientCandidatesError as e:
+            logger.warning(f"[후보 부족] {e} — 5분 후 재시도")
+            time.sleep(5 * 60)
             return
 
         symbols_str = ", ".join(c.symbol for c in decision.coins)
@@ -503,11 +583,24 @@ class TradingEngine:
 
                 time.sleep(_BUY_INTERVAL_SEC)
                 units = self._client.get_coin_balance(coin.symbol)
-                current_price = self._client.get_current_price(coin.symbol)
+                # 업비트 비동기 체결: 0이면 최대 3회 재시도 (체결 대기)
+                if units <= 0:
+                    for _retry in range(3):
+                        time.sleep(1.0)
+                        units = self._client.get_coin_balance(coin.symbol)
+                        if units > 0:
+                            break
+                    if units <= 0:
+                        logger.warning(
+                            f"[매수 체결 미확인] {coin.symbol} — units=0, 스킵"
+                        )
+                        continue
+                # 실제 평균 체결가 = 투입금액 / 수령 수량 (current_price보다 정확)
+                actual_buy_price = per_coin_amount / units
 
                 self._repo.save_trade(
                     symbol=coin.symbol, side="buy",
-                    price=current_price, units=units,
+                    price=actual_buy_price, units=units,
                     krw_amount=per_coin_amount, note=coin.reason,
                     portfolio_id=portfolio.id,
                 )
@@ -515,14 +608,14 @@ class TradingEngine:
                     portfolio_id=portfolio.id,
                     symbol=coin.symbol,
                     units=units,
-                    buy_price=current_price,
+                    buy_price=actual_buy_price,
                     buy_krw=per_coin_amount,
                     agent_reason=coin.reason,
                 )
                 bought_count += 1
                 logger.info(
                     f"  [{bought_count}/{len(decision.coins)}] "
-                    f"{coin.symbol} {units}개 @ {current_price:,.0f}원"
+                    f"{coin.symbol} {units}개 @ {actual_buy_price:,.0f}원"
                 )
             except Exception as e:
                 logger.error(f"[매수 오류] {coin.symbol}: {e}")
@@ -854,6 +947,9 @@ class TradingEngine:
         """8개 코인 전량 매도 → 포트폴리오 종료 (지정가 3회 → 시장가)"""
         logger.info(f"[포트폴리오 매도] '{portfolio.name}' | {reason}")
 
+        # 분할 매도가 먼저 실행된 경우 이미 확보된 수익 포함
+        prior_sell_krw = self._repo.get_portfolio_sell_total(portfolio.id)
+
         total_sell_krw = 0.0
         coin_results = []
 
@@ -924,14 +1020,20 @@ class TradingEngine:
                     filled_price = tgt_price
                     total_sell_krw += pos.buy_krw
 
-                # coin pnl은 매수금액 대비 실제 매도금액으로 계산
-                coin_pnl = (krw_value - pos.buy_krw) / pos.buy_krw * 100 if pos.buy_krw > 0 else 0
+                # 분할 매도 포함 코인 전체 손익 — pos.buy_krw는 잔여분 기준이므로 원매수금 조회
+                prior_coin_sell = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
+                original_buy_krw = self._repo.get_coin_buy_total(portfolio.id, pos.symbol)
+                total_coin_sell = prior_coin_sell + krw_value
+                coin_pnl = (
+                    (total_coin_sell - original_buy_krw) / original_buy_krw * 100
+                    if original_buy_krw > 0 else 0.0
+                )
                 coin_results.append({
                     "symbol": pos.symbol,
                     "buy_price": pos.buy_price,
-                    "buy_krw": pos.buy_krw,
+                    "buy_krw": round(original_buy_krw, 0),
                     "sell_price": filled_price,
-                    "sell_krw": round(krw_value, 0),
+                    "sell_krw": round(total_coin_sell, 0),
                     "pnl_pct": round(coin_pnl, 2),
                     "target_price": tgt_price,
                     "units": fill.get("filled_units", actual_units),
@@ -954,10 +1056,16 @@ class TradingEngine:
         for pos in positions:
             cooldown_registry.record_sell(pos.symbol, exit_type_for_cd)
 
-        pnl_krw = total_sell_krw - portfolio.total_buy_krw
+        # 분할 매도 수익(prior_sell_krw)까지 포함한 실제 총 손익
+        total_proceeds = total_sell_krw + prior_sell_krw
+        pnl_krw = total_proceeds - portfolio.total_buy_krw
+        pnl_pct_actual = (
+            pnl_krw / portfolio.total_buy_krw * 100
+            if portfolio.total_buy_krw > 0 else 0.0
+        )
         logger.info(
             f"[포트폴리오 매도 완료] '{portfolio.name}' "
-            f"수익={pnl_pct:+.2f}% ({pnl_krw:+,.0f}원) | {reason}"
+            f"수익={pnl_pct_actual:+.2f}% ({pnl_krw:+,.0f}원) | {reason}"
         )
 
         if self._notifier:
@@ -966,18 +1074,21 @@ class TradingEngine:
                     f"  {'✅' if cr['pnl_pct'] >= 0 else '❌'} {cr['symbol']} {cr['pnl_pct']:+.2f}%"
                     for cr in coin_results
                 )
+                # 트리거 사유와 실제 결과가 다를 수 있음을 명시
+                triggered_by = "익절트리거" if "익절" in reason else "손절트리거"
+                result_label = "실현이익" if pnl_pct_actual >= 0 else "실현손실"
                 self._notifier.send(
-                    f"{'💰' if pnl_pct >= 0 else '📉'} <b>포트폴리오 매도</b> '{portfolio.name}'\n"
-                    f"종합: {pnl_pct:+.2f}% ({pnl_krw:+,.0f}원)\n"
+                    f"{'💰' if pnl_pct_actual >= 0 else '📉'} <b>포트폴리오 매도</b> '{portfolio.name}'\n"
+                    f"종합: {pnl_pct_actual:+.2f}% ({pnl_krw:+,.0f}원) [{result_label}]\n"
                     f"{coin_summary}\n"
-                    f"사유: {reason}"
+                    f"트리거: {triggered_by} ({reason})"
                 )
             except Exception:
                 pass
 
         # ── 성과 평가 ──
         self._run_post_trade_evaluation(
-            portfolio, total_sell_krw, pnl_pct, held_min, reason, coin_results,
+            portfolio, total_proceeds, pnl_pct_actual, held_min, reason, coin_results,
         )
 
     # ------------------------------------------------------------------ #

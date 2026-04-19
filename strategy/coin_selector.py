@@ -127,6 +127,27 @@ class CoinSelector:
                     f"{len(extra[:need])}개 추가 보충"
                 )
 
+        # ── 3차 패스: 쿨다운 무시 — 위 두 패스로도 부족할 때만 ──
+        # 포트폴리오 익절 직후 다수 코인이 쿨다운에 걸려 후보가 고갈되는 상황 방지
+        if len(scored) < min_candidates and cooldown_symbols:
+            passed_symbols = {sc.symbol for _, sc in scored}
+            extra_nc, _ = self._run_filter_pass(
+                [s for s in snapshots if s.symbol not in passed_symbols],
+                set(),  # 쿨다운 무시
+                target_tp, vol_multiplier=0.5,
+            )
+            extra_nc.sort(key=lambda x: x[1].total_score, reverse=True)
+            need = min_candidates - len(scored)
+            added = extra_nc[:need]
+            scored.extend(added)
+            scored.sort(key=lambda x: x[1].total_score, reverse=True)
+            if added:
+                added_symbols = [sc.symbol for _, sc in added]
+                logger.warning(
+                    f"[CoinSelector] 3차 패스(쿨다운 무시): "
+                    f"{len(added)}개 보충 {added_symbols}"
+                )
+
         # 상위 N개만 반환
         top = scored[:_TOP_CANDIDATES]
         result_snapshots = [s for s, _ in top]
