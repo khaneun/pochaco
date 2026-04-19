@@ -82,6 +82,30 @@ def _parse_manual_note(note: str) -> tuple[float | None, float | None, float | N
     return pnl_pct, pnl_krw, held_min
 
 
+def _get_pyramid_info(repo: "TradeRepository", portfolio_id: int) -> dict | None:
+    """현재 포트폴리오의 피라미딩 추가 매수 내역 반환"""
+    try:
+        trades = repo.get_recent_trades(50)
+        pyramid_trades = [
+            t for t in trades
+            if t.portfolio_id == portfolio_id
+            and t.side == "buy"
+            and t.note
+            and "피라미딩" in t.note
+        ]
+        if not pyramid_trades:
+            return None
+        total_add_krw = sum(t.krw_amount for t in pyramid_trades)
+        executed_at = _to_kst(pyramid_trades[-1].created_at).strftime("%m-%d %H:%M")
+        return {
+            "count": len(pyramid_trades),
+            "total_add_krw": round(total_add_krw, 0),
+            "executed_at": executed_at,
+        }
+    except Exception:
+        return None
+
+
 def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordinator | None" = None) -> dict:
     """현재 상태를 JSON 직렬화 가능한 dict로 반환 (포트폴리오 기반)"""
     from database.models import Portfolio
@@ -198,6 +222,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                 "coins": coins_data,
                 "opened_at": _to_kst(pf.opened_at).strftime("%m-%d %H:%M"),
                 "peak_pnl_pct": round(pf.peak_pnl_pct or 0.0, 2),
+                "pyramid": _get_pyramid_info(repo, pf.id),
             }
 
         # holdings — 포트폴리오 외 보유 코인
@@ -970,8 +995,27 @@ def _render_html(data: dict) -> str:
 
     # 성과 평가 HTML
     eval_stats = data.get("eval_stats", {})
+    pyramid = pf.get("pyramid") if pf else None
+
+    # 피라미딩 배너 (현재 포트폴리오에 추가 매수 이력이 있을 때)
+    if pyramid:
+        pyramid_html = (
+            f'<div style="background:#1c1f2e; border-left:3px solid #fb923c; '
+            f'padding:10px 14px; border-radius:6px; margin-bottom:10px; font-size:0.83rem;">'
+            f'<span style="color:#fb923c; font-weight:600;">📈 피라미딩 추가 매수 완료</span>'
+            f'&nbsp;&nbsp;'
+            f'코인 {pyramid["count"]}종 &nbsp;|&nbsp; '
+            f'추가 투입 <b style="color:#fbbf24;">{pyramid["total_add_krw"]:,.0f}원</b>'
+            f'&nbsp;|&nbsp; '
+            f'<span style="color:#64748b;">{pyramid["executed_at"]}</span>'
+            f'</div>'
+        )
+    else:
+        pyramid_html = ""
+
     if eval_stats:
         eval_summary_html = (
+            pyramid_html +
             f'<div style="background:#0f172a; padding:12px 16px; border-radius:8px; '
             f'margin-bottom:12px; font-size:0.85rem;">'
             f'<span style="color:#facc15;">📈 최근 {eval_stats["count"]}건</span> &nbsp;|&nbsp; '
@@ -983,7 +1027,7 @@ def _render_html(data: dict) -> str:
             f'</div>'
         )
     else:
-        eval_summary_html = ""
+        eval_summary_html = pyramid_html
 
     evals_list = data.get("evaluations", [])
     eval_popup_list: list[dict] = []
