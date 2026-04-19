@@ -777,7 +777,7 @@ def _render_html(data: dict) -> str:
           <!-- 트랙 배경 -->
           <div style="position:absolute; top:8px; left:0; right:0; height:10px;
                background:#0f172a; border-radius:5px; overflow:hidden;">
-            <!-- 손절 구간 (빨간) -->
+            <!-- 손절 구간 -->
             <div style="position:absolute; left:0; width:{zero_pos:.1f}%;
                  height:100%; background:#1e3a5f;"></div>
             <!-- 익절 구간 -->
@@ -794,11 +794,11 @@ def _render_html(data: dict) -> str:
                background:{cur_color}; transform:translateX(-50%); border-radius:2px;"></div>
           {peak_marker_html}
         </div>
-        <!-- 레이블 행 -->
-        <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:#64748b;">
-          <span class="red">{pf['stop_loss_pct']:.1f}%</span>
-          <span style="color:#475569;">0%</span>
-          <span class="green">+{tp:.1f}%</span>
+        <!-- 레이블 행: 손절(좌) / 0%(중심선 위치) / 익절(우) -->
+        <div style="position:relative; font-size:0.7rem; color:#64748b; height:14px;">
+          <span class="red" style="position:absolute; left:0;">SL {pf['stop_loss_pct']:.1f}%</span>
+          <span style="position:absolute; left:{zero_pos:.1f}%; transform:translateX(-50%); color:#475569;">0%</span>
+          <span class="green" style="position:absolute; right:0;">TP +{tp:.1f}%</span>
         </div>
         <!-- 현재/고점 수치 -->
         <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px; text-align:center;">
