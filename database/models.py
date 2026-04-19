@@ -41,6 +41,7 @@ class Portfolio(Base):
     stop_loss_pct = Column(Float, nullable=False)         # 포트폴리오 최대 손절% (max -2%)
     agent_reason = Column(Text)                           # 포트폴리오 구성 이유
     llm_provider = Column(String(50), default="")
+    peak_pnl_pct = Column(Float, default=0.0)             # 보유 기간 최고 수익률
     opened_at = Column(DateTime, default=datetime.utcnow, index=True)
     closed_at = Column(DateTime, nullable=True)
     is_open = Column(Boolean, default=True, index=True)
@@ -272,6 +273,13 @@ def _ensure_schema_updates() -> None:
             conn.execute("ALTER TABLE trades ADD COLUMN target_price FLOAT")
             conn.commit()
             _log.info("[DB 스키마] trades.target_price 컬럼 추가 완료")
+
+        cursor = conn.execute("PRAGMA table_info(portfolios)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "peak_pnl_pct" not in columns:
+            conn.execute("ALTER TABLE portfolios ADD COLUMN peak_pnl_pct FLOAT DEFAULT 0.0")
+            conn.commit()
+            _log.info("[DB 스키마] portfolios.peak_pnl_pct 컬럼 추가 완료")
     finally:
         conn.close()
 

@@ -197,6 +197,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                 "coin_count": len(coins_data),
                 "coins": coins_data,
                 "opened_at": _to_kst(pf.opened_at).strftime("%m-%d %H:%M"),
+                "peak_pnl_pct": round(pf.peak_pnl_pct or 0.0, 2),
             }
 
         # holdings — 포트폴리오 외 보유 코인
@@ -733,8 +734,77 @@ def _render_html(data: dict) -> str:
         pnl_color = "green" if pnl_pct >= 0 else "red"
         held = pf["held_minutes"]
         held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
-        progress = min(1.0, max(0.0, pnl_pct / pf["take_profit_pct"])) if pf["take_profit_pct"] > 0 else 0.0
-        bar_color = "#f87171" if pnl_pct >= 0 else "#60a5fa"
+        peak_pnl_pct = pf.get("peak_pnl_pct", 0.0)
+
+        # ── 양방향 게이지 계산 ──
+        # 전체 범위: SL% ~ 0 ~ TP% (비율로 환산)
+        tp = pf["take_profit_pct"]       # 양수 ex) 5.0
+        sl = abs(pf["stop_loss_pct"])    # 절댓값 ex) 2.0
+        total_range = tp + sl            # ex) 7.0
+        # 0% 위치 (게이지 왼쪽 끝 기준 %)
+        zero_pos = sl / total_range * 100   # ex) 28.6%
+
+        def _gauge_pos(pct: float) -> float:
+            """수익률 → 게이지 위치 (0~100%)"""
+            clamped = max(-sl, min(tp, pct))
+            return (clamped + sl) / total_range * 100
+
+        cur_pos = _gauge_pos(pnl_pct)
+        peak_pos = _gauge_pos(peak_pnl_pct) if peak_pnl_pct > 0 else None
+
+        # 현재 위치 색: 손실=파랑, 이익=빨강
+        cur_color = "#f87171" if pnl_pct >= 0 else "#60a5fa"
+        peak_marker_html = ""
+        if peak_pos is not None and peak_pnl_pct > pnl_pct + 0.05:
+            # 고점 마커 (연한 주황 삼각형)
+            peak_marker_html = (
+                f'<div style="position:absolute; left:{peak_pos:.1f}%; top:-4px;'
+                f' transform:translateX(-50%); color:#fb923c; font-size:10px; line-height:1;">▼</div>'
+                f'<div style="position:absolute; left:{peak_pos:.1f}%; top:14px;'
+                f' transform:translateX(-50%); color:#fb923c; font-size:0.65rem; white-space:nowrap;">'
+                f'{peak_pnl_pct:+.1f}%</div>'
+            )
+
+        # 손절/익절 라벨 위치
+        gauge_html = f"""
+        <div style="margin-top:14px; font-size:0.78rem; color:#94a3b8; margin-bottom:6px;">
+          손절/익절 게이지
+          <span style="float:right; color:#fb923c; font-size:0.72rem;">
+            {"▼ 고점 " + f"{peak_pnl_pct:+.1f}%" if peak_pos is not None and peak_pnl_pct > pnl_pct + 0.05 else ""}
+          </span>
+        </div>
+        <div style="position:relative; height:28px; margin-bottom:4px;">
+          <!-- 트랙 배경 -->
+          <div style="position:absolute; top:8px; left:0; right:0; height:10px;
+               background:#0f172a; border-radius:5px; overflow:hidden;">
+            <!-- 손절 구간 (빨간) -->
+            <div style="position:absolute; left:0; width:{zero_pos:.1f}%;
+                 height:100%; background:#1e3a5f;"></div>
+            <!-- 익절 구간 -->
+            <div style="position:absolute; left:{zero_pos:.1f}%; right:0;
+                 height:100%; background:#1e3a28;"></div>
+            <!-- 현재 채움 -->
+            {'<div style="position:absolute; left:' + f'{min(cur_pos, zero_pos):.1f}' + '%; width:' + f'{abs(cur_pos - zero_pos):.1f}' + '%; height:100%; background:' + cur_color + '; opacity:0.8;"></div>'}
+          </div>
+          <!-- 0% 중심선 -->
+          <div style="position:absolute; left:{zero_pos:.1f}%; top:4px; width:2px; height:18px;
+               background:#475569; transform:translateX(-50%);"></div>
+          <!-- 현재 위치 마커 -->
+          <div style="position:absolute; left:{cur_pos:.1f}%; top:4px; width:3px; height:18px;
+               background:{cur_color}; transform:translateX(-50%); border-radius:2px;"></div>
+          {peak_marker_html}
+        </div>
+        <!-- 레이블 행 -->
+        <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:#64748b;">
+          <span class="red">{pf['stop_loss_pct']:.1f}%</span>
+          <span style="color:#475569;">0%</span>
+          <span class="green">+{tp:.1f}%</span>
+        </div>
+        <!-- 현재/고점 수치 -->
+        <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px; text-align:center;">
+          현재 <span class="{pnl_color}" style="font-weight:600;">{pnl_pct:+.2f}%</span>
+          {"&nbsp;|&nbsp; 고점 <span style='color:#fb923c; font-weight:600;'>" + f"{peak_pnl_pct:+.2f}%" + "</span>" if peak_pnl_pct > 0.05 else ""}
+        </div>"""
 
         # 개별 코인 테이블
         coin_rows = ""
@@ -780,11 +850,7 @@ def _render_html(data: dict) -> str:
           <span class="stat-label">보유 시간</span>
           <span class="stat-value">{held_str}</span>
         </div>
-        <div style="margin-top:10px; font-size:0.8rem; color:#94a3b8;">익절 달성률</div>
-        <div style="background:#0f172a; border-radius:4px; height:8px; margin-top:4px;">
-          <div style="background:{bar_color}; width:{progress*100:.0f}%; height:100%; border-radius:4px;"></div>
-        </div>
-        <div style="font-size:0.75rem; color:#64748b; margin-top:4px;">{progress:.0%} / 100%</div>
+        {gauge_html}
         {coins_table}
         <div style="margin-top:10px; font-size:0.78rem; color:#64748b; font-style:italic;">
           {(pf.get('agent_reason') or '')[:120]}

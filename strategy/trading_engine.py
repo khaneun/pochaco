@@ -766,6 +766,14 @@ class TradingEngine:
             f"{'[T1]' if tracker.tier1_sold else ''}{'[T2]' if tracker.tier2_sold else ''}"
         )
 
+        # 보유 기간 최고 수익률 갱신 (양수 신고점만)
+        if pnl_pct > tracker.peak_pnl_pct:
+            tracker.peak_pnl_pct = pnl_pct
+            try:
+                self._repo.update_portfolio_peak(portfolio.id, pnl_pct)
+            except Exception as e:
+                logger.warning(f"[peak 갱신 오류] {e}")
+
         # ── 익절 돌파 → 트레일링 모드 ──
         if pnl_pct >= portfolio.take_profit_pct:
             tracker.phase = _ExitPhase.TRAILING_TP

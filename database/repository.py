@@ -110,6 +110,13 @@ class TradeRepository:
                 pf.take_profit_pct = new_tp
                 pf.stop_loss_pct = new_sl
 
+    def update_portfolio_peak(self, portfolio_id: int, peak_pnl_pct: float) -> None:
+        """보유 기간 최고 수익률 갱신"""
+        with self._session() as db:
+            pf = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
+            if pf and peak_pnl_pct > (pf.peak_pnl_pct or 0.0):
+                pf.peak_pnl_pct = peak_pnl_pct
+
     # ------------------------------------------------------------------ #
     #  Position (포트폴리오 하위)                                            #
     # ------------------------------------------------------------------ #
