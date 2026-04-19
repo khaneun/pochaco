@@ -248,6 +248,10 @@ class UpbitClient(BaseExchangeClient):
             data[f"available_{cur}"] = str(bal)
             data[f"total_{cur}"] = str(bal + locked)
             data[f"in_use_{cur}"] = str(locked)
+            # 거래소 평균 매수가 — 수익률 기준 일치에 사용
+            avg = acc.get("avg_buy_price")
+            if avg is not None:
+                data[f"avg_buy_price_{cur}"] = str(avg)
         return {"status": "0000", "data": data}
 
     def get_orders(self, symbol: str, order_id: str = "", order_type: str = "") -> dict:

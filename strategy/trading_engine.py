@@ -1240,21 +1240,34 @@ class TradingEngine:
 
         for pos in positions:
             try:
-                actual = float(
-                    balance_data.get(f"available_{pos.symbol.lower()}", 0)
-                )
-                if actual <= 0 or pos.units <= 0:
+                key = pos.symbol.lower()
+                actual_units = float(balance_data.get(f"available_{key}", 0))
+                avg_buy_price_str = balance_data.get(f"avg_buy_price_{key}")
+                actual_buy_price = float(avg_buy_price_str) if avg_buy_price_str else 0.0
+
+                if actual_units <= 0 or pos.units <= 0:
                     continue
-                diff_ratio = abs(actual - pos.units) / pos.units
-                if diff_ratio > 0.005:  # 0.5% 이상 차이
+
+                units_diff = abs(actual_units - pos.units) / pos.units
+                price_diff = (
+                    abs(actual_buy_price - pos.buy_price) / pos.buy_price
+                    if actual_buy_price > 0 and pos.buy_price > 0 else 0.0
+                )
+
+                need_update = units_diff > 0.005 or price_diff > 0.001
+
+                if need_update:
+                    new_price = actual_buy_price if actual_buy_price > 0 else pos.buy_price
                     logger.warning(
-                        f"[수량 보정] {pos.symbol}: DB={pos.units:.6f} → 실잔고={actual:.6f} "
-                        f"(차이 {diff_ratio*100:.2f}%)"
+                        f"[포지션 보정] {pos.symbol}: "
+                        f"수량 {pos.units:.6f}→{actual_units:.6f} ({units_diff*100:.2f}%), "
+                        f"단가 {pos.buy_price:,.0f}→{new_price:,.0f} ({price_diff*100:.2f}%)"
                     )
-                    self._repo.update_position_units(pos.id, actual)
-                    pos.units = actual
+                    self._repo.reconcile_position(pos.id, actual_units, new_price)
+                    pos.units = actual_units
+                    pos.buy_price = new_price
             except Exception as e:
-                logger.debug(f"[수량 보정 오류] {pos.symbol}: {e}")
+                logger.debug(f"[포지션 보정 오류] {pos.symbol}: {e}")
 
     # ------------------------------------------------------------------ #
     #  피라미딩 추가 매수                                                     #

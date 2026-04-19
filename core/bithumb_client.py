@@ -119,8 +119,9 @@ class BithumbClient(BaseExchangeClient):
     def get_balance(self, currency: str = "ALL") -> dict:
         """잔고 조회 — trading_engine 호환 포맷(v1 스타일)으로 반환
 
-        v2 응답: [{"currency":"KRW","balance":"94825","locked":"0",...}, ...]
-        반환:    {"status":"0000","data":{"available_krw":"94825","total_krw":"94825","in_use_krw":"0",...}}
+        v2 응답: [{"currency":"KRW","balance":"94825","locked":"0","avg_buy_price":"0",...}, ...]
+        반환:    {"status":"0000","data":{"available_krw":"94825","total_krw":"94825",
+                  "in_use_krw":"0","avg_buy_price_krw":"0",...}}
         """
         accounts = self._v2_get("/v1/accounts")
         data: dict = {}
@@ -131,6 +132,10 @@ class BithumbClient(BaseExchangeClient):
             data[f"available_{cur}"] = str(bal)
             data[f"total_{cur}"] = str(bal + locked)
             data[f"in_use_{cur}"] = str(locked)
+            # 거래소 평균 매수가 — 수익률 기준 일치에 사용
+            avg = acc.get("avg_buy_price")
+            if avg is not None:
+                data[f"avg_buy_price_{cur}"] = str(avg)
         return {"status": "0000", "data": data}
 
     def get_orders(self, symbol: str, order_id: str = "", order_type: str = "") -> dict:

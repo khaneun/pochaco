@@ -204,6 +204,16 @@ class TradeRepository:
             if pos:
                 pos.units = units
 
+    def reconcile_position(
+        self, position_id: int, units: float, buy_price: float,
+    ) -> None:
+        """거래소 실잔고 기반 포지션 수량·평균 단가 동시 보정"""
+        with self._session() as db:
+            pos = db.query(Position).filter(Position.id == position_id).first()
+            if pos:
+                pos.units = units
+                pos.buy_price = buy_price
+
     def update_position_after_partial_sell(
         self, position_id: int, remaining_units: float, remaining_buy_krw: float,
     ) -> None:
