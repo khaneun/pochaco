@@ -662,15 +662,17 @@ class TradingEngine:
     #  포트폴리오 종합 P&L 계산                                              #
     # ------------------------------------------------------------------ #
     def _calc_portfolio_pnl(
-        self, positions: list[Position],
+        self, portfolio: Portfolio, positions: list[Position],
     ) -> tuple[float, float, list[dict]]:
         """포트폴리오 종합 P&L 계산
+
+        분할 매도로 이미 실현된 손익까지 포함하여 실제 포트폴리오 수익률을 계산합니다.
+        (기존 방식은 남은 포지션만의 수익률만 보여줘서 분할 손절 손실을 누락했음)
 
         Returns:
             (pnl_pct, pnl_krw, coin_details)
             coin_details: [{symbol, buy_price, buy_krw, current_price, current_value, pnl_pct, units}]
         """
-        total_buy = 0.0
         total_current = 0.0
         coin_details = []
 
@@ -691,7 +693,6 @@ class TradingEngine:
                 if pos.buy_price > 0 else 0.0
             )
 
-            total_buy += pos.buy_krw
             total_current += current_value
 
             coin_details.append({
@@ -704,11 +705,12 @@ class TradingEngine:
                 "units": pos.units,
             })
 
-        pnl_pct = (
-            (total_current - total_buy) / total_buy * 100
-            if total_buy > 0 else 0.0
-        )
-        pnl_krw = total_current - total_buy
+        # 분할 매도로 이미 실현된 금액 포함 → 원래 총 투자금 기준으로 실제 수익률 계산
+        prior_sell_krw = self._repo.get_portfolio_sell_total(portfolio.id)
+        total_proceeds_estimate = prior_sell_krw + total_current
+        ref_buy = portfolio.total_buy_krw if portfolio.total_buy_krw > 0 else 1.0
+        pnl_pct = (total_proceeds_estimate - ref_buy) / ref_buy * 100
+        pnl_krw = total_proceeds_estimate - ref_buy
 
         return round(pnl_pct, 4), round(pnl_krw, 0), coin_details
 
@@ -723,7 +725,7 @@ class TradingEngine:
             self._exit_tracker = None
             return
 
-        pnl_pct, pnl_krw, coin_details = self._calc_portfolio_pnl(positions)
+        pnl_pct, pnl_krw, coin_details = self._calc_portfolio_pnl(portfolio, positions)
         tracker = self._exit_tracker or _PortfolioExitTracker()
 
         # 매도 시 목표가 맵 (현재 시세 기준)
