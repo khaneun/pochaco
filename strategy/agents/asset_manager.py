@@ -21,6 +21,15 @@ class AllocationDecision:
     reason: str
 
 
+@dataclass
+class PyramidDecision:
+    """피라미딩 추가 매수 결정"""
+    should_pyramid: bool      # 추가 매수 여부
+    threshold_pct: float      # 실행 최소 수익률 (0.5~3.0%)
+    add_ratio: float          # 원래 투입금 대비 추가 비율 (0.10~0.50)
+    reason: str
+
+
 class AssetManager(BaseSpecialistAgent):
     """시장 상태와 계좌 상황을 보고 투자 비율을 결정하는 전문가 Agent"""
 
@@ -128,6 +137,97 @@ class AssetManager(BaseSpecialistAgent):
         except Exception as e:
             logger.error(f"[AssetManager] 분석 실패: {e}")
             return {"allocation": self._default_allocation()}
+
+    def decide_pyramid(self, context: dict) -> PyramidDecision:
+        """피라미딩 추가 매수 여부·조건 결정
+
+        Args:
+            context: {
+                "current_pnl_pct": float,   # 현재 포트폴리오 수익률
+                "peak_pnl_pct": float,      # 보유 기간 최고 수익률
+                "total_buy_krw": float,     # 현재 포트폴리오 총 투입금
+                "take_profit_pct": float,   # 익절 목표%
+                "krw_available": float,     # 가용 KRW
+                "coin_count": int,          # 보유 코인 수
+                "held_minutes": float,      # 보유 시간(분)
+            }
+
+        Returns:
+            PyramidDecision
+        """
+        current_pnl = context.get("current_pnl_pct", 0.0)
+        peak_pnl = context.get("peak_pnl_pct", 0.0)
+        total_buy = context.get("total_buy_krw", 0.0)
+        tp = context.get("take_profit_pct", 5.0)
+        krw_avail = context.get("krw_available", 0.0)
+        coin_count = context.get("coin_count", 1)
+        held_min = context.get("held_minutes", 0.0)
+
+        # 가용 KRW가 원래 투입금의 10% 미만이면 무조건 보류
+        if krw_avail < total_buy * 0.10:
+            return PyramidDecision(
+                should_pyramid=False,
+                threshold_pct=999.0,
+                add_ratio=0.0,
+                reason=f"가용 KRW 부족 ({krw_avail:,.0f}원)",
+            )
+
+        try:
+            task_prompt = (
+                f"현재 포트폴리오 상태:\n"
+                f"- 현재 수익률: {current_pnl:+.2f}%\n"
+                f"- 보유 기간 최고 수익률: {peak_pnl:+.2f}%\n"
+                f"- 익절 목표: +{tp}%\n"
+                f"- 총 투입금: {total_buy:,.0f}원\n"
+                f"- 가용 KRW: {krw_avail:,.0f}원 (원래 투입금의 {krw_avail/total_buy*100:.0f}%)\n"
+                f"- 보유 코인 수: {coin_count}개\n"
+                f"- 보유 시간: {held_min:.0f}분\n\n"
+                f"【피라미딩 의사결정】\n"
+                f"포트폴리오가 플러스 국면일 때 상승 모멘텀에 편승해 추가 매수할지 결정합니다.\n"
+                f"이 결정은 포트폴리오 생애 동안 단 1회만 실행됩니다.\n\n"
+                f"【판단 기준】\n"
+                f"- 수익이 안정적으로 유지되고 익절 목표의 30~60% 달성 시 적극 고려\n"
+                f"- 수익이 고점 대비 크게 빠졌다면 모멘텀이 약하므로 보류\n"
+                f"- threshold_pct: 추가 매수 실행에 필요한 최소 수익률 (0.5~3.0%)\n"
+                f"- add_ratio: 원래 투입금 대비 추가 투입 비율 (0.10~0.50)\n"
+                f"  · 상승 확신 강하면 0.3~0.5, 보통이면 0.1~0.2\n"
+                f"  · 가용 KRW 제약을 반드시 고려\n\n"
+                f"JSON으로만 응답:\n"
+                f'{{"should_pyramid": true, "threshold_pct": 2.0, "add_ratio": 0.25, "reason": "..."}}'
+            )
+
+            raw = self._call_llm(task_prompt, max_tokens=256)
+            logger.info(f"[AssetManager] 피라미딩 응답: {raw}")
+            data = self._parse_json(raw)
+
+            should = bool(data.get("should_pyramid", False))
+            threshold = float(data.get("threshold_pct", 2.0))
+            add_ratio = float(data.get("add_ratio", 0.25))
+            reason = data.get("reason", "")
+
+            threshold = max(0.5, min(3.0, threshold))
+            add_ratio = max(0.10, min(0.50, add_ratio))
+
+            decision = PyramidDecision(
+                should_pyramid=should,
+                threshold_pct=round(threshold, 2),
+                add_ratio=round(add_ratio, 2),
+                reason=reason,
+            )
+            logger.info(
+                f"[AssetManager] 피라미딩: {'예' if should else '아니오'} / "
+                f"최소수익={threshold:.1f}% / 추가비율={add_ratio:.0%} / {reason}"
+            )
+            return decision
+
+        except Exception as e:
+            logger.error(f"[AssetManager] 피라미딩 판단 실패: {e}")
+            return PyramidDecision(
+                should_pyramid=False,
+                threshold_pct=999.0,
+                add_ratio=0.0,
+                reason=f"판단 실패: {e}",
+            )
 
     @staticmethod
     def _default_allocation() -> AllocationDecision:

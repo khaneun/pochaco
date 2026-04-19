@@ -15,7 +15,7 @@ from .market_analyzer import CoinSnapshot
 from .coin_selector import CoinScore
 from .agents import (
     MarketAnalyst, MarketCondition,
-    AssetManager, AllocationDecision,
+    AssetManager, AllocationDecision, PyramidDecision,
     InvestmentStrategist, InvestmentOpinion,
     BuyStrategist,
     SellStrategist,
@@ -390,6 +390,21 @@ class AgentCoordinator:
             f"SL={decision.stop_loss_pct}%",
         )
 
+        return decision
+
+    # ------------------------------------------------------------------ #
+    #  피라미딩 추가 매수 판단                                                #
+    # ------------------------------------------------------------------ #
+    def decide_pyramid(self, context: dict) -> PyramidDecision:
+        """자산 운용가에게 피라미딩 추가 매수 여부 질의"""
+        decision = self._agents["asset_manager"].decide_pyramid(context)
+        if decision.should_pyramid:
+            self._log_decision(
+                "asset_manager", "pyramid",
+                f"pnl={context.get('current_pnl_pct', 0):+.2f}% "
+                f"avail={context.get('krw_available', 0):,.0f}원",
+                f"threshold={decision.threshold_pct}% add={decision.add_ratio:.0%} | {decision.reason}",
+            )
         return decision
 
     # ------------------------------------------------------------------ #

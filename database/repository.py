@@ -117,6 +117,36 @@ class TradeRepository:
             if pf and peak_pnl_pct > (pf.peak_pnl_pct or 0.0):
                 pf.peak_pnl_pct = peak_pnl_pct
 
+    def pyramid_position(
+        self,
+        portfolio_id: int,
+        symbol: str,
+        add_units: float,
+        add_krw: float,
+    ) -> None:
+        """피라미딩 추가 매수 — 기존 포지션에 가중평균으로 합산"""
+        with self._session() as db:
+            pos = (
+                db.query(Position)
+                .filter(
+                    Position.portfolio_id == portfolio_id,
+                    Position.symbol == symbol,
+                    Position.is_open == True,
+                )
+                .first()
+            )
+            if not pos:
+                return
+            new_units = pos.units + add_units
+            new_buy_price = (pos.buy_price * pos.units + add_krw) / new_units
+            pos.units = new_units
+            pos.buy_price = new_buy_price
+            pos.buy_krw = pos.buy_krw + add_krw
+
+            pf = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
+            if pf:
+                pf.total_buy_krw = pf.total_buy_krw + add_krw
+
     # ------------------------------------------------------------------ #
     #  Position (포트폴리오 하위)                                            #
     # ------------------------------------------------------------------ #

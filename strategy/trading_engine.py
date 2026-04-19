@@ -70,6 +70,10 @@ class _PortfolioExitTracker:
     tier2_sold: bool = False    # -1.5% → 33% 추가 매도 완료
     # -2.0% → 잔여 전량 매도 (최종 손절)
 
+    # ── 피라미딩 추가 매수 ──
+    pyramid_done: bool = False          # 이미 실행했거나 포기 결정된 경우
+    pyramid_checked_at: float = 0.0     # 마지막 판단 시각 (time.time())
+
 
 class TradingEngine:
     """기동부터 종료까지 포트폴리오 매매 사이클을 관리"""
@@ -829,6 +833,9 @@ class TradingEngine:
             self._maybe_adjust_strategy(
                 portfolio, pnl_pct, coin_details, tracker, holding_minutes
             )
+            # 플러스 국면 피라미딩 검토 (분할 매도 미발생, 아직 실행 전)
+            if pnl_pct > 0 and not tracker.pyramid_done and not tracker.tier1_sold:
+                self._maybe_pyramid(portfolio, positions, pnl_pct, holding_minutes, tracker)
 
     def _handle_trailing_tp(
         self, portfolio: Portfolio, positions: list[Position],
@@ -1176,6 +1183,135 @@ class TradingEngine:
 
         except Exception as e:
             logger.error(f"[전략 조정 오류] {e}")
+
+    # ------------------------------------------------------------------ #
+    #  피라미딩 추가 매수                                                     #
+    # ------------------------------------------------------------------ #
+    _PYRAMID_CHECK_INTERVAL_SEC = 15 * 60   # 15분마다 판단 재요청
+
+    def _maybe_pyramid(
+        self,
+        portfolio: Portfolio,
+        positions: list[Position],
+        pnl_pct: float,
+        holding_minutes: float,
+        tracker: _PortfolioExitTracker,
+    ) -> None:
+        """플러스 국면 피라미딩 — 자산 운용가 판단 후 조건 충족 시 추가 매수"""
+        if not self._agent:
+            return
+
+        now = time.time()
+        # 첫 판단은 15분 보유 후, 이후 15분 주기
+        if holding_minutes < 15:
+            return
+        if now - tracker.pyramid_checked_at < self._PYRAMID_CHECK_INTERVAL_SEC:
+            return
+
+        tracker.pyramid_checked_at = now
+
+        try:
+            krw = self._client.get_krw_balance()
+        except Exception as e:
+            logger.warning(f"[피라미딩] KRW 조회 실패: {e}")
+            return
+
+        decision = self._agent.decide_pyramid({
+            "current_pnl_pct": pnl_pct,
+            "peak_pnl_pct": tracker.peak_pnl_pct,
+            "total_buy_krw": portfolio.total_buy_krw,
+            "take_profit_pct": portfolio.take_profit_pct,
+            "krw_available": krw,
+            "coin_count": len(positions),
+            "held_minutes": holding_minutes,
+        })
+
+        if not decision.should_pyramid:
+            logger.info(f"[피라미딩 보류] '{portfolio.name}': {decision.reason}")
+            tracker.pyramid_done = True
+            return
+
+        if pnl_pct < decision.threshold_pct:
+            logger.info(
+                f"[피라미딩 대기] '{portfolio.name}' 현재={pnl_pct:+.2f}% "
+                f"< 최소={decision.threshold_pct:.1f}% — 다음 주기 재확인"
+            )
+            # threshold 미달 시 done 처리하지 않고 다음 주기에 재확인
+            return
+
+        # ── 추가 매수 실행 ──
+        add_total_krw = portfolio.total_buy_krw * decision.add_ratio
+        if add_total_krw > krw * 0.95:
+            add_total_krw = krw * 0.95   # 가용 KRW 초과 방지
+        if add_total_krw < 5_000:
+            logger.warning(f"[피라미딩 스킵] 추가 투입 금액 부족 ({add_total_krw:,.0f}원)")
+            tracker.pyramid_done = True
+            return
+
+        per_coin_add = add_total_krw / len(positions)
+        bought = 0
+
+        logger.info(
+            f"[피라미딩 실행] '{portfolio.name}' {pnl_pct:+.2f}% "
+            f"추가투입={add_total_krw:,.0f}원 ({decision.add_ratio:.0%}) / {decision.reason}"
+        )
+
+        for pos in positions:
+            try:
+                result = self._client.market_buy(pos.symbol, per_coin_add)
+                if result.get("status") != "0000":
+                    logger.warning(f"[피라미딩 매수 실패] {pos.symbol}: {result}")
+                    continue
+
+                time.sleep(_BUY_INTERVAL_SEC)
+                add_units = self._client.get_coin_balance(pos.symbol) - pos.units
+                if add_units <= 0:
+                    for _ in range(3):
+                        time.sleep(1.0)
+                        cur_units = self._client.get_coin_balance(pos.symbol)
+                        add_units = cur_units - pos.units
+                        if add_units > 0:
+                            break
+
+                if add_units <= 0:
+                    logger.warning(f"[피라미딩 체결 미확인] {pos.symbol} — 스킵")
+                    continue
+
+                actual_add_price = per_coin_add / add_units
+
+                self._repo.save_trade(
+                    symbol=pos.symbol, side="buy",
+                    price=actual_add_price, units=add_units,
+                    krw_amount=per_coin_add,
+                    note=f"피라미딩 추가매수 ({pnl_pct:+.2f}%)",
+                    portfolio_id=portfolio.id,
+                )
+                self._repo.pyramid_position(
+                    portfolio_id=portfolio.id,
+                    symbol=pos.symbol,
+                    add_units=add_units,
+                    add_krw=per_coin_add,
+                )
+                bought += 1
+                logger.info(
+                    f"  [피라미딩] {pos.symbol} +{add_units:.6g}개 "
+                    f"@ {actual_add_price:,.0f}원"
+                )
+            except Exception as e:
+                logger.error(f"[피라미딩 매수 오류] {pos.symbol}: {e}")
+
+        tracker.pyramid_done = True
+
+        if bought > 0 and self._notifier:
+            try:
+                self._notifier.send(
+                    f"📈 <b>피라미딩 추가 매수</b> '{portfolio.name}'\n"
+                    f"현재 수익: {pnl_pct:+.2f}% | 추가 투입: {add_total_krw:,.0f}원\n"
+                    f"코인 {bought}개 추가 매수 완료\n"
+                    f"사유: {decision.reason}"
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     #  Post-Trade Evaluation                                               #
