@@ -100,6 +100,7 @@ class TradingEngine:
         self._exit_tracker: _PortfolioExitTracker | None = None
         self._last_adjust_time: float = 0.0
         self._last_adjustment: dict | None = None
+        self._last_reconcile_time: float = 0.0
         self.daily_start_krw: float = 0.0
 
     # ------------------------------------------------------------------ #
@@ -576,30 +577,56 @@ class TradingEngine:
             llm_provider=decision.llm_provider,
         )
 
+        # ── 매수 전 전체 잔고 스냅샷 (before-after 차이로 실제 매수 수량 계산) ──
+        try:
+            balance_before = self._client.get_balance("ALL").get("data", {})
+        except Exception as e:
+            logger.warning(f"[매수 전 잔고 조회 실패] fallback 사용: {e}")
+            balance_before = {}
+
         # ── 8개 코인 순차 매수 ──
         bought_count = 0
         for coin in decision.coins:
             try:
+                before_units = float(
+                    balance_before.get(f"available_{coin.symbol.lower()}", 0)
+                )
+                if before_units > 0:
+                    logger.warning(
+                        f"[기존 잔고 감지] {coin.symbol}: {before_units:.6f}개 보유 중 — 차이로 수량 계산"
+                    )
+
                 result = self._client.market_buy(coin.symbol, per_coin_amount)
                 if result.get("status") != "0000":
                     logger.warning(f"[매수 실패] {coin.symbol}: {result}")
                     continue
 
                 time.sleep(_BUY_INTERVAL_SEC)
-                units = self._client.get_coin_balance(coin.symbol)
+                after_units = self._client.get_coin_balance(coin.symbol)
                 # 업비트 비동기 체결: 0이면 최대 3회 재시도 (체결 대기)
-                if units <= 0:
+                if after_units <= 0:
                     for _retry in range(3):
                         time.sleep(1.0)
-                        units = self._client.get_coin_balance(coin.symbol)
-                        if units > 0:
+                        after_units = self._client.get_coin_balance(coin.symbol)
+                        if after_units > 0:
                             break
-                    if units <= 0:
+                    if after_units <= 0:
                         logger.warning(
                             f"[매수 체결 미확인] {coin.symbol} — units=0, 스킵"
                         )
                         continue
-                # 실제 평균 체결가 = 투입금액 / 수령 수량 (current_price보다 정확)
+
+                # 기존 보유분 차감으로 실제 매수된 수량만 추출
+                units = after_units - before_units
+                if units <= 0:
+                    # fallback: 차감 결과가 0 이하면 after_units 전체 사용
+                    logger.warning(
+                        f"[수량 보정] {coin.symbol}: before={before_units:.6f} after={after_units:.6f} "
+                        f"→ 차이 계산 실패, after_units 사용"
+                    )
+                    units = after_units
+
+                # 실제 평균 체결가 = 투입금액 / 실제 매수 수량
                 actual_buy_price = per_coin_amount / units
 
                 self._repo.save_trade(
@@ -724,6 +751,9 @@ class TradingEngine:
             self._repo.close_portfolio(portfolio.id)
             self._exit_tracker = None
             return
+
+        # 거래소 실잔고와 DB 수량 주기적 대조·보정 (수익률 오차 방지)
+        self._maybe_reconcile_positions(positions)
 
         pnl_pct, pnl_krw, coin_details = self._calc_portfolio_pnl(portfolio, positions)
         tracker = self._exit_tracker or _PortfolioExitTracker()
@@ -1185,6 +1215,46 @@ class TradingEngine:
 
         except Exception as e:
             logger.error(f"[전략 조정 오류] {e}")
+
+    # ------------------------------------------------------------------ #
+    #  포지션 수량 reconciliation (거래소 실잔고 ↔ DB 보정)                    #
+    # ------------------------------------------------------------------ #
+    _RECONCILE_INTERVAL_SEC = 5 * 60        # 5분마다 실잔고 대조
+
+    def _maybe_reconcile_positions(self, positions: list[Position]) -> None:
+        """거래소 실잔고와 DB 포지션 수량을 주기적으로 대조하고 오차 보정.
+
+        분할 매도 슬리피지·수수료 등으로 pos.units가 실제 잔고와 달라지면
+        pnl_pct 계산이 틀어지므로 5분마다 보정합니다.
+        """
+        now = time.time()
+        if now - self._last_reconcile_time < self._RECONCILE_INTERVAL_SEC:
+            return
+        self._last_reconcile_time = now
+
+        try:
+            balance_data = self._client.get_balance("ALL").get("data", {})
+        except Exception as e:
+            logger.debug(f"[수량 보정] 잔고 조회 실패: {e}")
+            return
+
+        for pos in positions:
+            try:
+                actual = float(
+                    balance_data.get(f"available_{pos.symbol.lower()}", 0)
+                )
+                if actual <= 0 or pos.units <= 0:
+                    continue
+                diff_ratio = abs(actual - pos.units) / pos.units
+                if diff_ratio > 0.005:  # 0.5% 이상 차이
+                    logger.warning(
+                        f"[수량 보정] {pos.symbol}: DB={pos.units:.6f} → 실잔고={actual:.6f} "
+                        f"(차이 {diff_ratio*100:.2f}%)"
+                    )
+                    self._repo.update_position_units(pos.id, actual)
+                    pos.units = actual
+            except Exception as e:
+                logger.debug(f"[수량 보정 오류] {pos.symbol}: {e}")
 
     # ------------------------------------------------------------------ #
     #  피라미딩 추가 매수                                                     #

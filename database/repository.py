@@ -197,6 +197,13 @@ class TradeRepository:
             db.expunge_all()
             return rows
 
+    def update_position_units(self, position_id: int, units: float) -> None:
+        """거래소 실잔고 기반 포지션 수량 보정"""
+        with self._session() as db:
+            pos = db.query(Position).filter(Position.id == position_id).first()
+            if pos:
+                pos.units = units
+
     def update_position_after_partial_sell(
         self, position_id: int, remaining_units: float, remaining_buy_krw: float,
     ) -> None:
