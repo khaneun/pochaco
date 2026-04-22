@@ -410,6 +410,32 @@ class AgentCoordinator:
     # ------------------------------------------------------------------ #
     #  전략 동적 조정 (포트폴리오 레벨)                                       #
     # ------------------------------------------------------------------ #
+    def evaluate_tier1_sell(
+        self,
+        portfolio_name: str,
+        pnl_pct: float,
+        coin_details: list[dict],
+        holding_minutes: int,
+    ) -> dict:
+        """Tier1(-1.0%) 진입 시 AI 기민 평가 → 즉각 매도 비율 결정
+
+        Returns:
+            {"sell_ratio": float(0.33~0.67), "reason": str}
+        """
+        result = self._agents["sell_strategist"].evaluate_tier1_action({
+            "portfolio_name": portfolio_name,
+            "pnl_pct": pnl_pct,
+            "coin_details": coin_details,
+            "holding_minutes": holding_minutes,
+        })
+        ev = result.get("tier1_result", {"sell_ratio": 0.5, "reason": "기본값"})
+        self._log_decision(
+            "sell_strategist", "tier1_eval",
+            f"{portfolio_name} PnL={pnl_pct:+.2f}% {holding_minutes}분",
+            f"매도비율={ev.get('sell_ratio', 0.5):.0%} | {ev.get('reason', '')}",
+        )
+        return ev
+
     def should_adjust_strategy(
         self,
         portfolio_name: str,
@@ -419,7 +445,6 @@ class AgentCoordinator:
         original_sl: float,
         coin_details: list[dict],
         tier1_sold: bool = False,
-        tier2_sold: bool = False,
     ) -> dict:
         """매도 전문가에게 포트폴리오 TP/SL 조정 질의"""
         result = self._agents["sell_strategist"].execute({
@@ -430,7 +455,6 @@ class AgentCoordinator:
             "original_sl": original_sl,
             "coin_details": coin_details,
             "tier1_sold": tier1_sold,
-            "tier2_sold": tier2_sold,
         })
         adjust_result = result.get("adjust_result", {
             "adjust": False,
@@ -499,6 +523,7 @@ class AgentCoordinator:
 
         # 특성 분석가 — 포트폴리오 내 코인들 프로파일 업데이트
         if self._coin_analyst:
+            updated_symbols = []
             for cr in coin_results:
                 try:
                     self._coin_analyst.execute({
@@ -515,8 +540,18 @@ class AgentCoordinator:
                         "lesson": evaluation.lesson,
                         "trade_time": datetime.now(tz=_KST).strftime("%Y-%m-%d %H:%M"),
                     })
+                    updated_symbols.append(
+                        f"{cr.get('symbol','')}({cr.get('pnl_pct',0):+.1f}%)"
+                    )
                 except Exception as e:
                     logger.warning(f"[특성 분석가] {cr.get('symbol', '')} 업데이트 오류: {e}")
+            if updated_symbols:
+                self._log_decision(
+                    "coin_profile_analyst", "profile_update",
+                    input_summary=f"포트폴리오 {portfolio_id} 청산 ({exit_type})",
+                    output_summary=", ".join(updated_symbols),
+                    portfolio_id=portfolio_id,
+                )
 
         return evaluation
 

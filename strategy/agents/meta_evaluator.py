@@ -18,6 +18,7 @@ AGENT_ROLES = [
     "buy_strategist",
     "sell_strategist",
     "portfolio_evaluator",
+    "coin_profile_analyst",
 ]
 
 
