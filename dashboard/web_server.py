@@ -54,17 +54,17 @@ def _to_kst(dt: datetime) -> datetime:
 
 
 def _pct_disp(val: float) -> tuple[str, str]:
-    """수익률 (표시 텍스트, CSS 색상 클래스) — 0이면 부호 없이 gray"""
+    """수익률 (표시 텍스트, CSS 색상 클래스) — 색으로 구분하므로 부호 없음"""
     if val == 0.0:
         return "0.00%", "gray"
-    return f"{val:+.2f}%", "green" if val > 0 else "red"
+    return f"{abs(val):.2f}%", "green" if val > 0 else "red"
 
 
 def _krw_disp(val: float, suffix: str = "원") -> tuple[str, str]:
-    """손익금액 (표시 텍스트, CSS 색상 클래스) — 0이면 부호 없이 gray"""
+    """손익금액 (표시 텍스트, CSS 색상 클래스) — 색으로 구분하므로 부호 없음"""
     if val == 0.0:
         return f"0{suffix}", "gray"
-    return f"{val:+,.0f}{suffix}", "green" if val > 0 else "red"
+    return f"{abs(val):,.0f}{suffix}", "green" if val > 0 else "red"
 
 
 def _kst_now() -> datetime:
@@ -643,7 +643,7 @@ document.addEventListener('DOMContentLoaded', function() {{
     <br>
     <div class="stat-row">
       <span class="stat-label">누적 수익률</span>
-      <span class="stat-value {total_pnl_color}">{total_pnl_pct:+.2f}%</span>
+      <span class="stat-value {total_pnl_color}">{total_pnl_pct_txt}</span>
     </div>
     <div class="stat-row">
       <span class="stat-label">승률</span>
@@ -735,7 +735,9 @@ def _render_html(data: dict) -> str:
             return f"{v / 10_000:.1f}만 원"
         return f"{v:,.0f} 원"
 
-    total_pnl_color = "green" if perf["total_pnl_pct"] >= 0 else "red"
+    _tp = perf["total_pnl_pct"]
+    total_pnl_color = "green" if _tp > 0 else ("red" if _tp < 0 else "gray")
+    total_pnl_pct_txt = "0.00%" if _tp == 0 else f"{abs(_tp):.2f}%"
 
     # 포트폴리오 평가액 줄
     pos_asset_line = ""
@@ -803,7 +805,7 @@ def _render_html(data: dict) -> str:
                 f' transform:translateX(-50%); color:#fb923c; font-size:10px; line-height:1;">▼</div>'
                 f'<div style="position:absolute; left:{peak_pos:.1f}%; top:14px;'
                 f' transform:translateX(-50%); color:#fb923c; font-size:0.65rem; white-space:nowrap;">'
-                f'{peak_pnl_pct:+.1f}%</div>'
+                f'{abs(peak_pnl_pct):.1f}%</div>'
             )
         trough_marker_html = ""
         if trough_pos is not None and trough_pnl_pct < pnl_pct - 0.05:
@@ -816,11 +818,11 @@ def _render_html(data: dict) -> str:
         # 헤더 레이블 (고점/저점 모두 표기)
         header_extra = ""
         if peak_pos is not None and peak_pnl_pct > pnl_pct + 0.05:
-            header_extra += f'<span style="color:#fb923c;">▼ 고점 {peak_pnl_pct:+.1f}%</span>'
+            header_extra += f'<span style="color:#fb923c;">▼ 고점 {abs(peak_pnl_pct):.1f}%</span>'
         if trough_pos is not None and trough_pnl_pct < pnl_pct - 0.05:
             if header_extra:
                 header_extra += '&nbsp; '
-            header_extra += f'<span style="color:#38bdf8;">▲ 저점 {trough_pnl_pct:+.1f}%</span>'
+            header_extra += f'<span style="color:#38bdf8;">▲ 저점 {abs(trough_pnl_pct):.1f}%</span>'
 
         # 손절/익절 라벨 위치
         gauge_html = f"""
@@ -859,8 +861,8 @@ def _render_html(data: dict) -> str:
         <!-- 현재/고점/저점 수치 -->
         <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px; text-align:center;">
           현재 <span class="{pnl_color}" style="font-weight:600;">{_pct_txt}</span>
-          {"&nbsp;|&nbsp; 고점 <span style='color:#fb923c; font-weight:600;'>" + f"{peak_pnl_pct:+.2f}%" + "</span>" if peak_pnl_pct > 0.05 else ""}
-          {"&nbsp;|&nbsp; 저점 <span style='color:#38bdf8; font-weight:600;'>" + f"{trough_pnl_pct:+.2f}%" + "</span>" if trough_pnl_pct < -0.05 else ""}
+          {"&nbsp;|&nbsp; 고점 <span style='color:#fb923c; font-weight:600;'>" + f"{abs(peak_pnl_pct):.2f}%" + "</span>" if peak_pnl_pct > 0.05 else ""}
+          {"&nbsp;|&nbsp; 저점 <span style='color:#38bdf8; font-weight:600;'>" + f"{abs(trough_pnl_pct):.2f}%" + "</span>" if trough_pnl_pct < -0.05 else ""}
         </div>"""
 
         # 개별 코인 테이블
@@ -1181,8 +1183,7 @@ function showPfTx(idx) {
   var d = _pfTxPopup[idx];
   if (!d) return;
   var pnlColor = d.pnl_pct > 0 ? '#f87171' : (d.pnl_pct < 0 ? '#60a5fa' : '#94a3b8');
-  var pnlPctStr = d.pnl_pct === 0 ? '0.00%' : ((d.pnl_pct > 0 ? '+' : '') + d.pnl_pct.toFixed(2) + '%');
-  var sign = d.pnl_pct > 0 ? '+' : '';
+  var pnlPctStr = d.pnl_pct === 0 ? '0.00%' : (Math.abs(d.pnl_pct).toFixed(2) + '%');
   var statusBadge = d.is_open
     ? '<span style="background:#1d4ed8;color:#bfdbfe;padding:2px 8px;border-radius:4px;font-size:0.78rem;">보유 중</span>'
     : (d.exit_type === 'take_profit'
@@ -1200,7 +1201,7 @@ function showPfTx(idx) {
   var sellFmt = d.total_sell_krw ? d.total_sell_krw.toLocaleString('ko-KR') + '원' : '—';
   var pnlKrwFmt = (d.pnl_krw == null) ? '—'
     : (d.pnl_krw === 0 ? '0원'
-    : ((d.pnl_krw > 0 ? '+' : '') + d.pnl_krw.toLocaleString('ko-KR') + '원'));
+    : (Math.abs(d.pnl_krw).toLocaleString('ko-KR') + '원'));
   var tpSlStr = (d.take_profit_pct ? '<span style="color:#f87171">+' + d.take_profit_pct + '%</span>' : '—')
     + ' / ' + (d.stop_loss_pct ? '<span style="color:#60a5fa">' + d.stop_loss_pct + '%</span>' : '—');
 
@@ -1240,17 +1241,17 @@ function showPfTx(idx) {
       var troughPos = troughPnl < 0 ? gaugePos(troughPnl) : null;
       var peakMarker = (peakPos !== null && peakPnl > d.pnl_pct + 0.05)
         ? '<div style="position:absolute;left:' + peakPos.toFixed(1) + '%;top:-4px;transform:translateX(-50%);color:#fb923c;font-size:10px;line-height:1;">▼</div>'
-          + '<div style="position:absolute;left:' + peakPos.toFixed(1) + '%;top:14px;transform:translateX(-50%);color:#fb923c;font-size:0.6rem;white-space:nowrap;">' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(1) + '%</div>'
+          + '<div style="position:absolute;left:' + peakPos.toFixed(1) + '%;top:14px;transform:translateX(-50%);color:#fb923c;font-size:0.6rem;white-space:nowrap;">' + Math.abs(peakPnl).toFixed(1) + '%</div>'
         : '';
       var troughMarker = (troughPos !== null && troughPnl < d.pnl_pct - 0.05)
         ? '<div style="position:absolute;left:' + troughPos.toFixed(1) + '%;top:18px;transform:translateX(-50%);color:#38bdf8;font-size:10px;line-height:1;">▲</div>'
         : '';
       var hdrExtra = '';
-      if (peakPos !== null && peakPnl > d.pnl_pct + 0.05) hdrExtra += '<span style="color:#fb923c;">▼ 고점 ' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(1) + '%</span> ';
-      if (troughPos !== null && troughPnl < d.pnl_pct - 0.05) hdrExtra += '<span style="color:#38bdf8;">▲ 저점 ' + troughPnl.toFixed(1) + '%</span>';
+      if (peakPos !== null && peakPnl > d.pnl_pct + 0.05) hdrExtra += '<span style="color:#fb923c;">▼ 고점 ' + Math.abs(peakPnl).toFixed(1) + '%</span> ';
+      if (troughPos !== null && troughPnl < d.pnl_pct - 0.05) hdrExtra += '<span style="color:#38bdf8;">▲ 저점 ' + Math.abs(troughPnl).toFixed(1) + '%</span>';
       var bottomRow = '현재 <b style="color:' + curColor + ';">' + pnlPctStr + '</b>';
-      if (peakPos !== null && peakPnl > 0.05) bottomRow += ' &nbsp;|&nbsp; 고점 <b style="color:#fb923c;">' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(2) + '%</b>';
-      if (troughPos !== null && troughPnl < -0.05) bottomRow += ' &nbsp;|&nbsp; 저점 <b style="color:#38bdf8;">' + troughPnl.toFixed(2) + '%</b>';
+      if (peakPos !== null && peakPnl > 0.05) bottomRow += ' &nbsp;|&nbsp; 고점 <b style="color:#fb923c;">' + Math.abs(peakPnl).toFixed(2) + '%</b>';
+      if (troughPos !== null && troughPnl < -0.05) bottomRow += ' &nbsp;|&nbsp; 저점 <b style="color:#38bdf8;">' + Math.abs(troughPnl).toFixed(2) + '%</b>';
       html += '<div style="margin-top:10px;font-size:0.78rem;color:#94a3b8;margin-bottom:4px;">손절/익절 게이지 <span style="float:right;font-size:0.7rem;">' + hdrExtra + '</span></div>'
         + '<div style="position:relative;height:34px;margin-bottom:4px;">'
         + '<div style="position:absolute;top:8px;left:0;right:0;height:10px;background:#0f172a;border-radius:5px;overflow:hidden;">'
@@ -1285,8 +1286,8 @@ function showPfTx(idx) {
         var cp = c.pnl_pct || 0, ck = c.pnl_krw || 0;
         var cc = cp > 0 ? '#f87171' : (cp < 0 ? '#60a5fa' : '#94a3b8');
         var ck_c = ck > 0 ? '#f87171' : (ck < 0 ? '#60a5fa' : '#94a3b8');
-        var cPctStr = cp === 0 ? '0.00%' : ((cp > 0 ? '+' : '') + cp.toFixed(2) + '%');
-        var cKrwStr = ck === 0 ? '0' : ((ck > 0 ? '+' : '') + ck.toLocaleString('ko-KR'));
+        var cPctStr = cp === 0 ? '0.00%' : (Math.abs(cp).toFixed(2) + '%');
+        var cKrwStr = ck === 0 ? '0' : Math.abs(ck).toLocaleString('ko-KR');
         html += '<tr><td><b>' + c.symbol + '</b></td>'
           + '<td style="text-align:right">' + (c.buy_price || 0).toLocaleString('ko-KR') + '</td>'
           + '<td style="text-align:right">' + (c.current_price || 0).toLocaleString('ko-KR') + '</td>'
@@ -1307,11 +1308,12 @@ function showPfTx(idx) {
         var sellP = cr.sell_price || 0;
         // 단가 기준 수익률 재계산 (sell_price=0이면 pnl_pct 원본 사용)
         var coinPnl = (buyP > 0 && sellP > 0) ? (sellP - buyP) / buyP * 100 : (cr.pnl_pct || 0);
-        var crc = coinPnl >= 0 ? '#f87171' : '#60a5fa';
+        var crc = coinPnl > 0 ? '#f87171' : (coinPnl < 0 ? '#60a5fa' : '#94a3b8');
+        var coinPnlStr = coinPnl === 0 ? '0.00%' : (Math.abs(coinPnl).toFixed(2) + '%');
         html += '<tr><td><b>' + cr.symbol + '</b></td>'
           + '<td style="text-align:right">' + buyP.toLocaleString('ko-KR') + '</td>'
           + '<td style="text-align:right">' + (sellP > 0 ? sellP.toLocaleString('ko-KR') : '—') + '</td>'
-          + '<td style="text-align:right;color:' + crc + '">' + (coinPnl >= 0 ? '+' : '') + coinPnl.toFixed(2) + '%</td>'
+          + '<td style="text-align:right;color:' + crc + '">' + coinPnlStr + '</td>'
           + '</tr>';
       }
       html += '</table>';
