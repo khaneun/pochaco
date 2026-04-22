@@ -1309,13 +1309,14 @@ class TradingEngine:
 
                 units_diff = abs(actual_units - pos.units) / pos.units
 
-                # 수량만 보정 — buy_price는 건드리지 않음
-                # 업비트 avg_buy_price는 계좌 전체 역사적 가중평균이라 현재 포트폴리오 단가와 달라
-                # buy_price를 덮어쓰면 P&L이 왜곡됨 (AXL 142% 버그 원인)
-                if units_diff > 0.005:
+                # 수량 감소 방향만 보정 — buy_price 및 수량 증가는 건드리지 않음
+                # - 감소: 부분 매도 후 잔여 수량 반영 → 보정 필요
+                # - 증가: 계좌에 dust 코인(이전 포지션 잔여)이 섞인 것 → 보정 금지
+                #   (증가 보정 시 (units*price - buy_krw)/buy_krw 계산이 왜곡됨)
+                if actual_units < pos.units and units_diff > 0.005:
                     logger.warning(
                         f"[포지션 수량 보정] {pos.symbol}: "
-                        f"{pos.units:.6f}→{actual_units:.6f} ({units_diff*100:.2f}%)"
+                        f"{pos.units:.6f}→{actual_units:.6f} ({units_diff*100:.2f}%, 부분매도 반영)"
                     )
                     self._repo.update_position_units(pos.id, actual_units)
                     pos.units = actual_units
