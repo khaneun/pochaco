@@ -1352,6 +1352,7 @@ document.addEventListener('DOMContentLoaded', function() {
         holdings_html=holdings_html,
         total_pnl_color=total_pnl_color,
         total_pnl_pct=perf["total_pnl_pct"],
+        total_pnl_pct_txt=total_pnl_pct_txt,
         win_rate=perf["win_rate"],
         win_count=perf["win_count"],
         loss_count=perf["loss_count"],
