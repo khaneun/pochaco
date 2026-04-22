@@ -151,10 +151,12 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
             for pos in positions:
                 try:
                     cur = client.get_current_price(pos.symbol)
-                    # 잔고 조회 성공 시 API 실제 수량 우선 사용 (DB-API 불일치 방지)
-                    # 잔고 조회 실패 시에만 DB pos.units fallback
+                    # 잔고 조회 성공 시 API 실제 수량 사용 (DB-API 불일치 방지)
+                    # 단, 거래소 잔고가 DB보다 많으면 dust 코인 혼입으로 간주 → DB 수량으로 제한
+                    # (dust 혼입 시 coin_value 과대산정 → P&L 왜곡)
                     if balance_fetched:
-                        actual_units = actual_coin_units.get(pos.symbol, 0.0)
+                        raw_units = actual_coin_units.get(pos.symbol, 0.0)
+                        actual_units = min(raw_units, pos.units) if raw_units > 0 else pos.units
                     else:
                         actual_units = pos.units
                     coin_value = actual_units * cur
@@ -222,6 +224,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                 "coins": coins_data,
                 "opened_at": _to_kst(pf.opened_at).strftime("%m-%d %H:%M"),
                 "peak_pnl_pct": round(pf.peak_pnl_pct or 0.0, 2),
+                "trough_pnl_pct": round(pf.trough_pnl_pct or 0.0, 2),
                 "pyramid": _get_pyramid_info(repo, pf.id),
             }
 
@@ -577,7 +580,6 @@ function _scheduleAutoRefresh(intervalMs) {{
 }}
 
 document.addEventListener('DOMContentLoaded', function() {{
-  initPager('eval-table', 'eval-pager', 5, 1);
   initCardPager('trade-list', 'trade-pager', 10);
   _scheduleAutoRefresh(30000);
 }});
@@ -635,23 +637,10 @@ document.addEventListener('DOMContentLoaded', function() {{
   <!-- 현재 포지션 -->
   <div class="card">
     <h2>📦 현재 포지션</h2>
+    {pyramid_html}
     {position_html}
   </div>
 
-</div>
-
-<!-- AI 성과 평가 & 전략 조정 -->
-<div style="padding: 0 20px 16px;">
-  <div class="card">
-    <h2>📊 AI 성과 평가 & 전략 조정</h2>
-    {eval_summary_html}
-    {evals_html}
-    <div class="pager" id="eval-pager">
-      <button class="pg-prev">&laquo; 이전</button>
-      <span class="pg-info">1 / 1</span>
-      <button class="pg-next">다음 &raquo;</button>
-    </div>
-  </div>
 </div>
 
 {manual_trades_section}
@@ -680,9 +669,8 @@ document.addEventListener('DOMContentLoaded', function() {{
   </div>
 </div>
 
-<script>var _evalPopup = {eval_js_data}; var _pfTxPopup = {portfolio_tx_js_data};</script>
+<script>var _pfTxPopup = {portfolio_tx_js_data};</script>
 {portfolio_tx_modal}
-{eval_detail_modal}
 <footer>pochaco — AI 자동매매 시스템 &nbsp;|&nbsp; 데이터는 30초마다 갱신됩니다</footer>
 </body>
 </html>"""
@@ -760,6 +748,7 @@ def _render_html(data: dict) -> str:
         held = pf["held_minutes"]
         held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
         peak_pnl_pct = pf.get("peak_pnl_pct", 0.0)
+        trough_pnl_pct = pf.get("trough_pnl_pct", 0.0)
 
         # ── 양방향 게이지 계산 ──
         # 전체 범위: SL% ~ 0 ~ TP% (비율로 환산)
@@ -776,12 +765,13 @@ def _render_html(data: dict) -> str:
 
         cur_pos = _gauge_pos(pnl_pct)
         peak_pos = _gauge_pos(peak_pnl_pct) if peak_pnl_pct > 0 else None
+        trough_pos = _gauge_pos(trough_pnl_pct) if trough_pnl_pct < 0 else None
 
         # 현재 위치 색: 손실=파랑, 이익=빨강
         cur_color = "#f87171" if pnl_pct >= 0 else "#60a5fa"
         peak_marker_html = ""
         if peak_pos is not None and peak_pnl_pct > pnl_pct + 0.05:
-            # 고점 마커 (연한 주황 삼각형)
+            # 고점 마커 (주황 삼각형, 위에서 내려옴)
             peak_marker_html = (
                 f'<div style="position:absolute; left:{peak_pos:.1f}%; top:-4px;'
                 f' transform:translateX(-50%); color:#fb923c; font-size:10px; line-height:1;">▼</div>'
@@ -789,16 +779,30 @@ def _render_html(data: dict) -> str:
                 f' transform:translateX(-50%); color:#fb923c; font-size:0.65rem; white-space:nowrap;">'
                 f'{peak_pnl_pct:+.1f}%</div>'
             )
+        trough_marker_html = ""
+        if trough_pos is not None and trough_pnl_pct < pnl_pct - 0.05:
+            # 저점 마커 (파랑 삼각형, 아래에서 올라옴)
+            trough_marker_html = (
+                f'<div style="position:absolute; left:{trough_pos:.1f}%; top:18px;'
+                f' transform:translateX(-50%); color:#38bdf8; font-size:10px; line-height:1;">▲</div>'
+            )
+
+        # 헤더 레이블 (고점/저점 모두 표기)
+        header_extra = ""
+        if peak_pos is not None and peak_pnl_pct > pnl_pct + 0.05:
+            header_extra += f'<span style="color:#fb923c;">▼ 고점 {peak_pnl_pct:+.1f}%</span>'
+        if trough_pos is not None and trough_pnl_pct < pnl_pct - 0.05:
+            if header_extra:
+                header_extra += '&nbsp; '
+            header_extra += f'<span style="color:#38bdf8;">▲ 저점 {trough_pnl_pct:+.1f}%</span>'
 
         # 손절/익절 라벨 위치
         gauge_html = f"""
         <div style="margin-top:14px; font-size:0.78rem; color:#94a3b8; margin-bottom:6px;">
           손절/익절 게이지
-          <span style="float:right; color:#fb923c; font-size:0.72rem;">
-            {"▼ 고점 " + f"{peak_pnl_pct:+.1f}%" if peak_pos is not None and peak_pnl_pct > pnl_pct + 0.05 else ""}
-          </span>
+          <span style="float:right; font-size:0.72rem;">{header_extra}</span>
         </div>
-        <div style="position:relative; height:28px; margin-bottom:4px;">
+        <div style="position:relative; height:34px; margin-bottom:4px;">
           <!-- 트랙 배경 -->
           <div style="position:absolute; top:8px; left:0; right:0; height:10px;
                background:#0f172a; border-radius:5px; overflow:hidden;">
@@ -818,6 +822,7 @@ def _render_html(data: dict) -> str:
           <div style="position:absolute; left:{cur_pos:.1f}%; top:4px; width:3px; height:18px;
                background:{cur_color}; transform:translateX(-50%); border-radius:2px;"></div>
           {peak_marker_html}
+          {trough_marker_html}
         </div>
         <!-- 레이블 행: 손절(좌) / 0%(중심선 위치) / 익절(우) -->
         <div style="position:relative; font-size:0.7rem; color:#64748b; height:14px;">
@@ -825,10 +830,11 @@ def _render_html(data: dict) -> str:
           <span style="position:absolute; left:{zero_pos:.1f}%; transform:translateX(-50%); color:#475569;">0%</span>
           <span class="green" style="position:absolute; right:0;">TP +{tp:.1f}%</span>
         </div>
-        <!-- 현재/고점 수치 -->
+        <!-- 현재/고점/저점 수치 -->
         <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px; text-align:center;">
           현재 <span class="{pnl_color}" style="font-weight:600;">{pnl_pct:+.2f}%</span>
           {"&nbsp;|&nbsp; 고점 <span style='color:#fb923c; font-weight:600;'>" + f"{peak_pnl_pct:+.2f}%" + "</span>" if peak_pnl_pct > 0.05 else ""}
+          {"&nbsp;|&nbsp; 저점 <span style='color:#38bdf8; font-weight:600;'>" + f"{trough_pnl_pct:+.2f}%" + "</span>" if trough_pnl_pct < -0.05 else ""}
         </div>"""
 
         # 개별 코인 테이블
@@ -934,6 +940,8 @@ def _render_html(data: dict) -> str:
             "exit_type": "open",
             "take_profit_pct": pf["take_profit_pct"],
             "stop_loss_pct": pf["stop_loss_pct"],
+            "peak_pnl_pct": pf.get("peak_pnl_pct", 0.0),
+            "trough_pnl_pct": pf.get("trough_pnl_pct", 0.0),
             "coins": pf.get("coins", []),
             "evaluation": "",
             "lesson": "",
@@ -946,8 +954,16 @@ def _render_html(data: dict) -> str:
             exit_kr, exit_class = "익절", "badge-green"
         elif ev["exit_type"] == "manual":
             exit_kr, exit_class = "수동", "badge-manual"
+        elif ev["exit_type"] == "timeout":
+            exit_kr, exit_class = "타임아웃", "badge-red"
         else:
             exit_kr, exit_class = "손절", "badge-red"
+        is_manual_trade = ev["exit_type"] == "manual"
+        trade_mode_badge = (
+            "<span style='font-size:0.68rem;color:#fb923c;margin-right:4px;'>👤</span>"
+            if is_manual_trade else
+            "<span style='font-size:0.68rem;color:#38bdf8;margin-right:4px;'>🤖</span>"
+        )
         coin_count = ev.get("coin_count", "?")
         pnl_krw = ev.get("pnl_krw") or 0
         pnl_color = "green" if pnl_krw > 0 else ("red" if pnl_krw < 0 else "gray")
@@ -959,7 +975,7 @@ def _render_html(data: dict) -> str:
         pf_tx_cards += (
             f"<div class='pf-tx-row' onclick='showPfTx({idx})'>"
             f"<div class='pf-tx-dt'><b>{_dt_date}</b><small>{_dt_time}</small></div>"
-            f"<div class='pf-tx-nm'><b>[{coin_count}] {ev['portfolio_name']}</b></div>"
+            f"<div class='pf-tx-nm'>{trade_mode_badge}<b>[{coin_count}] {ev['portfolio_name']}</b></div>"
             f"<span class='pf-tx-held'>⏱ {held_str_closed}</span>"
             f"<div class='pf-tx-pnl'>"
             f"<div class='pf-tx-pnl-r {pnl_color}'>{ev['pnl_pct']:+.2f}%</div>"
@@ -981,6 +997,8 @@ def _render_html(data: dict) -> str:
             "exit_type": ev["exit_type"],
             "take_profit_pct": ev.get("original_tp", ""),
             "stop_loss_pct": ev.get("original_sl", ""),
+            "peak_pnl_pct": 0.0,
+            "trough_pnl_pct": 0.0,
             "coins": ev.get("coins", []),
             "evaluation": ev.get("evaluation", ""),
             "lesson": ev.get("lesson", ""),
@@ -993,11 +1011,8 @@ def _render_html(data: dict) -> str:
 
     portfolio_tx_js_data = json.dumps(pf_tx_popup_list, ensure_ascii=False)
 
-    # 성과 평가 HTML
-    eval_stats = data.get("eval_stats", {})
-    pyramid = pf.get("pyramid") if pf else None
-
     # 피라미딩 배너 (현재 포트폴리오에 추가 매수 이력이 있을 때)
+    pyramid = pf.get("pyramid") if pf else None
     if pyramid:
         pyramid_html = (
             f'<div style="background:#1c1f2e; border-left:3px solid #fb923c; '
@@ -1012,74 +1027,6 @@ def _render_html(data: dict) -> str:
         )
     else:
         pyramid_html = ""
-
-    if eval_stats:
-        eval_summary_html = (
-            pyramid_html +
-            f'<div style="background:#0f172a; padding:12px 16px; border-radius:8px; '
-            f'margin-bottom:12px; font-size:0.85rem;">'
-            f'<span style="color:#facc15;">📈 최근 {eval_stats["count"]}건</span> &nbsp;|&nbsp; '
-            f'승률 <b>{eval_stats["win_rate"]:.0%}</b> &nbsp;|&nbsp; '
-            f'평균 수익 <span class="{"green" if eval_stats["avg_pnl_pct"] >= 0 else "red"}">'
-            f'{eval_stats["avg_pnl_pct"]:+.2f}%</span> &nbsp;|&nbsp; '
-            f'AI 제안 평균: 익절 <span class="green">+{eval_stats["avg_suggested_tp"]:.1f}%</span> '
-            f'손절 <span class="red">{eval_stats["avg_suggested_sl"]:.1f}%</span>'
-            f'</div>'
-        )
-    else:
-        eval_summary_html = pyramid_html
-
-    evals_list = data.get("evaluations", [])
-    eval_popup_list: list[dict] = []
-    if evals_list:
-        erows = ""
-        for idx, ev in enumerate(evals_list):
-            pnl_color = "green" if ev["pnl_pct"] >= 0 else "red"
-            t_parts = ev["time"].split(" ")
-            t_date = t_parts[0] if len(t_parts) > 0 else ev["time"]
-            t_hms  = t_parts[1] if len(t_parts) > 1 else ""
-            pnl_krw_str = f'{ev["pnl_krw"]:+,.0f}원' if ev.get("pnl_krw") is not None else "—"
-            ev_label = ev.get("portfolio_name") or ev.get("symbol", "")
-            erows += (
-                f"<tr>"
-                f"<td><span class='time-date'>{t_date}</span>"
-                f"<span class='time-hms'>{t_hms}</span></td>"
-                f"<td><b>{ev_label}</b></td>"
-                f'<td class="{pnl_color} pnl-link" onclick="showEvalDetail({idx})">'
-                f'{ev["pnl_pct"]:+.2f}%</td>'
-                f'<td class="{pnl_color}">{pnl_krw_str}</td>'
-                f"</tr>"
-            )
-            held = ev["held_minutes"]
-            held_str_popup = f"{held/60:.1f}시간" if held >= 60 else f"{held:.0f}분"
-            if ev["exit_type"] == "take_profit":
-                exit_label = "익절"
-            elif ev["exit_type"] == "manual":
-                exit_label = "수동청산"
-            else:
-                exit_label = "손절"
-            eval_popup_list.append({
-                "symbol": ev_label,
-                "time": ev["time"],
-                "exit": exit_label,
-                "pnl_pct": ev["pnl_pct"],
-                "held": held_str_popup,
-                "orig_tp": ev.get("original_tp") or "",
-                "orig_sl": ev.get("original_sl") or "",
-                "sug_tp": ev.get("suggested_tp") or "",
-                "sug_sl": ev.get("suggested_sl") or "",
-                "evaluation": ev.get("evaluation") or "",
-                "lesson": ev.get("lesson") or "",
-            })
-        evals_html = (
-            "<table id='eval-table'>"
-            "<tr><th>시간</th><th>포트폴리오</th><th>수익률</th><th>수익금액</th></tr>"
-            f"{erows}</table>"
-        )
-    else:
-        evals_html = '<div class="no-data">성과 평가 데이터 없음<br>(매매 완료 후 자동 기록)</div>'
-
-    eval_js_data = json.dumps(eval_popup_list, ensure_ascii=False)
 
     # 전문가 점수 요약 HTML
     agent_scores = data.get("agent_scores", {})
@@ -1203,6 +1150,8 @@ function showPfTx(idx) {
       ? '<span style="background:#166534;color:#bbf7d0;padding:2px 8px;border-radius:4px;font-size:0.78rem;">익절</span>'
       : d.exit_type === 'manual'
       ? '<span style="background:#7c2d12;color:#fdba74;padding:2px 8px;border-radius:4px;font-size:0.78rem;">수동청산</span>'
+      : d.exit_type === 'timeout'
+      ? '<span style="background:#1e3a5f;color:#93c5fd;padding:2px 8px;border-radius:4px;font-size:0.78rem;">타임아웃</span>'
       : '<span style="background:#991b1b;color:#fecaca;padding:2px 8px;border-radius:4px;font-size:0.78rem;">손절</span>');
   var timeStr = d.is_open ? ('매수: ' + d.opened_at) : ('종료: ' + d.closed_at);
   var heldStr = d.is_open
@@ -1214,8 +1163,12 @@ function showPfTx(idx) {
   var tpSlStr = (d.take_profit_pct ? '<span style="color:#f87171">+' + d.take_profit_pct + '%</span>' : '—')
     + ' / ' + (d.stop_loss_pct ? '<span style="color:#60a5fa">' + d.stop_loss_pct + '%</span>' : '—');
 
-  var html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
+  var tradeModeLabel = d.exit_type === 'manual'
+    ? '<span style="font-size:0.75rem;color:#fb923c;">👤 수동 청산</span>'
+    : '<span style="font-size:0.75rem;color:#38bdf8;">🤖 AI 자동매매</span>';
+  var html = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">'
     + '<span style="font-size:1rem;font-weight:700;">' + d.name + '</span>' + statusBadge + '</div>'
+    + '<div style="margin-bottom:10px;">' + tradeModeLabel + '</div>'
     + '<div class="stat-row"><span class="stat-label">시간</span><span class="stat-value">' + timeStr + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">보유 시간</span><span class="stat-value">' + heldStr + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">종목 수</span><span class="stat-value">' + d.coin_count + '개</span></div>'
@@ -1225,10 +1178,63 @@ function showPfTx(idx) {
     + '<div class="stat-row"><span class="stat-label">손익(원)</span><span class="stat-value" style="color:' + pnlColor + '">' + pnlKrwFmt + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">TP / SL 설정</span><span class="stat-value">' + tpSlStr + '</span></div>';
 
-  // 코인 상세 테이블
+  // ── 손절/익절 게이지 ──
+  if (d.take_profit_pct && d.stop_loss_pct) {
+    var tp = parseFloat(d.take_profit_pct);
+    var sl = Math.abs(parseFloat(d.stop_loss_pct));
+    if (tp > 0 && sl > 0) {
+      var totalRange = tp + sl;
+      var zeroPos = sl / totalRange * 100;
+      function gaugePos(pct) {
+        var clamped = Math.max(-sl, Math.min(tp, pct));
+        return (clamped + sl) / totalRange * 100;
+      }
+      var curPos = gaugePos(d.pnl_pct);
+      var curColor = d.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
+      var fillLeft = Math.min(curPos, zeroPos);
+      var fillWidth = Math.abs(curPos - zeroPos);
+      var peakPnl = d.peak_pnl_pct || 0;
+      var troughPnl = d.trough_pnl_pct || 0;
+      var peakPos = peakPnl > 0 ? gaugePos(peakPnl) : null;
+      var troughPos = troughPnl < 0 ? gaugePos(troughPnl) : null;
+      var peakMarker = (peakPos !== null && peakPnl > d.pnl_pct + 0.05)
+        ? '<div style="position:absolute;left:' + peakPos.toFixed(1) + '%;top:-4px;transform:translateX(-50%);color:#fb923c;font-size:10px;line-height:1;">▼</div>'
+          + '<div style="position:absolute;left:' + peakPos.toFixed(1) + '%;top:14px;transform:translateX(-50%);color:#fb923c;font-size:0.6rem;white-space:nowrap;">' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(1) + '%</div>'
+        : '';
+      var troughMarker = (troughPos !== null && troughPnl < d.pnl_pct - 0.05)
+        ? '<div style="position:absolute;left:' + troughPos.toFixed(1) + '%;top:18px;transform:translateX(-50%);color:#38bdf8;font-size:10px;line-height:1;">▲</div>'
+        : '';
+      var hdrExtra = '';
+      if (peakPos !== null && peakPnl > d.pnl_pct + 0.05) hdrExtra += '<span style="color:#fb923c;">▼ 고점 ' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(1) + '%</span> ';
+      if (troughPos !== null && troughPnl < d.pnl_pct - 0.05) hdrExtra += '<span style="color:#38bdf8;">▲ 저점 ' + troughPnl.toFixed(1) + '%</span>';
+      var bottomRow = '현재 <b style="color:' + curColor + ';">' + sign + d.pnl_pct.toFixed(2) + '%</b>';
+      if (peakPos !== null && peakPnl > 0.05) bottomRow += ' &nbsp;|&nbsp; 고점 <b style="color:#fb923c;">' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(2) + '%</b>';
+      if (troughPos !== null && troughPnl < -0.05) bottomRow += ' &nbsp;|&nbsp; 저점 <b style="color:#38bdf8;">' + troughPnl.toFixed(2) + '%</b>';
+      html += '<div style="margin-top:10px;font-size:0.78rem;color:#94a3b8;margin-bottom:4px;">손절/익절 게이지 <span style="float:right;font-size:0.7rem;">' + hdrExtra + '</span></div>'
+        + '<div style="position:relative;height:34px;margin-bottom:4px;">'
+        + '<div style="position:absolute;top:8px;left:0;right:0;height:10px;background:#0f172a;border-radius:5px;overflow:hidden;">'
+        + '<div style="position:absolute;left:0;width:' + zeroPos.toFixed(1) + '%;height:100%;background:#1e3a5f;"></div>'
+        + '<div style="position:absolute;left:' + zeroPos.toFixed(1) + '%;right:0;height:100%;background:#1e3a28;"></div>'
+        + '<div style="position:absolute;left:' + fillLeft.toFixed(1) + '%;width:' + fillWidth.toFixed(1) + '%;height:100%;background:' + curColor + ';opacity:0.8;"></div>'
+        + '</div>'
+        + '<div style="position:absolute;left:' + zeroPos.toFixed(1) + '%;top:4px;width:2px;height:18px;background:#475569;transform:translateX(-50%);"></div>'
+        + '<div style="position:absolute;left:' + curPos.toFixed(1) + '%;top:4px;width:3px;height:18px;background:' + curColor + ';transform:translateX(-50%);border-radius:2px;"></div>'
+        + peakMarker + troughMarker
+        + '</div>'
+        + '<div style="position:relative;font-size:0.68rem;color:#64748b;height:14px;margin-bottom:6px;">'
+        + '<span style="position:absolute;left:0;color:#60a5fa;">SL ' + d.stop_loss_pct + '%</span>'
+        + '<span style="position:absolute;left:' + zeroPos.toFixed(1) + '%;transform:translateX(-50%);color:#475569;">0%</span>'
+        + '<span style="position:absolute;right:0;color:#f87171;">TP +' + d.take_profit_pct + '%</span>'
+        + '</div>'
+        + '<div style="font-size:0.7rem;color:#94a3b8;text-align:center;margin-bottom:8px;">' + bottomRow + '</div>';
+    }
+  }
+
+  // ── 코인 상세 테이블 ──
   if (d.coins && d.coins.length > 0) {
     html += '<div style="margin-top:12px;font-size:0.8rem;color:#94a3b8;font-weight:600;">코인별 상세</div>';
     if (d.is_open) {
+      // 보유 중: 매수가 / 현재가 / 수익률 / 손익(원)
       html += '<table style="margin-top:6px;width:100%;font-size:0.8rem;">'
         + '<tr style="color:#64748b;"><th style="text-align:left;">코인</th>'
         + '<th style="text-align:right;">매수가</th><th style="text-align:right;">현재가</th>'
@@ -1245,17 +1251,22 @@ function showPfTx(idx) {
       }
       html += '</table>';
     } else {
+      // 종료됨: 실제 매수가 / 매도가 / 수익률 (단가 기준)
       html += '<table style="margin-top:6px;width:100%;font-size:0.8rem;">'
         + '<tr style="color:#64748b;"><th style="text-align:left;">코인</th>'
-        + '<th style="text-align:right;">매수(원)</th><th style="text-align:right;">매도(원)</th>'
+        + '<th style="text-align:right;">매수가</th><th style="text-align:right;">매도가</th>'
         + '<th style="text-align:right;">수익률</th></tr>';
       for (var j = 0; j < d.coins.length; j++) {
         var cr = d.coins[j];
-        var crc = cr.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
+        var buyP = cr.buy_price || 0;
+        var sellP = cr.sell_price || 0;
+        // 단가 기준 수익률 재계산 (sell_price=0이면 pnl_pct 원본 사용)
+        var coinPnl = (buyP > 0 && sellP > 0) ? (sellP - buyP) / buyP * 100 : (cr.pnl_pct || 0);
+        var crc = coinPnl >= 0 ? '#f87171' : '#60a5fa';
         html += '<tr><td><b>' + cr.symbol + '</b></td>'
-          + '<td style="text-align:right">' + (cr.buy_krw || 0).toLocaleString('ko-KR') + '</td>'
-          + '<td style="text-align:right">' + (cr.sell_krw || 0).toLocaleString('ko-KR') + '</td>'
-          + '<td style="text-align:right;color:' + crc + '">' + (cr.pnl_pct >= 0 ? '+' : '') + (cr.pnl_pct || 0).toFixed(2) + '%</td>'
+          + '<td style="text-align:right">' + buyP.toLocaleString('ko-KR') + '</td>'
+          + '<td style="text-align:right">' + (sellP > 0 ? sellP.toLocaleString('ko-KR') : '—') + '</td>'
+          + '<td style="text-align:right;color:' + crc + '">' + (coinPnl >= 0 ? '+' : '') + coinPnl.toFixed(2) + '%</td>'
           + '</tr>';
       }
       html += '</table>';
@@ -1280,59 +1291,7 @@ document.addEventListener('DOMContentLoaded', function() {
   var ptm = document.getElementById('pf-tx-modal');
   if (ptm) ptm.addEventListener('click', function(e) { if (e.target === this) closePfTx(); });
 });
-function showEvalDetail(idx) {
-  var d = _evalPopup[idx];
-  if (!d) return;
-  var pnlColor = d.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
-  var sign = d.pnl_pct >= 0 ? '+' : '';
-  document.getElementById('edm-content').innerHTML =
-    '<div class="stat-row"><span class="stat-label">코인 / 결과</span>' +
-    '<span class="stat-value">' + d.symbol + ' \u2014 ' + d.exit + '</span></div>' +
-    '<div class="stat-row"><span class="stat-label">수익률</span>' +
-    '<span class="stat-value" style="color:' + pnlColor + '">' + sign + d.pnl_pct.toFixed(2) + '%</span></div>' +
-    '<div class="stat-row"><span class="stat-label">보유 시간</span>' +
-    '<span class="stat-value">' + d.held + '</span></div>' +
-    '<div class="stat-row"><span class="stat-label">설정 TP / SL</span>' +
-    '<span class="stat-value"><span style="color:#f87171">+' + d.orig_tp + '%</span>' +
-    ' / <span style="color:#60a5fa">' + d.orig_sl + '%</span></span></div>' +
-    '<div class="stat-row"><span class="stat-label">제안 TP / SL</span>' +
-    '<span class="stat-value"><b><span style="color:#f87171">+' + d.sug_tp + '%</span>' +
-    ' / <span style="color:#60a5fa">' + d.sug_sl + '%</span></b></span></div>' +
-    (d.evaluation ? '<div style="margin-top:10px;padding:10px;background:#0f172a;' +
-    'border-radius:6px;font-size:0.82rem;color:#94a3b8;white-space:pre-wrap;">' +
-    d.evaluation + '</div>' : '') +
-    (d.lesson ? '<div style="margin-top:8px;font-size:0.78rem;color:#64748b;' +
-    'font-style:italic;">' + d.lesson + '</div>' : '');
-  document.getElementById('eval-detail-modal').style.display = 'flex';
-}
-function closeEvalDetail() {
-  document.getElementById('eval-detail-modal').style.display = 'none';
-}
-document.addEventListener('DOMContentLoaded', function() {
-  var edm = document.getElementById('eval-detail-modal');
-  if (edm) edm.addEventListener('click', function(e) { if (e.target === this) closeEvalDetail(); });
-});
 """
-    eval_detail_modal = (
-        '<div id="eval-detail-modal" style="display:none;position:fixed;inset:0;'
-        'background:rgba(0,0,0,0.75);z-index:1000;align-items:center;justify-content:center;">'
-        '<div style="background:#1e293b;border-radius:12px;border:1px solid #334155;'
-        'width:90%;max-width:500px;overflow:hidden;">'
-        '<div style="padding:16px 20px;border-bottom:1px solid #334155;'
-        'display:flex;justify-content:space-between;align-items:center;">'
-        '<span style="font-size:1rem;font-weight:600;color:#e2e8f0;">📊 상세 평가</span>'
-        '<button onclick="closeEvalDetail()" style="background:none;border:none;'
-        'color:#64748b;font-size:1.5rem;cursor:pointer;line-height:1;padding:2px 6px;">&#215;</button>'
-        '</div>'
-        '<div id="edm-content" style="padding:16px 20px;font-size:0.85rem;"></div>'
-        '<div style="padding:12px 20px;border-top:1px solid #334155;'
-        'display:flex;justify-content:flex-end;">'
-        '<button onclick="closeEvalDetail()" style="background:#334155;color:#e2e8f0;'
-        'border:none;border-radius:6px;padding:8px 18px;font-size:0.85rem;'
-        'font-weight:600;cursor:pointer;">닫기</button>'
-        '</div></div></div>'
-    )
-
     return _HTML_TEMPLATE.format(
         monitor_name=_MONITOR_NAME,
         updated_at=data["updated_at"],
@@ -1353,11 +1312,8 @@ document.addEventListener('DOMContentLoaded', function() {
         avg_hold=avg_hold,
         position_html=position_html,
         trades_html=trades_html,
-        eval_summary_html=eval_summary_html,
-        evals_html=evals_html,
+        pyramid_html=pyramid_html,
         agent_scores_html=agent_scores_html,
-        eval_js_data=eval_js_data,
-        eval_detail_modal=eval_detail_modal,
         portfolio_tx_js_data=portfolio_tx_js_data,
         portfolio_tx_modal=portfolio_tx_modal,
         manual_trades_section=manual_trades_section,
