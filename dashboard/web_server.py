@@ -1728,6 +1728,7 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
             f'<div style="display:flex; gap:6px; margin-top:14px; padding-top:10px; border-top:1px solid #334155;">'
             f'<button onclick="showPromptModal(\'{role}\')" class="btn-action">📝 프롬프트</button>'
             f'<button onclick="showChatModal(\'{role}\', \'{name}\')" class="btn-action">💬 대화</button>'
+            f'<button onclick="showReflectionModal(\'{role}\', \'{name}\')" class="btn-action" style="background:#1e293b; border-color:#7c3aed; color:#a78bfa;">📓 반성문</button>'
             f'</div>'
         )
 
@@ -1847,6 +1848,7 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
         document.getElementById('pm-title').textContent = '프롬프트 로딩 중...';
         document.getElementById('pm-base').value = '';
         document.getElementById('pm-feedback').textContent = '';
+        document.getElementById('pm-reflection-summary').textContent = '';
         document.getElementById('pm-role').value = role;
         fetch('/api/agent/prompt?role=' + encodeURIComponent(role))
             .then(function(r) { return r.json(); })
@@ -1854,11 +1856,51 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
                 document.getElementById('pm-title').textContent = d.role + ' — 프롬프트 설정';
                 document.getElementById('pm-base').value = d.base_prompt || '';
                 document.getElementById('pm-feedback').textContent = d.feedback_prompt || '(MetaEvaluator 피드백 없음)';
+                document.getElementById('pm-reflection-summary').textContent = d.reflection_summary || '(반성문 요약 없음 — 총괄 평가 후 자동 생성됩니다)';
             })
             .catch(function(e) {
                 document.getElementById('pm-title').textContent = '오류';
                 document.getElementById('pm-base').value = '프롬프트 로드 실패: ' + e;
             });
+    }
+
+    // 반성문 모달
+    var _reflectionRole = '';
+    function showReflectionModal(role, name) {
+        _reflectionRole = role;
+        var modal = document.getElementById('reflection-modal');
+        modal.style.display = 'flex';
+        document.getElementById('rm-title').textContent = name + ' — 반성문 이력';
+        document.getElementById('rm-body').innerHTML = '<div style="color:#94a3b8; padding:20px; text-align:center;">로딩 중...</div>';
+        fetch('/api/agent/reflections?role=' + encodeURIComponent(role))
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                var html = '';
+                if (!d.reflections || d.reflections.length === 0) {
+                    html = '<div style="color:#94a3b8; padding:20px; text-align:center;">아직 반성문이 없습니다.<br>총괄 평가(3시간 주기) 후 자동 생성됩니다.</div>';
+                } else {
+                    d.reflections.forEach(function(r) {
+                        var scoreColor = r.score >= 70 ? '#4ade80' : r.score >= 40 ? '#facc15' : '#f87171';
+                        html += '<div style="border:1px solid #334155; border-radius:8px; padding:14px; margin-bottom:12px; background:#1e293b;">';
+                        html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">';
+                        html += '<span style="color:#94a3b8; font-size:0.8rem;">' + r.eval_period + '</span>';
+                        html += '<span style="color:' + scoreColor + '; font-weight:700; font-size:0.95rem;">' + r.score + '점</span>';
+                        html += '</div>';
+                        html += '<div style="color:#e2e8f0; font-size:0.87rem; line-height:1.7; white-space:pre-wrap;">' + (r.reflection || '') + '</div>';
+                        if (r.prompt_summary) {
+                            html += '<div style="margin-top:8px; padding:6px 10px; background:#0f172a; border-left:3px solid #7c3aed; border-radius:3px; color:#a78bfa; font-size:0.8rem;">📌 프롬프트 반영: ' + r.prompt_summary + '</div>';
+                        }
+                        html += '</div>';
+                    });
+                }
+                document.getElementById('rm-body').innerHTML = html;
+            })
+            .catch(function(e) {
+                document.getElementById('rm-body').innerHTML = '<div style="color:#f87171; padding:20px;">로드 실패: ' + e + '</div>';
+            });
+    }
+    function closeReflectionModal() {
+        document.getElementById('reflection-modal').style.display = 'none';
     }
 
     function closePromptModal() {
@@ -1991,6 +2033,8 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
       <textarea id="pm-base" class="prompt-textarea" placeholder="로딩 중..."></textarea>
       <span class="sect-label">MetaEvaluator 피드백 (읽기 전용)</span>
       <div id="pm-feedback" class="feedback-readonly"></div>
+      <span class="sect-label" style="color:#a78bfa;">반성문 종합 요약 — 현재 프롬프트 주입 내용 (읽기 전용)</span>
+      <div id="pm-reflection-summary" class="feedback-readonly" style="border-color:#7c3aed; color:#c4b5fd;"></div>
     </div>
     <div class="modal-footer">
       <button class="mbtn mbtn-secondary" onclick="closePromptModal()">닫기</button>
@@ -2012,6 +2056,22 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
           placeholder="메시지 입력... (Enter: 전송, Shift+Enter: 줄바꿈)" rows="1"></textarea>
         <button id="cm-send" class="btn-send" onclick="sendMessage()">전송</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<div id="reflection-modal" class="modal-overlay" onclick="if(event.target===this)closeReflectionModal()">
+  <div class="modal-box" style="max-width:640px;">
+    <div class="modal-header">
+      <span id="rm-title" class="modal-title">반성문 이력</span>
+      <button class="modal-close" onclick="closeReflectionModal()">&#215;</button>
+    </div>
+    <div id="rm-body" class="modal-body"
+         style="max-height:500px; overflow-y:auto; font-size:0.87rem;">
+      로딩 중...
+    </div>
+    <div class="modal-footer">
+      <button class="mbtn mbtn-secondary" onclick="closeReflectionModal()">닫기</button>
     </div>
   </div>
 </div>
@@ -2299,6 +2359,29 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(200, "application/json; charset=utf-8", body)
             except Exception as e:
                 self._respond(500, "application/json", json.dumps({"error": str(e)}).encode())
+
+        elif self.path.startswith("/api/agent/reflections"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            role = params.get("role", [None])[0]
+            if not role:
+                body = json.dumps({"error": "role 파라미터 필수"}).encode()
+                self._respond(400, "application/json; charset=utf-8", body)
+            else:
+                repo = TradeRepository()
+                rows = repo.get_agent_reflections(role, limit=20)
+                reflections = [
+                    {
+                        "eval_period": r.eval_period,
+                        "score": round(r.score, 1),
+                        "reflection": r.reflection,
+                        "prompt_summary": r.prompt_summary or "",
+                        "created_at": r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else "",
+                    }
+                    for r in rows
+                ]
+                body = json.dumps({"role": role, "reflections": reflections}, ensure_ascii=False).encode("utf-8")
+                self._respond(200, "application/json; charset=utf-8", body)
 
         elif self.path.startswith("/api/agent/prompt"):
             parsed = urlparse(self.path)

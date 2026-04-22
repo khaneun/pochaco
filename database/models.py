@@ -42,6 +42,7 @@ class Portfolio(Base):
     agent_reason = Column(Text)                           # 포트폴리오 구성 이유
     llm_provider = Column(String(50), default="")
     peak_pnl_pct = Column(Float, default=0.0)             # 보유 기간 최고 수익률
+    trough_pnl_pct = Column(Float, default=0.0)           # 보유 기간 최저 수익률
     opened_at = Column(DateTime, default=datetime.utcnow, index=True)
     closed_at = Column(DateTime, nullable=True)
     is_open = Column(Boolean, default=True, index=True)
@@ -158,6 +159,19 @@ class AgentDecisionLog(Base):
     input_summary = Column(Text, default="")
     output_summary = Column(Text, default="")
     portfolio_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AgentReflection(Base):
+    """전문가별 반성문 (MetaEvaluator 평가 후 자기반성 기록)"""
+    __tablename__ = "agent_reflections"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_role = Column(String(30), nullable=False, index=True)
+    eval_period = Column(String(20), nullable=False)    # 예: "2026-04-22_12"
+    score = Column(Float, nullable=False)               # 해당 주기 점수
+    reflection = Column(Text, nullable=False)           # 반성문 전문 (1인칭)
+    prompt_summary = Column(Text, default="")           # 프롬프트 주입용 핵심 요약
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -280,6 +294,10 @@ def _ensure_schema_updates() -> None:
             conn.execute("ALTER TABLE portfolios ADD COLUMN peak_pnl_pct FLOAT DEFAULT 0.0")
             conn.commit()
             _log.info("[DB 스키마] portfolios.peak_pnl_pct 컬럼 추가 완료")
+        if "trough_pnl_pct" not in columns:
+            conn.execute("ALTER TABLE portfolios ADD COLUMN trough_pnl_pct FLOAT DEFAULT 0.0")
+            conn.commit()
+            _log.info("[DB 스키마] portfolios.trough_pnl_pct 컬럼 추가 완료")
     finally:
         conn.close()
 

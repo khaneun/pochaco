@@ -7,6 +7,7 @@
 """
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 
 from core.llm_provider import BaseLLMProvider, get_llm_provider
@@ -31,6 +32,7 @@ class BaseSpecialistAgent(ABC):
         self._llm = llm or get_llm_provider()
         self._base_prompt: str = ""      # 서브클래스에서 설정
         self._feedback_prompt: str = ""  # MetaEvaluator가 주입 (누적 요약)
+        self._reflection_summary: str = ""  # 최근 반성문 요약 (DB → 주입)
         self._score: float = 50.0
         self._feedback_history: list[dict] = []  # 최근 피드백 히스토리
 
@@ -53,6 +55,14 @@ class BaseSpecialistAgent(ABC):
     @property
     def feedback_prompt(self) -> str:
         return self._feedback_prompt
+
+    @property
+    def reflection_summary(self) -> str:
+        return self._reflection_summary
+
+    def update_reflection_summary(self, summary: str) -> None:
+        """DB에서 복원한 반성문 요약을 주입"""
+        self._reflection_summary = summary
 
     # ---------------------------------------------------------------- #
     #  누적 피드백 관리                                                   #
@@ -156,13 +166,31 @@ class BaseSpecialistAgent(ABC):
         messages = list(history or [])
         messages.append({"role": "user", "content": message})
         self._llm._current_agent = self.ROLE_NAME or "unknown"
-        return self._llm.chat_with_system(system, messages, max_tokens=1024)
+        last_exc: Exception | None = None
+        for attempt in range(4):
+            try:
+                return self._llm.chat_with_system(system, messages, max_tokens=1024)
+            except Exception as e:
+                msg = str(e).lower()
+                if "insufficient_quota" in msg or "quota" in msg and "exceeded" in msg:
+                    raise
+                if "429" in msg or "rate" in msg or "overloaded" in msg or "capacity" in msg:
+                    wait = 5 * (3 ** attempt)
+                    logger.warning(
+                        f"[{self.ROLE_NAME}] chat 429/과부하 — {wait}초 후 재시도 "
+                        f"({attempt + 1}/4): {e}"
+                    )
+                    time.sleep(wait)
+                    last_exc = e
+                else:
+                    raise
+        raise last_exc  # type: ignore
 
     # ---------------------------------------------------------------- #
     #  LLM 호출                                                          #
     # ---------------------------------------------------------------- #
     def _build_system_context(self) -> str:
-        """기본 프롬프트 + 누적 피드백 조합"""
+        """기본 프롬프트 + 누적 피드백 + 반성문 요약 조합"""
         parts = [self._base_prompt]
         if self._feedback_prompt:
             parts.append(
@@ -171,13 +199,39 @@ class BaseSpecialistAgent(ABC):
                 f"{'='*60}\n"
                 f"{self._feedback_prompt}"
             )
+        if self._reflection_summary:
+            parts.append(
+                f"\n\n{'='*60}\n"
+                f"[나의 반성문 요약 — 반복 실수를 절대 반복하지 마세요]\n"
+                f"{'='*60}\n"
+                f"{self._reflection_summary}"
+            )
         return "\n".join(parts)
 
     def _call_llm(self, task_prompt: str, max_tokens: int = 512) -> str:
-        """시스템 컨텍스트 + 작업 프롬프트로 LLM 호출"""
+        """시스템 컨텍스트 + 작업 프롬프트로 LLM 호출 (429 자동 재시도 포함)"""
         full_prompt = f"{self._build_system_context()}\n\n---\n\n{task_prompt}"
         self._llm._current_agent = self.ROLE_NAME or "unknown"
-        return self._llm.chat(full_prompt, max_tokens=max_tokens)
+        last_exc: Exception | None = None
+        for attempt in range(4):  # 최대 4회 시도 (지수 백오프: 5s, 15s, 45s)
+            try:
+                return self._llm.chat(full_prompt, max_tokens=max_tokens)
+            except Exception as e:
+                msg = str(e).lower()
+                # 크레딧/쿼터 소진은 재시도 불가 — 즉시 예외 전파
+                if "insufficient_quota" in msg or "quota" in msg and "exceeded" in msg:
+                    raise
+                if "429" in msg or "rate" in msg or "overloaded" in msg or "capacity" in msg:
+                    wait = 5 * (3 ** attempt)
+                    logger.warning(
+                        f"[{self.ROLE_NAME}] LLM 429/과부하 — {wait}초 후 재시도 "
+                        f"({attempt + 1}/4): {e}"
+                    )
+                    time.sleep(wait)
+                    last_exc = e
+                else:
+                    raise
+        raise last_exc  # type: ignore
 
     def _parse_json(self, raw: str) -> dict:
         """LLM 응답에서 JSON 추출 (마크다운 코드블록 제거)"""

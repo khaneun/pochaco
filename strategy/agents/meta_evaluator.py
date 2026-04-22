@@ -31,6 +31,8 @@ class AgentFeedback:
     weaknesses: str       # 못하는 부분
     directive: str        # 구체적 개선 지시 (프롬프트에 삽입될 내용)
     priority: str         # reinforce | improve | critical
+    reflection: str = ""       # 1인칭 반성문 (해당 전문가 관점)
+    prompt_summary: str = ""   # 프롬프트 주입용 핵심 요약 (30자 이내)
 
 
 class MetaEvaluator(BaseSpecialistAgent):
@@ -130,18 +132,21 @@ class MetaEvaluator(BaseSpecialistAgent):
 priority: reinforce(유지·강화) | improve(개선필요) | critical(즉시개선)
 
 strengths/weaknesses는 각 50자 이내, directive는 80자 이내로 작성.
+reflection: 해당 전문가 1인칭으로 작성 ("저는 이번에 ~을 잘못했습니다. ~을 개선하겠습니다.") 150자 이내.
+prompt_summary: 반성문의 핵심을 한 줄 압축 (30자 이내, 프롬프트에 직접 주입됨).
 
 JSON으로만 응답 (마크다운 코드블록 없이):
 {{"agents": [
-  {{"role": "market_analyst", "score": 75, "strengths": "구체적 잘한 점", "weaknesses": "구체적 부족한 점", "directive": "다음 분석 시 구체적 명령 (수치 포함)", "priority": "reinforce"}},
-  {{"role": "asset_manager", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve"}},
-  {{"role": "buy_strategist", "score": 65, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve"}},
-  {{"role": "sell_strategist", "score": 60, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "critical"}},
-  {{"role": "portfolio_evaluator", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "reinforce"}}
+  {{"role": "market_analyst", "score": 75, "strengths": "구체적 잘한 점", "weaknesses": "구체적 부족한 점", "directive": "다음 분석 시 구체적 명령 (수치 포함)", "priority": "reinforce", "reflection": "저는 이번에... 개선하겠습니다.", "prompt_summary": "핵심 반성 한 줄"}},
+  {{"role": "asset_manager", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve", "reflection": "...", "prompt_summary": "..."}},
+  {{"role": "buy_strategist", "score": 65, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve", "reflection": "...", "prompt_summary": "..."}},
+  {{"role": "sell_strategist", "score": 60, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "critical", "reflection": "...", "prompt_summary": "..."}},
+  {{"role": "portfolio_evaluator", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "reinforce", "reflection": "...", "prompt_summary": "..."}},
+  {{"role": "coin_profile_analyst", "score": 65, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve", "reflection": "...", "prompt_summary": "..."}}
 ]}}"""
 
             logger.info("[MetaEvaluator] 전문가 종합 평가 시작...")
-            raw = self._call_llm(task_prompt, max_tokens=1024)
+            raw = self._call_llm(task_prompt, max_tokens=1600)
             logger.info(f"[MetaEvaluator] 평가 응답: {raw}")
 
             data = self._parse_json(raw)
@@ -185,6 +190,8 @@ JSON으로만 응답 (마크다운 코드블록 없이):
                     weaknesses=agent_data.get("weaknesses", ""),
                     directive=agent_data.get("directive", ""),
                     priority=priority,
+                    reflection=agent_data.get("reflection", ""),
+                    prompt_summary=agent_data.get("prompt_summary", ""),
                 )
                 feedbacks.append(feedback)
 

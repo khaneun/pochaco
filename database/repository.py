@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .models import (
     SessionLocal, Portfolio, Trade, Position, DailyReport,
-    StrategyEvaluation, AgentScore, AgentDecisionLog,
+    StrategyEvaluation, AgentScore, AgentDecisionLog, AgentReflection,
 )
 
 
@@ -100,6 +100,13 @@ class TradeRepository:
             db.expunge_all()
             return rows
 
+    def update_portfolio_total_buy(self, portfolio_id: int, total_buy_krw: float) -> None:
+        """실체결 기반 포트폴리오 총 투입금 보정"""
+        with self._session() as db:
+            pf = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
+            if pf:
+                pf.total_buy_krw = total_buy_krw
+
     def update_portfolio_targets(
         self, portfolio_id: int, new_tp: float, new_sl: float,
     ) -> None:
@@ -116,6 +123,13 @@ class TradeRepository:
             pf = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
             if pf and peak_pnl_pct > (pf.peak_pnl_pct or 0.0):
                 pf.peak_pnl_pct = peak_pnl_pct
+
+    def update_portfolio_trough(self, portfolio_id: int, trough_pnl_pct: float) -> None:
+        """보유 기간 최저 수익률 갱신 (음수 신저점만)"""
+        with self._session() as db:
+            pf = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
+            if pf and trough_pnl_pct < (pf.trough_pnl_pct or 0.0):
+                pf.trough_pnl_pct = trough_pnl_pct
 
     def pyramid_position(
         self,
@@ -743,3 +757,73 @@ class TradeRepository:
             )
             db.expunge_all()
             return rows
+
+    # ---------------------------------------------------------------- #
+    #  반성문 (AgentReflection)                                          #
+    # ---------------------------------------------------------------- #
+    def save_agent_reflection(
+        self,
+        agent_role: str,
+        eval_period: str,
+        score: float,
+        reflection: str,
+        prompt_summary: str = "",
+    ) -> None:
+        """전문가 반성문 저장 (같은 period 중복 시 덮어쓰기)"""
+        with self._session() as db:
+            existing = (
+                db.query(AgentReflection)
+                .filter(
+                    AgentReflection.agent_role == agent_role,
+                    AgentReflection.eval_period == eval_period,
+                )
+                .first()
+            )
+            if existing:
+                existing.score = score
+                existing.reflection = reflection
+                existing.prompt_summary = prompt_summary
+            else:
+                db.add(AgentReflection(
+                    agent_role=agent_role,
+                    eval_period=eval_period,
+                    score=score,
+                    reflection=reflection,
+                    prompt_summary=prompt_summary,
+                ))
+
+    def get_agent_reflections(
+        self, agent_role: str, limit: int = 10
+    ) -> list[AgentReflection]:
+        """최근 반성문 목록 (최신순)"""
+        with self._session() as db:
+            rows = (
+                db.query(AgentReflection)
+                .filter(AgentReflection.agent_role == agent_role)
+                .order_by(AgentReflection.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            db.expunge_all()
+            return rows
+
+    def get_agent_reflection_prompt_summary(self, agent_role: str, limit: int = 3) -> str:
+        """최근 N회 반성문의 prompt_summary를 합산 — 프롬프트 주입용"""
+        with self._session() as db:
+            rows = (
+                db.query(AgentReflection)
+                .filter(
+                    AgentReflection.agent_role == agent_role,
+                    AgentReflection.prompt_summary != "",
+                )
+                .order_by(AgentReflection.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            db.expunge_all()
+        if not rows:
+            return ""
+        lines = []
+        for r in reversed(rows):
+            lines.append(f"[{r.eval_period}] {r.prompt_summary}")
+        return "\n".join(lines)

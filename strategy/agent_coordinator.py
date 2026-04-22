@@ -86,6 +86,9 @@ class AgentCoordinator:
         # 마지막 시장 분석 결과
         self.last_market_condition: MarketCondition | None = None
 
+        # 시작 시 반성문 요약 복원
+        self._restore_reflection_summaries()
+
     # ------------------------------------------------------------------ #
     #  기본 속성                                                            #
     # ------------------------------------------------------------------ #
@@ -99,6 +102,19 @@ class AgentCoordinator:
     def get_all_agents(self) -> dict:
         return self._agents
 
+    def _restore_reflection_summaries(self) -> None:
+        """시작 시 DB에서 반성문 요약을 각 Agent에 복원"""
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        for role, agent in self._agents.items():
+            try:
+                summary = self._repo.get_agent_reflection_prompt_summary(role, limit=3)
+                if summary:
+                    agent.update_reflection_summary(summary)
+                    _log.info(f"[반성문 복원] {role}: {len(summary)}자")
+            except Exception as e:
+                _log.debug(f"[반성문 복원 실패] {role}: {e}")
+
     def get_agent_prompt(self, role: str) -> dict | None:
         agent = self._agents.get(role)
         if not agent:
@@ -107,6 +123,7 @@ class AgentCoordinator:
             "role": role,
             "base_prompt": agent.base_prompt,
             "feedback_prompt": agent.feedback_prompt,
+            "reflection_summary": agent.reflection_summary,
         }
 
     def get_coin_profile(self, symbol: str) -> str | None:
@@ -626,5 +643,30 @@ class AgentCoordinator:
                 self._repo.save_agent_scores(score_records)
             except Exception as e:
                 logger.error(f"[총괄 평가 DB 저장 오류] {e}")
+
+        # 반성문 저장 및 Agent에 요약 주입
+        for fb in feedbacks:
+            if not fb.reflection:
+                continue
+            try:
+                self._repo.save_agent_reflection(
+                    agent_role=fb.agent_role,
+                    eval_period=eval_period,
+                    score=fb.score,
+                    reflection=fb.reflection,
+                    prompt_summary=fb.prompt_summary,
+                )
+                # 최신 반성문 요약을 Agent 프롬프트에 반영
+                agent = self._agents.get(fb.agent_role)
+                if agent:
+                    new_summary = self._repo.get_agent_reflection_prompt_summary(
+                        fb.agent_role, limit=3
+                    )
+                    agent.update_reflection_summary(new_summary)
+                    logger.info(
+                        f"[반성문 저장] {fb.agent_role}: {fb.prompt_summary[:40]}"
+                    )
+            except Exception as e:
+                logger.error(f"[반성문 저장 오류] {fb.agent_role}: {e}")
 
         return feedbacks
