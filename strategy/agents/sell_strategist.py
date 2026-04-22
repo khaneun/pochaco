@@ -52,7 +52,6 @@ class SellStrategist(BaseSpecialistAgent):
                 "original_sl": float,
                 "coin_details": list[dict],  # [{symbol, pnl_pct, buy_krw, current_value}]
                 "tier1_sold": bool,
-                "tier2_sold": bool,
             }
 
         Returns:
@@ -70,7 +69,6 @@ class SellStrategist(BaseSpecialistAgent):
         original_sl = context.get("original_sl", -2.0)
         coin_details = context.get("coin_details", [])
         tier1_sold = context.get("tier1_sold", False)
-        tier2_sold = context.get("tier2_sold", False)
 
         try:
             time_guidance = self._get_time_guidance(holding_minutes)
@@ -85,10 +83,8 @@ class SellStrategist(BaseSpecialistAgent):
             coin_text = "\n".join(coin_lines) if coin_lines else "  (정보 없음)"
 
             tier_status = "전량 보유"
-            if tier2_sold:
-                tier_status = "2차 분할 매도 완료 (잔여 약 34%)"
-            elif tier1_sold:
-                tier_status = "1차 분할 매도 완료 (잔여 약 67%)"
+            if tier1_sold:
+                tier_status = "1차 분할 매도 완료 (잔여 약 50~67%)"
 
             task_prompt = f"""현재 보유 포트폴리오:
 - 포트폴리오: {portfolio_name} ({len(coin_details)}개 코인)
@@ -105,7 +101,7 @@ class SellStrategist(BaseSpecialistAgent):
 
 **조정 원칙:**
 - 익절은 낮추는 방향 — 오래 보유할수록 익절 낮추기 (최소 +3.0% 유지)
-- 손절은 -2.0%를 절대 초과할 수 없음 (하드캡)
+- 손절은 -1.5%를 절대 초과할 수 없음 (하드캡)
 - 분할 매도가 이미 진행되었다면 남은 물량의 빠른 처리를 고려
 - 포트폴리오 내 대부분 코인이 하락 중이면 익절을 낮추어 빠른 탈출 권장
 
@@ -113,7 +109,7 @@ class SellStrategist(BaseSpecialistAgent):
 {{
   "adjust": true 또는 false,
   "new_take_profit_pct": 숫자(조정 불필요 시 원래값),
-  "new_stop_loss_pct": 음수숫자(조정 불필요 시 원래값, 최대 -2.0),
+  "new_stop_loss_pct": 음수숫자(조정 불필요 시 원래값, 최대 -1.5),
   "reason": "이유 (한국어, 50자 이내)"
 }}"""
 
@@ -126,11 +122,11 @@ class SellStrategist(BaseSpecialistAgent):
                 new_tp = float(data.get("new_take_profit_pct", original_tp))
                 new_sl = float(data.get("new_stop_loss_pct", original_sl))
 
-                # ── 안전장치: TP 3.0~12%, SL 최대 -2.0% ──
+                # ── 안전장치: TP 3.0~12%, SL 최대 -1.5% ──
                 new_tp = max(3.0, min(12.0, new_tp))
                 if new_sl > 0:
                     new_sl = -abs(new_sl)
-                new_sl = max(-2.0, min(-0.5, new_sl))
+                new_sl = max(-1.5, min(-0.5, new_sl))
 
                 data["new_take_profit_pct"] = round(new_tp, 2)
                 data["new_stop_loss_pct"] = round(new_sl, 2)
@@ -173,3 +169,67 @@ class SellStrategist(BaseSpecialistAgent):
                 "보유 시간이 6시간 이상으로 매우 깁니다. "
                 "현재 수익이 +1% 이상이면 즉시 익절을, 손실이면 빠른 탈출을 강력히 권장합니다."
             )
+
+    def evaluate_tier1_action(self, context: dict) -> dict:
+        """Tier1(-1.0%) 진입 시 즉각 매도 비율 AI 평가
+
+        Args:
+            context: {
+                "portfolio_name": str,
+                "pnl_pct": float,       # 현재 종합 수익률 (≤ -1.0%)
+                "coin_details": list,   # [{symbol, pnl_pct, buy_krw, current_value}]
+                "holding_minutes": int,
+            }
+
+        Returns:
+            {"tier1_result": {"sell_ratio": float(0.33~0.67), "reason": str}}
+        """
+        portfolio_name = context.get("portfolio_name", "UNKNOWN")
+        pnl_pct = context.get("pnl_pct", -1.0)
+        coin_details = context.get("coin_details", [])
+        holding_minutes = context.get("holding_minutes", 0)
+
+        try:
+            coin_lines = []
+            for cd in coin_details:
+                coin_lines.append(
+                    f"  - {cd['symbol']}: 수익 {cd['pnl_pct']:+.2f}%, "
+                    f"투입 {cd['buy_krw']:,.0f}원 → 현재 {cd['current_value']:,.0f}원"
+                )
+            coin_text = "\n".join(coin_lines) if coin_lines else "  (정보 없음)"
+
+            task_prompt = f"""포트폴리오가 -1.0% 손실 구간에 진입했습니다. 즉각 매도 비율을 결정하세요.
+
+포트폴리오: {portfolio_name} ({len(coin_details)}개 코인)
+종합 수익률: {pnl_pct:+.2f}%
+보유 시간: {holding_minutes}분
+
+**개별 코인 현황:**
+{coin_text}
+
+**판단 기준:**
+- 최악의 경우 -1.5%에서 잔여 전량 손절됩니다
+- 코인들이 전반적으로 계속 하락 중 → 매도 비율 높게 (0.60~0.67)
+- 일부만 하락, 반등 가능성 있음 → 매도 비율 중간 (0.45~0.55)
+- 단기 과매도, 반등 기대 → 매도 비율 낮게 (0.33~0.44)
+- 반드시 0.33 이상 0.67 이하로 결정
+
+아래 JSON 형식으로만 응답하세요 (마크다운 코드블록 없이 순수 JSON):
+{{
+  "sell_ratio": 0.33~0.67 사이 숫자,
+  "reason": "판단 근거 (한국어, 40자 이내)"
+}}"""
+
+            raw = self._call_llm(task_prompt, max_tokens=200)
+            logger.info(f"[SellStrategist] Tier1 평가 응답: {raw}")
+
+            data = self._parse_json(raw)
+            ratio = float(data.get("sell_ratio", 0.5))
+            ratio = max(0.33, min(0.67, ratio))
+            data["sell_ratio"] = round(ratio, 2)
+
+            return {"tier1_result": data}
+
+        except Exception as e:
+            logger.error(f"[SellStrategist] Tier1 평가 실패: {e}")
+            return {"tier1_result": {"sell_ratio": 0.5, "reason": "기본값 (평가 실패)"}}

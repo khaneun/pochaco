@@ -55,33 +55,44 @@ class MetaEvaluator(BaseSpecialistAgent):
             "4. 추상적 표현 금지 ('더 잘하세요'는 무의미)\n\n"
             "【전문가별 평가 기준】\n"
             "■ market_analyst (시장 분석가)\n"
-            "  - ★ 손절률이 높으면 자동 감점됩니다 (50%→-10, 70%→-20, 100%→-30)\n"
+            "  - ★ 손절률 자동 감점 (50%→-10, 70%→-20, 100%→-30)\n"
             "  - 시장 심리 판단이 실제 결과와 일치했는가?\n"
-            "  - RSI 과매수 종목 진입을 허용했는가? → 허용 시 강한 감점\n"
-            "  - 가격-거래량 다이버전스(가짜 상승)를 감지했는가?\n"
-            "  - bearish 판단 후 포트폴리오가 익절이면 → 과도한 보수성\n"
-            "  - bullish 판단 후 포트폴리오가 손절이면 → 위험 감지 실패\n\n"
+            "  - bearish 판단 후 익절이면 → 과도한 보수성 / bullish 후 손절이면 → 위험 감지 실패\n\n"
             "■ asset_manager (자산 운용가)\n"
-            "  - 투자 비율이 적절했는가? (손절 후 비율 축소, 익절 후 비율 유지/확대)\n"
-            "  - 투자 보류 판단이 합당했는가?\n\n"
+            "  - ★★ 책임: 총 자산이 감소했으면 이것은 실패다\n"
+            "  - ★ 순손실 발생 시 자동 감점 (손실률 1%→-10, 2%→-20, 3%이상→-30)\n"
+            "  - 손절이 반복되는데 투자 비율을 줄이지 않았으면 → 리스크 관리 실패, 강한 감점\n"
+            "  - 투자 보류가 잦으면 → 기회비용 발생, 감점\n"
+            "  - 비율만 조정하고 실제 손실을 막지 못했다면 → 역할을 다하지 못한 것\n\n"
+            "■ investment_strategist (투자 전문가)\n"
+            "  - 기회 포착 능력: 진입 시점이 수익으로 연결됐는가?\n"
+            "  - 투자 강행 판단이 손절로 끝났으면 → 과도한 공격성, 감점\n"
+            "  - 투자 보류 판단이 옳았는가? (보류 후 시장이 하락했으면 +, 상승했으면 -)\n"
+            "  - opportunity_score가 높았는데 손절이면 → 기회 판단 오류, 강한 감점\n"
+            "  - 자산 운용가와 의견 충돌 시 결과가 어땠는가?\n\n"
             "■ buy_strategist (매수 전문가)\n"
-            "  - ★ 손절률이 높으면 자동 감점됩니다 (50%→-10, 70%→-15, 100%→-20)\n"
-            "  - RSI 과매수(>70) 코인을 포트폴리오에 포함했는가? → 즉시 감점\n"
-            "  - MACD 하락/데드크로스인 코인 비중이 높았는가?\n"
-            "  - 선정된 8개 코인의 분산 효과는?\n"
-            "  - TP/SL 설정이 현실적이었는가?\n\n"
+            "  - ★ 손절률 자동 감점 (50%→-10, 70%→-15, 100%→-20)\n"
+            "  - RSI 과매수(>70) 코인 포함 → 즉시 감점\n"
+            "  - MACD 하락/데드크로스 코인 비중이 높았는가?\n"
+            "  - 8개 코인 분산 효과와 TP/SL 설정의 현실성\n\n"
             "■ sell_strategist (매도 전문가)\n"
-            "  - TP/SL 조정 타이밍이 적절했는가?\n"
-            "  - 기회비용이 발생했는가? (보유 시간 대비 수익률)\n"
+            "  - TP/SL 조정 타이밍과 기회비용\n"
             "  - 불필요한 조정으로 혼란을 야기했는가?\n\n"
             "■ portfolio_evaluator (포트폴리오 평가가)\n"
-            "  - 제안한 TP/SL이 다음 사이클에서 효과적이었는가?\n"
-            "  - 교훈(lesson)이 실제로 유용했는가?\n\n"
+            "  - ★★★ 가장 중요: 손절 발생 시 이 전문가가 가장 큰 책임을 진다\n"
+            "  - ★ 손절 자동 감점 (50%→-15, 70%→-25, 100%→-35) — 가장 강한 패널티\n"
+            "  - ★ 평균 손실 규모 자동 감점 (평균PnL -1%→-5, -2%→-15, -3%이상→-25)\n"
+            "  - 제안한 TP가 너무 높아 달성 못하고 손절됐으면 → 현실성 없는 TP 설정\n"
+            "  - 제안한 SL이 너무 빡빡해 정상 변동성에 손절됐으면 → SL 조정 실패\n"
+            "  - 교훈(lesson)이 다음 사이클에서 실제로 반영됐는가?\n"
+            "  - 익절이 나오면 +20점 보너스 (좋은 TP/SL 설정의 직접 증거)\n\n"
             "【점수 부여 기준】\n"
             "- 80+: 탁월함. 판단이 매매 성과에 직접 기여\n"
             "- 60~79: 양호함. 개선 여지 있으나 큰 문제 없음\n"
             "- 40~59: 미흡함. 명확한 개선 필요\n"
-            "- 40 미만: 심각함. 즉시 전략 전환 필요"
+            "- 40 미만: 심각함. 즉시 전략 전환 필요\n"
+            "★ LLM 기본 점수가 70점 근처에 몰리는 현상을 경계하라.\n"
+            "  실제 성과 데이터를 보고 냉정하게 평가해야 한다. 손절이 많으면 40점대가 정상이다."
         )
 
     def execute(self, context: dict) -> dict:
@@ -141,7 +152,7 @@ JSON으로만 응답 (마크다운 코드블록 없이):
   {{"role": "asset_manager", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve", "reflection": "...", "prompt_summary": "..."}},
   {{"role": "buy_strategist", "score": 65, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve", "reflection": "...", "prompt_summary": "..."}},
   {{"role": "sell_strategist", "score": 60, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "critical", "reflection": "...", "prompt_summary": "..."}},
-  {{"role": "portfolio_evaluator", "score": 70, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "reinforce", "reflection": "...", "prompt_summary": "..."}},
+  {{"role": "portfolio_evaluator", "score": 35, "strengths": "...", "weaknesses": "손절 2건 발생으로 파라미터 제안 실패", "directive": "손절 발생 직후 SL을 즉시 좁히고 TP를 낮춰 안전한 청산 유도", "priority": "critical", "reflection": "저는 이번에 손절 2건을 막지 못했습니다. SL 범위를 더 좁게 조정하겠습니다.", "prompt_summary": "손절 2건 — SL 즉시 축소 필수"}},
   {{"role": "coin_profile_analyst", "score": 65, "strengths": "...", "weaknesses": "...", "directive": "...", "priority": "improve", "reflection": "...", "prompt_summary": "..."}}
 ]}}"""
 
@@ -293,10 +304,12 @@ JSON으로만 응답 (마크다운 코드블록 없이):
 
     @staticmethod
     def _calc_stop_loss_penalty(trade_results: list) -> dict[str, float]:
-        """손절률 기반으로 시장 분석가·매수 전문가에 명시적 감점 산출
+        """손절률·평균 수익률 기반 명시적 감점 산출
 
-        손절이 반복되면 LLM 판단과 무관하게 자동 감점됩니다.
-        이는 '쓰레기 종목만 선정하는' 패턴을 확실히 벌하기 위함입니다.
+        손절이 반복되거나 전체 손실이 누적되면 LLM 판단과 무관하게 자동 감점.
+        - market_analyst / buy_strategist: 손절률 기반
+        - portfolio_evaluator: 손절률 기반 (가장 강하게)
+        - asset_manager: 평균 PnL 기반 (총 자산 감소 책임)
 
         Returns:
             {role: penalty_points} — 해당 role에 차감할 점수
@@ -305,35 +318,57 @@ JSON으로만 응답 (마크다운 코드블록 없이):
             return {}
 
         total = len(trade_results)
+        if total == 0:
+            return {}
+
         stop_losses = sum(
             1 for r in trade_results
             if isinstance(r, dict) and r.get("exit_type") == "stop_loss"
         )
-
-        if total == 0:
-            return {}
-
         sl_rate = stop_losses / total
+
+        # 평균 PnL 계산 (asset_manager 감점용)
+        pnl_values = [
+            float(r["pnl_pct"])
+            for r in trade_results
+            if isinstance(r, dict) and r.get("pnl_pct") is not None
+        ]
+        avg_pnl = sum(pnl_values) / len(pnl_values) if pnl_values else 0.0
+
         penalty: dict[str, float] = {}
 
-        # 손절률 50% 이상: 시장 분석가 -10, 매수 전문가 -10
-        # 손절률 70% 이상: 시장 분석가 -20, 매수 전문가 -15
-        # 손절률 100%:     시장 분석가 -30, 매수 전문가 -20
-
+        # ── 손절률 기반 감점 ─────────────────────────
+        # 손절률 50% 이상: 시장 분석가 -10, 매수 전문가 -10, 포트폴리오 평가가 -15
+        # 손절률 70% 이상: 시장 분석가 -20, 매수 전문가 -15, 포트폴리오 평가가 -25
+        # 손절률 100%:     시장 분석가 -30, 매수 전문가 -20, 포트폴리오 평가가 -35
         if sl_rate >= 1.0:
             penalty["market_analyst"] = 30
             penalty["buy_strategist"] = 20
+            penalty["portfolio_evaluator"] = 35
         elif sl_rate >= 0.7:
             penalty["market_analyst"] = 20
             penalty["buy_strategist"] = 15
+            penalty["portfolio_evaluator"] = 25
         elif sl_rate >= 0.5:
             penalty["market_analyst"] = 10
             penalty["buy_strategist"] = 10
+            penalty["portfolio_evaluator"] = 15
+
+        # ── 평균 PnL 기반 asset_manager 감점 ────────
+        # 평균 수익률 -1% 미만: -10
+        # 평균 수익률 -2% 미만: -20
+        # 평균 수익률 -3% 미만: -30
+        if avg_pnl < -3.0:
+            penalty["asset_manager"] = 30
+        elif avg_pnl < -2.0:
+            penalty["asset_manager"] = 20
+        elif avg_pnl < -1.0:
+            penalty["asset_manager"] = 10
 
         if penalty:
             logger.info(
-                f"[MetaEvaluator] 손절률 {sl_rate:.0%} "
-                f"({stop_losses}/{total}건) → 감점: {penalty}"
+                f"[MetaEvaluator] 손절률 {sl_rate:.0%} ({stop_losses}/{total}건) "
+                f"| 평균 PnL {avg_pnl:.2f}% → 감점: {penalty}"
             )
 
         return penalty
