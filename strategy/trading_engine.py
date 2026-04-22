@@ -4,8 +4,8 @@
   1. CoinSelector 사전 필터링 → AI 8개 코인 포트폴리오 선정
   2. 가용 KRW를 8등분하여 각 코인 매수
   3. 포트폴리오 종합 P&L 기반 스마트 매도 감시
-     - 낙폭별 분할 매도: -1.0% → 33%, -1.5% → 33%, -2.0% → 전량
-     - 트레일링 익절: TP 도달 시 고점 추적
+     - 낙폭별 분할 매도: -1.0% → AI 평가 기반 비율(33~67%), -1.5% → 잔여 전량
+     - 트레일링 익절: TP 도달 시 고점 추적 (0.3% 하락 시 실현)
   4. 매도 완료 → 성과 평가 → 1번으로
 """
 import json
@@ -43,6 +43,9 @@ _HOLD_WAIT_MINUTES = 30
 # 지정가 매도: 시도별 가격 조정 배율 (1→0.998→0.995), 실패 시 시장가
 _LIMIT_SELL_PRICE_ADJ = [1.0, 0.998, 0.995]
 _LIMIT_SELL_WAIT_SEC = 5.0
+# 분할 매도 손절 라인
+_TIER1_SL_PCT = -1.0    # 1차 분할 매도 진입점 (AI 평가 기반 비율)
+_FINAL_SL_PCT = -1.5    # 최대 손절 하드캡 (잔여 전량 매도)
 
 
 # ================================================================== #
@@ -61,14 +64,14 @@ class _PortfolioExitTracker:
 
     # ── 트레일링 익절 ──
     peak_pnl_pct: float = 0.0
+    trough_pnl_pct: float = 0.0
     trail_offset_pct: float = 0.8
     trailing_since: float = 0.0
     trailing_timeout: float = 1800.0   # 30분
 
     # ── 낙폭별 분할 매도 상태 ──
-    tier1_sold: bool = False    # -1.0% → 33% 매도 완료
-    tier2_sold: bool = False    # -1.5% → 33% 추가 매도 완료
-    # -2.0% → 잔여 전량 매도 (최종 손절)
+    tier1_sold: bool = False    # -1.0% → AI 평가 비율 매도 완료
+    # -1.5% → 잔여 전량 매도 (최종 손절 하드캡)
 
     # ── 피라미딩 추가 매수 ──
     pyramid_done: bool = False          # 이미 실행했거나 포기 결정된 경우
@@ -601,9 +604,12 @@ class TradingEngine:
                     logger.warning(f"[매수 실패] {coin.symbol}: {result}")
                     continue
 
+                order_data = result.get("data", {})
+                buy_order_uuid = order_data.get("uuid", "") if isinstance(order_data, dict) else ""
+
                 time.sleep(_BUY_INTERVAL_SEC)
                 after_units = self._client.get_coin_balance(coin.symbol)
-                # 업비트 비동기 체결: 0이면 최대 3회 재시도 (체결 대기)
+                # 비동기 체결: 0이면 최대 3회 재시도 (체결 대기)
                 if after_units <= 0:
                     for _retry in range(3):
                         time.sleep(1.0)
@@ -626,13 +632,32 @@ class TradingEngine:
                     )
                     units = after_units
 
-                # 실제 평균 체결가 = 투입금액 / 실제 매수 수량
-                actual_buy_price = per_coin_amount / units
+                # 거래소 체결가 조회 — order_uuid 있으면 실제 avg_price 우선, 없으면 투입금/수량 계산
+                actual_buy_price = per_coin_amount / units  # fallback
+                actual_krw = per_coin_amount
+                if buy_order_uuid:
+                    try:
+                        order_info = self._client.get_order_by_uuid(buy_order_uuid)
+                        # state=done + executed_volume>0 일 때만 사용
+                        # wait 상태이면 avg_price=null → price(KRW 투입금액)로 fallback되어 단가 오인
+                        if (order_info
+                                and order_info.get("state") == "done"
+                                and order_info.get("executed_volume", 0) > 0
+                                and order_info.get("avg_price", 0) > 0):
+                            actual_buy_price = order_info["avg_price"]
+                            if order_info.get("executed_funds", 0) > 0:
+                                actual_krw = order_info["executed_funds"]
+                            logger.debug(
+                                f"  [체결가 확인] {coin.symbol} "
+                                f"avg={actual_buy_price:,.0f}원 실체결={actual_krw:,.0f}원"
+                            )
+                    except Exception as _e:
+                        logger.debug(f"  [체결가 조회 실패] {coin.symbol}: {_e} — 계산값 사용")
 
                 self._repo.save_trade(
                     symbol=coin.symbol, side="buy",
                     price=actual_buy_price, units=units,
-                    krw_amount=per_coin_amount, note=coin.reason,
+                    krw_amount=actual_krw, note=coin.reason,
                     portfolio_id=portfolio.id,
                 )
                 self._repo.open_position(
@@ -640,7 +665,7 @@ class TradingEngine:
                     symbol=coin.symbol,
                     units=units,
                     buy_price=actual_buy_price,
-                    buy_krw=per_coin_amount,
+                    buy_krw=actual_krw,
                     agent_reason=coin.reason,
                 )
                 bought_count += 1
@@ -659,6 +684,21 @@ class TradingEngine:
             self._liquidate_all("포트폴리오 구성 실패")
             time.sleep(30)
             return
+
+        # 실체결 기반 총 투입금 보정 — Trade 테이블 buy 합산이 예상 투입금과 다를 수 있음
+        try:
+            actual_total_buy = sum(
+                t.krw_amount for t in self._repo.get_recent_trades(50)
+                if t.portfolio_id == portfolio.id and t.side == "buy"
+            )
+            if actual_total_buy > 0 and abs(actual_total_buy - total_invest) > 100:
+                self._repo.update_portfolio_total_buy(portfolio.id, actual_total_buy)
+                logger.info(
+                    f"[포트폴리오 투입금 보정] {total_invest:,.0f}원 → {actual_total_buy:,.0f}원"
+                )
+                total_invest = actual_total_buy
+        except Exception as _e:
+            logger.warning(f"[포트폴리오 투입금 보정 실패] {_e}")
 
         logger.info(
             f"[포트폴리오 매수 완료] '{portfolio_name}' "
@@ -799,7 +839,7 @@ class TradingEngine:
         logger.debug(
             f"[감시] '{portfolio.name}' 종합={pnl_pct:+.2f}% "
             f"TP=+{portfolio.take_profit_pct}% SL={portfolio.stop_loss_pct}% "
-            f"{'[T1]' if tracker.tier1_sold else ''}{'[T2]' if tracker.tier2_sold else ''}"
+            f"{'[T1]' if tracker.tier1_sold else ''}"
         )
 
         # 보유 기간 최고 수익률 갱신 (양수 신고점만)
@@ -809,6 +849,14 @@ class TradingEngine:
                 self._repo.update_portfolio_peak(portfolio.id, pnl_pct)
             except Exception as e:
                 logger.warning(f"[peak 갱신 오류] {e}")
+
+        # 보유 기간 최저 수익률 갱신 (음수 신저점만)
+        if pnl_pct < tracker.trough_pnl_pct:
+            tracker.trough_pnl_pct = pnl_pct
+            try:
+                self._repo.update_portfolio_trough(portfolio.id, pnl_pct)
+            except Exception as e:
+                logger.warning(f"[trough 갱신 오류] {e}")
 
         # ── 익절 돌파 → 트레일링 모드 ──
         if pnl_pct >= portfolio.take_profit_pct:
@@ -829,33 +877,40 @@ class TradingEngine:
                 except Exception:
                     pass
 
-        # ── Tier 3: -2.0% 전량 매도 (최종 손절) ──
-        elif pnl_pct <= portfolio.stop_loss_pct:
+        # ── 최종 손절: -1.5% 하드캡 → 잔여 전량 매도 ──
+        elif pnl_pct <= _FINAL_SL_PCT:
             logger.warning(
-                f"[최종 손절] '{portfolio.name}' {pnl_pct:+.2f}% <= SL {portfolio.stop_loss_pct}%"
+                f"[최종 손절] '{portfolio.name}' {pnl_pct:+.2f}% <= {_FINAL_SL_PCT}%"
             )
             self._execute_portfolio_sell(
                 portfolio, positions, pnl_pct, coin_details,
-                f"최종 손절 ({pnl_pct:+.2f}% <= SL {portfolio.stop_loss_pct}%)",
+                f"최종 손절 ({pnl_pct:+.2f}% <= {_FINAL_SL_PCT}%)",
                 target_prices=target_prices,
             )
 
-        # ── Tier 2: -1.5% → 33% 추가 매도 ──
-        elif not tracker.tier2_sold and tracker.tier1_sold and pnl_pct <= -1.5:
-            logger.warning(f"[2차 분할 매도] '{portfolio.name}' {pnl_pct:+.2f}% <= -1.5%")
-            self._execute_portfolio_partial_sell(
-                portfolio, positions, ratio=0.5,
-                reason=f"2차 분할 매도 ({pnl_pct:+.2f}% <= -1.5%)",
-                target_prices=target_prices,
+        # ── Tier 1: -1.0% → AI 평가 기반 비율 매도 ──
+        elif not tracker.tier1_sold and pnl_pct <= _TIER1_SL_PCT:
+            sell_ratio = 0.5  # 기본값: 50%
+            sell_reason = "기본"
+            if self._agent:
+                try:
+                    ev = self._agent.evaluate_tier1_sell(
+                        portfolio_name=portfolio.name,
+                        pnl_pct=pnl_pct,
+                        coin_details=coin_details,
+                        holding_minutes=int(holding_minutes),
+                    )
+                    sell_ratio = ev.get("sell_ratio", 0.5)
+                    sell_reason = ev.get("reason", "")
+                except Exception as e:
+                    logger.warning(f"[Tier1 AI 평가 실패] {e} → 기본 50% 적용")
+            logger.warning(
+                f"[1차 분할 매도] '{portfolio.name}' {pnl_pct:+.2f}% <= {_TIER1_SL_PCT}% "
+                f"→ {sell_ratio:.0%} 매도 ({sell_reason})"
             )
-            tracker.tier2_sold = True
-
-        # ── Tier 1: -1.0% → 33% 매도 ──
-        elif not tracker.tier1_sold and pnl_pct <= -1.0:
-            logger.warning(f"[1차 분할 매도] '{portfolio.name}' {pnl_pct:+.2f}% <= -1.0%")
             self._execute_portfolio_partial_sell(
-                portfolio, positions, ratio=0.33,
-                reason=f"1차 분할 매도 ({pnl_pct:+.2f}% <= -1.0%)",
+                portfolio, positions, ratio=sell_ratio,
+                reason=f"1차 분할 매도 {sell_ratio:.0%} ({pnl_pct:+.2f}%, {sell_reason})",
                 target_prices=target_prices,
             )
             tracker.tier1_sold = True
@@ -1013,16 +1068,18 @@ class TradingEngine:
             try:
                 actual_units = self._client.get_coin_balance(pos.symbol)
                 if actual_units <= 0:
-                    # 이미 분할 매도로 전부 팔림 — Trade 테이블에서 실제 수익 조회
+                    # 이미 분할 매도로 전부 팔림 — Trade 테이블에서 원매수금·실제 수익 조회
+                    # pos.buy_krw는 분할 매도 후 잔여분 비례로 줄어든 값이므로 직접 사용 불가
                     coin_sell_krw = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
+                    original_buy_krw = self._repo.get_coin_buy_total(portfolio.id, pos.symbol) or pos.buy_krw
                     coin_pnl = (
-                        (coin_sell_krw - pos.buy_krw) / pos.buy_krw * 100
-                        if pos.buy_krw > 0 else 0.0
+                        (coin_sell_krw - original_buy_krw) / original_buy_krw * 100
+                        if original_buy_krw > 0 else 0.0
                     )
                     coin_results.append({
                         "symbol": pos.symbol,
                         "buy_price": pos.buy_price,
-                        "buy_krw": pos.buy_krw,
+                        "buy_krw": round(original_buy_krw, 0),
                         "sell_price": 0,
                         "sell_krw": round(coin_sell_krw, 0),
                         "pnl_pct": round(coin_pnl, 2),
@@ -1068,9 +1125,10 @@ class TradingEngine:
                     total_sell_krw += pos.buy_krw
 
                 # 분할 매도 포함 코인 전체 손익 — pos.buy_krw는 잔여분 기준이므로 원매수금 조회
-                prior_coin_sell = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
+                # ※ get_coin_sell_total은 방금 save_trade로 저장된 현재 매도 포함이므로
+                #   krw_value를 별도로 더하지 않아야 이중 계산이 방지됨
                 original_buy_krw = self._repo.get_coin_buy_total(portfolio.id, pos.symbol)
-                total_coin_sell = prior_coin_sell + krw_value
+                total_coin_sell = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
                 coin_pnl = (
                     (total_coin_sell - original_buy_krw) / original_buy_krw * 100
                     if original_buy_krw > 0 else 0.0
@@ -1152,7 +1210,7 @@ class TradingEngine:
         elif current_pnl >= 5.0:
             return 0.8
         else:
-            return 0.5
+            return 0.3
 
     # ------------------------------------------------------------------ #
     #  전략 동적 조정 (30분 간격)                                           #
@@ -1179,7 +1237,6 @@ class TradingEngine:
                 original_sl=portfolio.stop_loss_pct,
                 coin_details=coin_details,
                 tier1_sold=tracker.tier1_sold,
-                tier2_sold=tracker.tier2_sold,
             )
 
             if result.get("adjust"):
@@ -1241,7 +1298,9 @@ class TradingEngine:
         for pos in positions:
             try:
                 key = pos.symbol.lower()
-                actual_units = float(balance_data.get(f"available_{key}", 0))
+                # total_ = available + locked (미체결 매도 주문 포함) → 실제 보유량과 일치
+                # available_ 만 쓰면 미체결 매도 주문 중인 수량이 0으로 보여 P&L 오차 발생
+                actual_units = float(balance_data.get(f"total_{key}", 0))
                 avg_buy_price_str = balance_data.get(f"avg_buy_price_{key}")
                 actual_buy_price = float(avg_buy_price_str) if avg_buy_price_str else 0.0
 
@@ -1249,23 +1308,17 @@ class TradingEngine:
                     continue
 
                 units_diff = abs(actual_units - pos.units) / pos.units
-                price_diff = (
-                    abs(actual_buy_price - pos.buy_price) / pos.buy_price
-                    if actual_buy_price > 0 and pos.buy_price > 0 else 0.0
-                )
 
-                need_update = units_diff > 0.005 or price_diff > 0.001
-
-                if need_update:
-                    new_price = actual_buy_price if actual_buy_price > 0 else pos.buy_price
+                # 수량만 보정 — buy_price는 건드리지 않음
+                # 업비트 avg_buy_price는 계좌 전체 역사적 가중평균이라 현재 포트폴리오 단가와 달라
+                # buy_price를 덮어쓰면 P&L이 왜곡됨 (AXL 142% 버그 원인)
+                if units_diff > 0.005:
                     logger.warning(
-                        f"[포지션 보정] {pos.symbol}: "
-                        f"수량 {pos.units:.6f}→{actual_units:.6f} ({units_diff*100:.2f}%), "
-                        f"단가 {pos.buy_price:,.0f}→{new_price:,.0f} ({price_diff*100:.2f}%)"
+                        f"[포지션 수량 보정] {pos.symbol}: "
+                        f"{pos.units:.6f}→{actual_units:.6f} ({units_diff*100:.2f}%)"
                     )
-                    self._repo.reconcile_position(pos.id, actual_units, new_price)
+                    self._repo.update_position_units(pos.id, actual_units)
                     pos.units = actual_units
-                    pos.buy_price = new_price
             except Exception as e:
                 logger.debug(f"[포지션 보정 오류] {pos.symbol}: {e}")
 
@@ -1348,6 +1401,9 @@ class TradingEngine:
                     logger.warning(f"[피라미딩 매수 실패] {pos.symbol}: {result}")
                     continue
 
+                pyr_order_data = result.get("data", {})
+                pyr_order_uuid = pyr_order_data.get("uuid", "") if isinstance(pyr_order_data, dict) else ""
+
                 time.sleep(_BUY_INTERVAL_SEC)
                 add_units = self._client.get_coin_balance(pos.symbol) - pos.units
                 if add_units <= 0:
@@ -1362,12 +1418,26 @@ class TradingEngine:
                     logger.warning(f"[피라미딩 체결 미확인] {pos.symbol} — 스킵")
                     continue
 
+                # 거래소 체결가 조회 — 실체결가 우선, 없으면 계산값 fallback
                 actual_add_price = per_coin_add / add_units
+                actual_add_krw = per_coin_add
+                if pyr_order_uuid:
+                    try:
+                        pyr_info = self._client.get_order_by_uuid(pyr_order_uuid)
+                        if (pyr_info
+                                and pyr_info.get("state") == "done"
+                                and pyr_info.get("executed_volume", 0) > 0
+                                and pyr_info.get("avg_price", 0) > 0):
+                            actual_add_price = pyr_info["avg_price"]
+                            if pyr_info.get("executed_funds", 0) > 0:
+                                actual_add_krw = pyr_info["executed_funds"]
+                    except Exception as _e:
+                        logger.debug(f"  [피라미딩 체결가 조회 실패] {pos.symbol}: {_e}")
 
                 self._repo.save_trade(
                     symbol=pos.symbol, side="buy",
                     price=actual_add_price, units=add_units,
-                    krw_amount=per_coin_add,
+                    krw_amount=actual_add_krw,
                     note=f"피라미딩 추가매수 ({pnl_pct:+.2f}%)",
                     portfolio_id=portfolio.id,
                 )
@@ -1375,7 +1445,7 @@ class TradingEngine:
                     portfolio_id=portfolio.id,
                     symbol=pos.symbol,
                     add_units=add_units,
-                    add_krw=per_coin_add,
+                    add_krw=actual_add_krw,
                 )
                 bought += 1
                 logger.info(
