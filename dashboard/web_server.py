@@ -39,9 +39,13 @@ _KST = timezone(timedelta(hours=9))
 if settings.EXCHANGE_PROVIDER == "upbit":
     _MONITOR_NAME = "Kuromi Monitor"
     _PROFILE_IMG  = _APP_DIR / "kuromi.png"
+    _SELL_FEE_RATE = 0.0005   # 업비트 KRW 시장 수수료 0.05%
+    _SELL_FEE_LABEL = "업비트 0.05%"
 else:
     _MONITOR_NAME = "Pochaco Monitor"
     _PROFILE_IMG  = _APP_DIR / "profile.png"
+    _SELL_FEE_RATE = 0.0004   # 빗썸 KRW 시장 수수료 0.04%
+    _SELL_FEE_LABEL = "빗썸 0.04%"
 
 
 def _to_kst(dt: datetime) -> datetime:
@@ -164,8 +168,11 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                     # 분할 매도가 있으면 원매수금·이미 실현된 매도금 조회해 정확한 손익 계산
                     original_buy_krw = repo.get_coin_buy_total(pf.id, pos.symbol) or pos.buy_krw
                     sold_krw = repo.get_coin_sell_total(pf.id, pos.symbol)
+
+                    # 예상 매도 수수료 적용 (미실현 잔여 수량에만 적용; sold_krw는 이미 수수료 반영됨)
+                    estimated_sell_fee = coin_value * _SELL_FEE_RATE
                     # sold_krw는 KRW 잔고에 이미 반영됨 → P&L 계산에만 포함, 총 자산 계산에서 제외
-                    true_total_value = coin_value + sold_krw
+                    true_total_value = (coin_value - estimated_sell_fee) + sold_krw
                     coin_pnl_krw = true_total_value - original_buy_krw
                     coin_pnl_pct = coin_pnl_krw / original_buy_krw * 100 if original_buy_krw > 0 else 0.0
 
@@ -181,6 +188,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                         "current_value": round(coin_value, 0),
                         "pnl_pct": round(coin_pnl_pct, 2),
                         "pnl_krw": round(coin_pnl_krw, 0),
+                        "estimated_fee": round(estimated_sell_fee, 0),
                         "reason": pos.agent_reason or "",
                     })
                 except Exception:
@@ -194,6 +202,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                         "current_value": round(pos.buy_krw, 0),
                         "pnl_pct": 0.0,
                         "pnl_krw": 0.0,
+                        "estimated_fee": 0.0,
                         "reason": pos.agent_reason or "",
                     })
                     total_buy += pos.buy_krw
@@ -215,6 +224,8 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                 "total_current_value": round(total_coin_value, 0),
                 "pnl_pct": round(pf_pnl_pct, 2),
                 "pnl_krw": round(pf_pnl_krw, 0),
+                "fee_rate": _SELL_FEE_RATE,
+                "fee_label": _SELL_FEE_LABEL,
                 "take_profit_pct": pf.take_profit_pct,
                 "stop_loss_pct": pf.stop_loss_pct,
                 "held_minutes": round(held_min, 1),
@@ -851,22 +862,26 @@ def _render_html(data: dict) -> str:
                 f'</tr>'
             )
 
+        fee_note = f'<span style="font-size:0.72rem;color:#64748b;font-weight:400;"> ({_SELL_FEE_LABEL})</span>'
         coins_table = (
             '<table style="margin-top:10px;">'
-            '<tr><th>코인</th><th style="text-align:right">매수가</th>'
-            '<th style="text-align:right">현재가</th>'
-            '<th style="text-align:right">수익률</th>'
-            '<th style="text-align:right">손익(원)</th></tr>'
+            f'<tr><th>코인</th><th style="text-align:right">매수가</th>'
+            f'<th style="text-align:right">현재가</th>'
+            f'<th style="text-align:right">수익률{fee_note}</th>'
+            f'<th style="text-align:right">손익(원)</th></tr>'
             f'{coin_rows}</table>'
         )
 
         position_html = f"""
         <div class="big-num {pnl_color}">{pnl_pct:+.2f}%</div>
+        <div class="sub" style="font-size:0.75rem; color:#64748b;">수수료 반영 ({_SELL_FEE_LABEL})</div>
         <div class="sub" style="font-size:1.1em; font-weight:600;">{pf['name']}</div>
         <div class="sub">{pf['coin_count']}개 코인 | 투입 {pf['total_buy_krw']:,.0f}원</div>
         <br>
         <div class="stat-row">
-          <span class="stat-label">평가 손익</span>
+          <span class="stat-label">평가 손익
+            <span style="font-size:0.72rem;color:#64748b;"> (수수료반영)</span>
+          </span>
           <span class="stat-value {pnl_color}">{pf['pnl_krw']:+,.0f} 원</span>
         </div>
         <div class="stat-row">
@@ -1174,7 +1189,7 @@ function showPfTx(idx) {
     + '<div class="stat-row"><span class="stat-label">종목 수</span><span class="stat-value">' + d.coin_count + '개</span></div>'
     + '<div class="stat-row"><span class="stat-label">매수 금액</span><span class="stat-value">' + buyFmt + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">매도 금액</span><span class="stat-value">' + sellFmt + '</span></div>'
-    + '<div class="stat-row"><span class="stat-label">수익률</span><span class="stat-value" style="color:' + pnlColor + '">' + sign + d.pnl_pct.toFixed(2) + '%</span></div>'
+    + '<div class="stat-row"><span class="stat-label">수익률 <span style="font-size:0.72rem;color:#64748b;">(수수료반영)</span></span><span class="stat-value" style="color:' + pnlColor + '">' + sign + d.pnl_pct.toFixed(2) + '%</span></div>'
     + '<div class="stat-row"><span class="stat-label">손익(원)</span><span class="stat-value" style="color:' + pnlColor + '">' + pnlKrwFmt + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">TP / SL 설정</span><span class="stat-value">' + tpSlStr + '</span></div>';
 
