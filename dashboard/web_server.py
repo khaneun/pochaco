@@ -53,6 +53,20 @@ def _to_kst(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc).astimezone(_KST)
 
 
+def _pct_disp(val: float) -> tuple[str, str]:
+    """수익률 (표시 텍스트, CSS 색상 클래스) — 0이면 부호 없이 gray"""
+    if val == 0.0:
+        return "0.00%", "gray"
+    return f"{val:+.2f}%", "green" if val > 0 else "red"
+
+
+def _krw_disp(val: float, suffix: str = "원") -> tuple[str, str]:
+    """손익금액 (표시 텍스트, CSS 색상 클래스) — 0이면 부호 없이 gray"""
+    if val == 0.0:
+        return f"0{suffix}", "gray"
+    return f"{val:+,.0f}{suffix}", "green" if val > 0 else "red"
+
+
 def _kst_now() -> datetime:
     return datetime.now(tz=_KST)
 
@@ -755,7 +769,8 @@ def _render_html(data: dict) -> str:
     # 포트폴리오 HTML
     if pf:
         pnl_pct = pf["pnl_pct"]
-        pnl_color = "green" if pnl_pct >= 0 else "red"
+        _pct_txt, pnl_color = _pct_disp(pnl_pct)
+        _pnl_krw_txt, _pnl_krw_color = _krw_disp(pf["pnl_krw"], " 원")
         held = pf["held_minutes"]
         held_str = f"{held / 60:.1f}시간" if held >= 60 else f"{held:.0f}분"
         peak_pnl_pct = pf.get("peak_pnl_pct", 0.0)
@@ -843,7 +858,7 @@ def _render_html(data: dict) -> str:
         </div>
         <!-- 현재/고점/저점 수치 -->
         <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px; text-align:center;">
-          현재 <span class="{pnl_color}" style="font-weight:600;">{pnl_pct:+.2f}%</span>
+          현재 <span class="{pnl_color}" style="font-weight:600;">{_pct_txt}</span>
           {"&nbsp;|&nbsp; 고점 <span style='color:#fb923c; font-weight:600;'>" + f"{peak_pnl_pct:+.2f}%" + "</span>" if peak_pnl_pct > 0.05 else ""}
           {"&nbsp;|&nbsp; 저점 <span style='color:#38bdf8; font-weight:600;'>" + f"{trough_pnl_pct:+.2f}%" + "</span>" if trough_pnl_pct < -0.05 else ""}
         </div>"""
@@ -851,14 +866,15 @@ def _render_html(data: dict) -> str:
         # 개별 코인 테이블
         coin_rows = ""
         for c in pf.get("coins", []):
-            c_color = "green" if c["pnl_pct"] >= 0 else "red"
+            c_pct_txt, c_pct_color = _pct_disp(c["pnl_pct"])
+            c_krw_txt, c_krw_color = _krw_disp(c["pnl_krw"])
             coin_rows += (
                 f'<tr>'
                 f'<td><b>{c["symbol"]}</b></td>'
                 f'<td style="text-align:right">{c["buy_price"]:,.0f}</td>'
                 f'<td style="text-align:right">{c["current_price"]:,.0f}</td>'
-                f'<td style="text-align:right" class="{c_color}">{c["pnl_pct"]:+.2f}%</td>'
-                f'<td style="text-align:right" class="{c_color}">{c["pnl_krw"]:+,.0f}</td>'
+                f'<td style="text-align:right" class="{c_pct_color}">{c_pct_txt}</td>'
+                f'<td style="text-align:right" class="{c_krw_color}">{c_krw_txt}</td>'
                 f'</tr>'
             )
 
@@ -873,7 +889,7 @@ def _render_html(data: dict) -> str:
         )
 
         position_html = f"""
-        <div class="big-num {pnl_color}">{pnl_pct:+.2f}%</div>
+        <div class="big-num {pnl_color}">{_pct_txt}</div>
         <div class="sub" style="font-size:0.75rem; color:#64748b;">수수료 반영 ({_SELL_FEE_LABEL})</div>
         <div class="sub" style="font-size:1.1em; font-weight:600;">{pf['name']}</div>
         <div class="sub">{pf['coin_count']}개 코인 | 투입 {pf['total_buy_krw']:,.0f}원</div>
@@ -882,7 +898,7 @@ def _render_html(data: dict) -> str:
           <span class="stat-label">평가 손익
             <span style="font-size:0.72rem;color:#64748b;"> (수수료반영)</span>
           </span>
-          <span class="stat-value {pnl_color}">{pf['pnl_krw']:+,.0f} 원</span>
+          <span class="stat-value {_pnl_krw_color}">{_pnl_krw_txt}</span>
         </div>
         <div class="stat-row">
           <span class="stat-label">익절 / 손절</span>
@@ -925,7 +941,8 @@ def _render_html(data: dict) -> str:
     if pf:
         idx = len(pf_tx_popup_list)
         open_pnl_krw = pf["pnl_krw"]
-        open_pnl_color = "green" if open_pnl_krw > 0 else ("red" if open_pnl_krw < 0 else "gray")
+        _op_pct_txt, open_pnl_color = _pct_disp(pf["pnl_pct"])
+        _op_krw_txt, _ = _krw_disp(open_pnl_krw)
         held_str_open = _fmt_held(pf["held_minutes"])
         _dt_parts = pf["opened_at"].split(" ")
         _dt_date = _dt_parts[0] if _dt_parts else ""
@@ -936,8 +953,8 @@ def _render_html(data: dict) -> str:
             f"<div class='pf-tx-nm'><b>[{pf['coin_count']}] {pf['name']}</b></div>"
             f"<span class='pf-tx-held'>⏱ {held_str_open}</span>"
             f"<div class='pf-tx-pnl'>"
-            f"<div class='pf-tx-pnl-r {open_pnl_color}'>{pf['pnl_pct']:+.2f}%</div>"
-            f"<div class='pf-tx-pnl-k {open_pnl_color}'>{open_pnl_krw:+,.0f}원</div>"
+            f"<div class='pf-tx-pnl-r {open_pnl_color}'>{_op_pct_txt}</div>"
+            f"<div class='pf-tx-pnl-k {open_pnl_color}'>{_op_krw_txt}</div>"
             f"</div>"
             f"</div>"
         )
@@ -981,7 +998,8 @@ def _render_html(data: dict) -> str:
         )
         coin_count = ev.get("coin_count", "?")
         pnl_krw = ev.get("pnl_krw") or 0
-        pnl_color = "green" if pnl_krw > 0 else ("red" if pnl_krw < 0 else "gray")
+        _ev_pct_txt, pnl_color = _pct_disp(ev["pnl_pct"])
+        _ev_krw_txt, _ = _krw_disp(pnl_krw)
         held_str_closed = _fmt_held(ev["held_minutes"])
         _dt_parts = ev["time"].split(" ")
         _dt_date = _dt_parts[0] if _dt_parts else ""
@@ -993,8 +1011,8 @@ def _render_html(data: dict) -> str:
             f"<div class='pf-tx-nm'>{trade_mode_badge}<b>[{coin_count}] {ev['portfolio_name']}</b></div>"
             f"<span class='pf-tx-held'>⏱ {held_str_closed}</span>"
             f"<div class='pf-tx-pnl'>"
-            f"<div class='pf-tx-pnl-r {pnl_color}'>{ev['pnl_pct']:+.2f}%</div>"
-            f"<div class='pf-tx-pnl-k {pnl_color}'>{pnl_krw:+,.0f}원</div>"
+            f"<div class='pf-tx-pnl-r {pnl_color}'>{_ev_pct_txt}</div>"
+            f"<div class='pf-tx-pnl-k {pnl_color}'>{_ev_krw_txt}</div>"
             f"</div>"
             f"</div>"
         )
@@ -1102,12 +1120,17 @@ def _render_html(data: dict) -> str:
     if manual_list:
         mrows = ""
         for m in manual_list:
-            pnl_c = "green" if (m.get("pnl_pct") or 0) >= 0 else "red"
             t_parts = m["time"].split(" ")
             t_date = t_parts[0] if len(t_parts) > 0 else m["time"]
             t_hms  = t_parts[1] if len(t_parts) > 1 else ""
-            pnl_str = f'{m["pnl_pct"]:+.2f}%' if m.get("pnl_pct") is not None else "—"
-            pnl_krw_str = f'{m["pnl_krw"]:+,.0f}원' if m.get("pnl_krw") is not None else "—"
+            if m.get("pnl_pct") is not None:
+                pnl_str, pnl_c = _pct_disp(m["pnl_pct"])
+            else:
+                pnl_str, pnl_c = "—", "gray"
+            if m.get("pnl_krw") is not None:
+                pnl_krw_str, _ = _krw_disp(m["pnl_krw"])
+            else:
+                pnl_krw_str = "—"
             held_str = f'{m["held_min"]:.0f}분' if m.get("held_min") is not None else "—"
             mrows += (
                 f"<tr>"
@@ -1157,8 +1180,9 @@ def _render_html(data: dict) -> str:
 function showPfTx(idx) {
   var d = _pfTxPopup[idx];
   if (!d) return;
-  var pnlColor = d.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
-  var sign = d.pnl_pct >= 0 ? '+' : '';
+  var pnlColor = d.pnl_pct > 0 ? '#f87171' : (d.pnl_pct < 0 ? '#60a5fa' : '#94a3b8');
+  var pnlPctStr = d.pnl_pct === 0 ? '0.00%' : ((d.pnl_pct > 0 ? '+' : '') + d.pnl_pct.toFixed(2) + '%');
+  var sign = d.pnl_pct > 0 ? '+' : '';
   var statusBadge = d.is_open
     ? '<span style="background:#1d4ed8;color:#bfdbfe;padding:2px 8px;border-radius:4px;font-size:0.78rem;">보유 중</span>'
     : (d.exit_type === 'take_profit'
@@ -1174,7 +1198,9 @@ function showPfTx(idx) {
     : (d.held_str || '—');
   var buyFmt = d.total_buy_krw ? d.total_buy_krw.toLocaleString('ko-KR') + '원' : '—';
   var sellFmt = d.total_sell_krw ? d.total_sell_krw.toLocaleString('ko-KR') + '원' : '—';
-  var pnlKrwFmt = d.pnl_krw ? (d.pnl_krw >= 0 ? '+' : '') + d.pnl_krw.toLocaleString('ko-KR') + '원' : '—';
+  var pnlKrwFmt = (d.pnl_krw == null) ? '—'
+    : (d.pnl_krw === 0 ? '0원'
+    : ((d.pnl_krw > 0 ? '+' : '') + d.pnl_krw.toLocaleString('ko-KR') + '원'));
   var tpSlStr = (d.take_profit_pct ? '<span style="color:#f87171">+' + d.take_profit_pct + '%</span>' : '—')
     + ' / ' + (d.stop_loss_pct ? '<span style="color:#60a5fa">' + d.stop_loss_pct + '%</span>' : '—');
 
@@ -1189,7 +1215,7 @@ function showPfTx(idx) {
     + '<div class="stat-row"><span class="stat-label">종목 수</span><span class="stat-value">' + d.coin_count + '개</span></div>'
     + '<div class="stat-row"><span class="stat-label">매수 금액</span><span class="stat-value">' + buyFmt + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">매도 금액</span><span class="stat-value">' + sellFmt + '</span></div>'
-    + '<div class="stat-row"><span class="stat-label">수익률 <span style="font-size:0.72rem;color:#64748b;">(수수료반영)</span></span><span class="stat-value" style="color:' + pnlColor + '">' + sign + d.pnl_pct.toFixed(2) + '%</span></div>'
+    + '<div class="stat-row"><span class="stat-label">수익률 <span style="font-size:0.72rem;color:#64748b;">(수수료반영)</span></span><span class="stat-value" style="color:' + pnlColor + '">' + pnlPctStr + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">손익(원)</span><span class="stat-value" style="color:' + pnlColor + '">' + pnlKrwFmt + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">TP / SL 설정</span><span class="stat-value">' + tpSlStr + '</span></div>';
 
@@ -1205,7 +1231,7 @@ function showPfTx(idx) {
         return (clamped + sl) / totalRange * 100;
       }
       var curPos = gaugePos(d.pnl_pct);
-      var curColor = d.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
+      var curColor = d.pnl_pct > 0 ? '#f87171' : (d.pnl_pct < 0 ? '#60a5fa' : '#94a3b8');
       var fillLeft = Math.min(curPos, zeroPos);
       var fillWidth = Math.abs(curPos - zeroPos);
       var peakPnl = d.peak_pnl_pct || 0;
@@ -1222,7 +1248,7 @@ function showPfTx(idx) {
       var hdrExtra = '';
       if (peakPos !== null && peakPnl > d.pnl_pct + 0.05) hdrExtra += '<span style="color:#fb923c;">▼ 고점 ' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(1) + '%</span> ';
       if (troughPos !== null && troughPnl < d.pnl_pct - 0.05) hdrExtra += '<span style="color:#38bdf8;">▲ 저점 ' + troughPnl.toFixed(1) + '%</span>';
-      var bottomRow = '현재 <b style="color:' + curColor + ';">' + sign + d.pnl_pct.toFixed(2) + '%</b>';
+      var bottomRow = '현재 <b style="color:' + curColor + ';">' + pnlPctStr + '</b>';
       if (peakPos !== null && peakPnl > 0.05) bottomRow += ' &nbsp;|&nbsp; 고점 <b style="color:#fb923c;">' + (peakPnl >= 0 ? '+' : '') + peakPnl.toFixed(2) + '%</b>';
       if (troughPos !== null && troughPnl < -0.05) bottomRow += ' &nbsp;|&nbsp; 저점 <b style="color:#38bdf8;">' + troughPnl.toFixed(2) + '%</b>';
       html += '<div style="margin-top:10px;font-size:0.78rem;color:#94a3b8;margin-bottom:4px;">손절/익절 게이지 <span style="float:right;font-size:0.7rem;">' + hdrExtra + '</span></div>'
@@ -1256,12 +1282,16 @@ function showPfTx(idx) {
         + '<th style="text-align:right;">수익률</th><th style="text-align:right;">손익(원)</th></tr>';
       for (var i = 0; i < d.coins.length; i++) {
         var c = d.coins[i];
-        var cc = c.pnl_pct >= 0 ? '#f87171' : '#60a5fa';
+        var cp = c.pnl_pct || 0, ck = c.pnl_krw || 0;
+        var cc = cp > 0 ? '#f87171' : (cp < 0 ? '#60a5fa' : '#94a3b8');
+        var ck_c = ck > 0 ? '#f87171' : (ck < 0 ? '#60a5fa' : '#94a3b8');
+        var cPctStr = cp === 0 ? '0.00%' : ((cp > 0 ? '+' : '') + cp.toFixed(2) + '%');
+        var cKrwStr = ck === 0 ? '0' : ((ck > 0 ? '+' : '') + ck.toLocaleString('ko-KR'));
         html += '<tr><td><b>' + c.symbol + '</b></td>'
           + '<td style="text-align:right">' + (c.buy_price || 0).toLocaleString('ko-KR') + '</td>'
           + '<td style="text-align:right">' + (c.current_price || 0).toLocaleString('ko-KR') + '</td>'
-          + '<td style="text-align:right;color:' + cc + '">' + (c.pnl_pct >= 0 ? '+' : '') + (c.pnl_pct || 0).toFixed(2) + '%</td>'
-          + '<td style="text-align:right;color:' + cc + '">' + (c.pnl_krw >= 0 ? '+' : '') + (c.pnl_krw || 0).toLocaleString('ko-KR') + '</td>'
+          + '<td style="text-align:right;color:' + cc + '">' + cPctStr + '</td>'
+          + '<td style="text-align:right;color:' + ck_c + '">' + cKrwStr + '</td>'
           + '</tr>';
       }
       html += '</table>';
