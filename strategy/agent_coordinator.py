@@ -565,9 +565,8 @@ class AgentCoordinator:
             if updated_symbols:
                 self._log_decision(
                     "coin_profile_analyst", "profile_update",
-                    input_summary=f"포트폴리오 {portfolio_id} 청산 ({exit_type})",
+                    input_summary=f"포트폴리오 {portfolio_name} 청산 ({exit_type})",
                     output_summary=", ".join(updated_symbols),
-                    portfolio_id=portfolio_id,
                 )
 
         return evaluation
