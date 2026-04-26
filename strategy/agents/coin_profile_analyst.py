@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -63,6 +64,26 @@ class CoinProfileAnalyst(BaseSpecialistAgent):
         except Exception as e:
             logger.warning(f"[특성 분석가] {symbol} 프로파일 읽기 실패: {e}")
             return None
+
+    def get_rsi_threshold(self, symbol: str) -> float | None:
+        """코인별 과매수 RSI 임계값 파싱.
+
+        프로파일의 "위험 진입 RSI: XX 이상" 패턴에서 숫자를 추출합니다.
+        프로파일이 없거나 파싱 실패 시 None 반환 → 호출측에서 기본값 사용.
+
+        Args:
+            symbol: 코인 심볼
+
+        Returns:
+            RSI 임계값 (정수), 없으면 None
+        """
+        profile = self.get_profile(symbol)
+        if not profile:
+            return None
+        match = re.search(r'위험\s*진입\s*RSI\s*:\s*(\d+)', profile)
+        if match:
+            return float(match.group(1))
+        return None
 
     def list_profiles(self) -> list[str]:
         """프로파일이 존재하는 코인 심볼 목록 반환"""

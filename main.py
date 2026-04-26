@@ -83,7 +83,6 @@ def main() -> None:
     derivatives = DerivativesClient()
     analyzer    = MarketAnalyzer(client, derivatives=derivatives)
     optimizer   = StrategyOptimizer()
-    selector    = CoinSelector()
 
     # LLM 공급자 (공유)
     llm = get_llm_provider()
@@ -100,6 +99,9 @@ def main() -> None:
         profile_dir=_APP_DIR / "data" / "coin_profiles",
         llm=llm,
     )
+
+    # CoinSelector — 코인별 RSI 임계값을 특성 분석가 프로파일에서 적용
+    selector    = CoinSelector(profile_analyst=coin_profile_analyst)
 
     # 코디네이터 (합의 기반 의사결정)
     coordinator = AgentCoordinator(

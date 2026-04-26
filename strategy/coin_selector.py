@@ -24,8 +24,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .market_analyzer import CoinSnapshot
+
+if TYPE_CHECKING:
+    from strategy.agents.coin_profile_analyst import CoinProfileAnalyst
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,9 @@ class CoinSelector:
     변동성·거래량·모멘텀을 분석하고, 매매 가능한 상위 후보만 반환합니다.
     """
 
+    def __init__(self, profile_analyst: "CoinProfileAnalyst | None" = None):
+        self._profile_analyst = profile_analyst
+
     def filter_and_rank(
         self,
         snapshots: list[CoinSnapshot],
@@ -103,9 +110,23 @@ class CoinSelector:
         """
         cooldown_symbols = cooldown_symbols or set()
 
+        # ── 코인별 RSI 임계값 사전 조회 (특성 분석가 프로파일 기반) ──
+        rsi_thresholds: dict[str, float] = {}
+        if self._profile_analyst:
+            for s in snapshots:
+                t = self._profile_analyst.get_rsi_threshold(s.symbol)
+                if t is not None:
+                    rsi_thresholds[s.symbol] = t
+            if rsi_thresholds:
+                logger.debug(
+                    f"[CoinSelector] 코인별 RSI 임계값 적용: "
+                    f"{len(rsi_thresholds)}개 ({dict(list(rsi_thresholds.items())[:5])}...)"
+                )
+
         # ── 1차 패스: 전체 필터 (변동폭 TP×1.5 포함) ──
         scored, rejected = self._run_filter_pass(
-            snapshots, cooldown_symbols, target_tp, vol_multiplier=1.5,
+            snapshots, cooldown_symbols, target_tp,
+            vol_multiplier=1.5, rsi_thresholds=rsi_thresholds,
         )
         scored.sort(key=lambda x: x[1].total_score, reverse=True)
 
@@ -115,7 +136,8 @@ class CoinSelector:
             # 2차: 변동폭 조건 TP×0.5 (하락추세·거래대금은 유지)
             extra, _ = self._run_filter_pass(
                 [s for s in snapshots if s.symbol not in passed_symbols],
-                cooldown_symbols, target_tp, vol_multiplier=0.5,
+                cooldown_symbols, target_tp,
+                vol_multiplier=0.5, rsi_thresholds=rsi_thresholds,
             )
             extra.sort(key=lambda x: x[1].total_score, reverse=True)
             need = min_candidates - len(scored)
@@ -134,7 +156,7 @@ class CoinSelector:
             extra_nc, _ = self._run_filter_pass(
                 [s for s in snapshots if s.symbol not in passed_symbols],
                 set(),  # 쿨다운 무시
-                target_tp, vol_multiplier=0.5,
+                target_tp, vol_multiplier=0.5, rsi_thresholds=rsi_thresholds,
             )
             extra_nc.sort(key=lambda x: x[1].total_score, reverse=True)
             need = min_candidates - len(scored)
@@ -173,6 +195,7 @@ class CoinSelector:
         cooldown_symbols: set[str],
         target_tp: float,
         vol_multiplier: float,
+        rsi_thresholds: dict[str, float] | None = None,
     ) -> tuple[list[tuple[CoinSnapshot, "CoinScore"]], int]:
         """단일 필터 패스 실행.
 
@@ -181,6 +204,7 @@ class CoinSelector:
             cooldown_symbols: 쿨다운 심볼
             target_tp: 목표 익절%
             vol_multiplier: 변동폭 조건 배수 (target_tp × multiplier)
+            rsi_thresholds: 코인별 RSI 임계값 (없으면 _RSI_OVERBOUGHT 기본값 사용)
 
         Returns:
             (통과 코인 리스트, 제외된 개수)
@@ -227,11 +251,13 @@ class CoinSelector:
 
             # ── 기술 지표 필터 ──
 
-            # RSI 과매수 필터: RSI > 75 → 조정 임박, 진입 금지
-            if ti.rsi_14 >= _RSI_OVERBOUGHT:
+            # RSI 과매수 필터: 코인별 임계값 우선, 없으면 기본값 _RSI_OVERBOUGHT
+            rsi_limit = (rsi_thresholds or {}).get(s.symbol, _RSI_OVERBOUGHT)
+            if ti.rsi_14 >= rsi_limit:
+                src = "프로파일" if (rsi_thresholds or {}).get(s.symbol) else "기본값"
                 logger.debug(
                     f"  [제외] {s.symbol}: RSI 과매수 {ti.rsi_14:.0f} "
-                    f"(≥{_RSI_OVERBOUGHT})"
+                    f"(≥{rsi_limit}, {src})"
                 )
                 rejected += 1
                 continue
