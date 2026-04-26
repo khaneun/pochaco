@@ -978,9 +978,13 @@ class TradingEngine:
 
         for pos in positions:
             try:
-                actual_units = self._client.get_coin_balance(pos.symbol)
-                if actual_units <= 0:
+                # pos.units 기준으로 매도 (get_coin_balance 사용 금지)
+                # — get_coin_balance는 다른 포트폴리오 잔여분까지 포함하여 수량이 부풀려짐
+                # — 지갑이 pos.units보다 적으면(외부 출금 등) 지갑 잔액으로 클램프
+                wallet_units = self._client.get_coin_balance(pos.symbol)
+                if wallet_units <= 0 or pos.units <= 0:
                     continue
+                actual_units = min(pos.units, wallet_units)
 
                 sell_units = actual_units * ratio
 
@@ -1076,7 +1080,9 @@ class TradingEngine:
 
         for pos in positions:
             try:
-                actual_units = self._client.get_coin_balance(pos.symbol)
+                # pos.units 기준으로 청산 (다른 포트폴리오 잔여분 혼입 방지)
+                wallet_units = self._client.get_coin_balance(pos.symbol)
+                actual_units = min(pos.units, wallet_units) if wallet_units > 0 else 0.0
                 if actual_units <= 0:
                     # 이미 분할 매도로 전부 팔림 — Trade 테이블에서 원매수금·실제 수익 조회
                     # pos.buy_krw는 분할 매도 후 잔여분 비례로 줄어든 값이므로 직접 사용 불가
