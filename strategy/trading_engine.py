@@ -1083,6 +1083,7 @@ class TradingEngine:
                         "sell_price": 0,
                         "sell_krw": round(coin_sell_krw, 0),
                         "pnl_pct": round(coin_pnl, 2),
+                        "pnl_krw": round(coin_sell_krw - original_buy_krw, 0),
                         "target_price": tgt_map.get(pos.symbol, 0),
                         "reason": pos.agent_reason or "",
                     })
@@ -1119,10 +1120,11 @@ class TradingEngine:
                         f"[{fill['method']}]"
                     )
                 else:
-                    logger.warning(f"  {pos.symbol} 매도 실패")
-                    krw_value = pos.buy_krw
-                    filled_price = tgt_price
-                    total_sell_krw += pos.buy_krw
+                    # 매도 실패 — 실제로 받은 금액 없으므로 total_sell_krw에 가산하지 않음
+                    # (get_portfolio_sell_total이 실제 Trade 합계만 집계하므로 일관성 유지)
+                    logger.warning(f"  {pos.symbol} 매도 실패 — 손익 집계에서 제외")
+                    filled_price = 0.0
+                    total_sell_krw += 0.0
 
                 # 분할 매도 포함 코인 전체 손익 — pos.buy_krw는 잔여분 기준이므로 원매수금 조회
                 # ※ get_coin_sell_total은 방금 save_trade로 저장된 현재 매도 포함이므로
@@ -1140,6 +1142,7 @@ class TradingEngine:
                     "sell_price": filled_price,
                     "sell_krw": round(total_coin_sell, 0),
                     "pnl_pct": round(coin_pnl, 2),
+                    "pnl_krw": round(total_coin_sell - original_buy_krw, 0),
                     "target_price": tgt_price,
                     "units": fill.get("filled_units", actual_units),
                     "reason": pos.agent_reason or "",
@@ -1148,6 +1151,25 @@ class TradingEngine:
                 time.sleep(_BUY_INTERVAL_SEC)
             except Exception as e:
                 logger.error(f"  {pos.symbol} 매도 오류: {e}")
+                # 예외 발생 코인도 coins_summary에 기록 (누락 방지)
+                try:
+                    _orig_buy = self._repo.get_coin_buy_total(portfolio.id, pos.symbol) or pos.buy_krw
+                    _coin_sell = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
+                    _cpnl = (_coin_sell - _orig_buy) / _orig_buy * 100 if _orig_buy > 0 else 0.0
+                    coin_results.append({
+                        "symbol": pos.symbol,
+                        "buy_price": pos.buy_price,
+                        "buy_krw": round(_orig_buy, 0),
+                        "sell_price": 0.0,
+                        "sell_krw": round(_coin_sell, 0),
+                        "pnl_pct": round(_cpnl, 2),
+                        "pnl_krw": round(_coin_sell - _orig_buy, 0),
+                        "target_price": 0.0,
+                        "reason": pos.agent_reason or "",
+                        "error": True,
+                    })
+                except Exception:
+                    pass
                 self._repo.close_position(pos.id)
 
         # 포트폴리오 종료
@@ -1191,9 +1213,18 @@ class TradingEngine:
             except Exception:
                 pass
 
+        # ── 청산 시점 총 자산 조회 (KRW 잔고 + 매도 수익 기반 추정) ──
+        closing_total_assets = None
+        try:
+            krw_bal = self._client.get_krw_balance()
+            closing_total_assets = krw_bal  # 매도 직후 KRW 잔고 ≈ 총 자산
+        except Exception:
+            pass
+
         # ── 성과 평가 ──
         self._run_post_trade_evaluation(
             portfolio, total_proceeds, pnl_pct_actual, held_min, reason, coin_results,
+            closing_total_assets_krw=closing_total_assets,
         )
 
     # ------------------------------------------------------------------ #
@@ -1480,6 +1511,7 @@ class TradingEngine:
         held_minutes: float,
         reason: str,
         coin_results: list[dict],
+        closing_total_assets_krw: float | None = None,
     ) -> None:
         try:
             if "익절" in reason:
@@ -1537,6 +1569,7 @@ class TradingEngine:
                 adjusted_tp_pct=adj.get("adjusted_tp_pct"),
                 adjusted_sl_pct=adj.get("adjusted_sl_pct"),
                 adjustment_reason=adj.get("adjustment_reason", ""),
+                closing_total_assets_krw=closing_total_assets_krw,
             )
 
             logger.info(

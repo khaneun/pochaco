@@ -130,6 +130,9 @@ class StrategyEvaluation(Base):
     adjusted_sl_pct = Column(Float, nullable=True)
     adjustment_reason = Column(Text, default="")
 
+    # 청산 시점 총 자산 (KRW 잔고 + 미실현 코인 평가액)
+    closing_total_assets_krw = Column(Float, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -287,6 +290,13 @@ def _ensure_schema_updates() -> None:
             conn.execute("ALTER TABLE trades ADD COLUMN target_price FLOAT")
             conn.commit()
             _log.info("[DB 스키마] trades.target_price 컬럼 추가 완료")
+
+        cursor = conn.execute("PRAGMA table_info(strategy_evaluations)")
+        se_columns = {row[1] for row in cursor.fetchall()}
+        if "closing_total_assets_krw" not in se_columns:
+            conn.execute("ALTER TABLE strategy_evaluations ADD COLUMN closing_total_assets_krw FLOAT")
+            conn.commit()
+            _log.info("[DB 스키마] strategy_evaluations.closing_total_assets_krw 컬럼 추가 완료")
 
         cursor = conn.execute("PRAGMA table_info(portfolios)")
         columns = {row[1] for row in cursor.fetchall()}

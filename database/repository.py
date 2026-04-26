@@ -536,6 +536,7 @@ class TradeRepository:
         adjusted_tp_pct: float | None = None,
         adjusted_sl_pct: float | None = None,
         adjustment_reason: str = "",
+        closing_total_assets_krw: float | None = None,
     ) -> StrategyEvaluation:
         with self._session() as db:
             ev = StrategyEvaluation(
@@ -555,6 +556,7 @@ class TradeRepository:
                 adjusted_tp_pct=adjusted_tp_pct,
                 adjusted_sl_pct=adjusted_sl_pct,
                 adjustment_reason=adjustment_reason,
+                closing_total_assets_krw=closing_total_assets_krw,
             )
             db.add(ev)
             db.flush()
@@ -571,6 +573,25 @@ class TradeRepository:
             )
             db.expunge_all()
             return rows
+
+    def get_recent_evaluations_with_portfolio(self, limit: int = 10) -> list[dict]:
+        """최근 평가 + Portfolio peak/trough 포함 (대시보드 상세 표시용)"""
+        with self._session() as db:
+            rows = (
+                db.query(StrategyEvaluation)
+                .order_by(StrategyEvaluation.created_at.desc())
+                .limit(limit).all()
+            )
+            result = []
+            for ev in rows:
+                pf = db.query(Portfolio).filter(Portfolio.id == ev.portfolio_id).first()
+                result.append({
+                    "ev": ev,
+                    "peak_pnl_pct": round(pf.peak_pnl_pct or 0.0, 2) if pf else 0.0,
+                    "trough_pnl_pct": round(pf.trough_pnl_pct or 0.0, 2) if pf else 0.0,
+                })
+            db.expunge_all()
+            return result
 
     def get_evaluation_stats(self, last_n: int = 10) -> dict:
         """최근 N건 평가 기반 전략 통계 — Agent 프롬프트에 주입용"""

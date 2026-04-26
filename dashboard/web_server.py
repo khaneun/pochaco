@@ -293,15 +293,17 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
         total_pnl_pct = (total - initial) / initial * 100 if initial > 0 else 0.0
 
         # 성과 평가 데이터 (포트폴리오 단위)
-        recent_evals = repo.get_recent_evaluations(limit=10)
+        recent_evals_with_pf = repo.get_recent_evaluations_with_portfolio(limit=10)
         eval_stats = repo.get_evaluation_stats(last_n=10)
         evals_data = []
-        for ev in recent_evals:
+        for item in recent_evals_with_pf:
+            ev = item["ev"]
             pnl_krw_est = round(ev.total_sell_krw - ev.total_buy_krw, 0) if ev.total_buy_krw else None
             try:
                 ev_coins = json.loads(ev.coins_summary) if ev.coins_summary else []
             except Exception:
                 ev_coins = []
+            closing_assets = getattr(ev, "closing_total_assets_krw", None)
             evals_data.append({
                 "time": _to_kst(ev.created_at).strftime("%m-%d %H:%M:%S"),
                 "portfolio_name": ev.portfolio_name,
@@ -310,6 +312,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                 "pnl_krw": pnl_krw_est,
                 "total_buy_krw": round(ev.total_buy_krw, 0),
                 "total_sell_krw": round(ev.total_sell_krw, 0),
+                "closing_total_assets_krw": round(closing_assets, 0) if closing_assets else None,
                 "coin_count": len(ev_coins),
                 "held_minutes": round(ev.held_minutes, 1),
                 "original_tp": ev.original_tp_pct,
@@ -319,6 +322,8 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
                 "evaluation": ev.evaluation,
                 "lesson": ev.lesson or "",
                 "coins": ev_coins,
+                "peak_pnl_pct": item["peak_pnl_pct"],
+                "trough_pnl_pct": item["trough_pnl_pct"],
             })
 
         # 포트폴리오 히스토리
@@ -1036,8 +1041,9 @@ def _render_html(data: dict) -> str:
             "exit_type": ev["exit_type"],
             "take_profit_pct": ev.get("original_tp", ""),
             "stop_loss_pct": ev.get("original_sl", ""),
-            "peak_pnl_pct": 0.0,
-            "trough_pnl_pct": 0.0,
+            "peak_pnl_pct": ev.get("peak_pnl_pct", 0.0),
+            "trough_pnl_pct": ev.get("trough_pnl_pct", 0.0),
+            "closing_total_assets_krw": ev.get("closing_total_assets_krw"),
             "coins": ev.get("coins", []),
             "evaluation": ev.get("evaluation", ""),
             "lesson": ev.get("lesson", ""),
@@ -1208,6 +1214,9 @@ function showPfTx(idx) {
     : ((d.pnl_krw > 0 ? '+' : '') + d.pnl_krw.toLocaleString('ko-KR') + '원'));
   var tpSlStr = (d.take_profit_pct ? '<span style="color:#f87171">+' + d.take_profit_pct + '%</span>' : '—')
     + ' / ' + (d.stop_loss_pct ? '<span style="color:#60a5fa">' + d.stop_loss_pct + '%</span>' : '—');
+  var closingAssetsFmt = (d.closing_total_assets_krw != null)
+    ? d.closing_total_assets_krw.toLocaleString('ko-KR') + '원'
+    : null;
 
   var tradeModeLabel = d.exit_type === 'manual'
     ? '<span style="font-size:0.75rem;color:#fb923c;">👤 수동 청산</span>'
@@ -1220,6 +1229,7 @@ function showPfTx(idx) {
     + '<div class="stat-row"><span class="stat-label">종목 수</span><span class="stat-value">' + d.coin_count + '개</span></div>'
     + '<div class="stat-row"><span class="stat-label">매수 금액</span><span class="stat-value">' + buyFmt + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">매도 금액</span><span class="stat-value">' + sellFmt + '</span></div>'
+    + (closingAssetsFmt ? '<div class="stat-row"><span class="stat-label">처분 당시 총 자산</span><span class="stat-value">' + closingAssetsFmt + '</span></div>' : '')
     + '<div class="stat-row"><span class="stat-label">수익률 <span style="font-size:0.72rem;color:#64748b;">(수수료반영)</span></span><span class="stat-value" style="color:' + pnlColor + '">' + pnlPctStr + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">손익(원)</span><span class="stat-value" style="color:' + pnlColor + '">' + pnlKrwFmt + '</span></div>'
     + '<div class="stat-row"><span class="stat-label">TP / SL 설정</span><span class="stat-value">' + tpSlStr + '</span></div>';
@@ -1301,23 +1311,31 @@ function showPfTx(idx) {
       }
       html += '</table>';
     } else {
-      // 종료됨: 실제 매수가 / 매도가 / 수익률 (단가 기준)
+      // 종료됨: 매수금 / 매도금 / 수익률(금액기준) / 손익(원)
+      var sortedClosedCoins = d.coins.slice().sort(function(a, b) { return (b.pnl_pct || 0) - (a.pnl_pct || 0); });
       html += '<table style="margin-top:6px;width:100%;font-size:0.8rem;">'
         + '<tr style="color:#64748b;"><th style="text-align:left;">코인</th>'
-        + '<th style="text-align:right;">매수가</th><th style="text-align:right;">매도가</th>'
-        + '<th style="text-align:right;">수익률</th></tr>';
-      for (var j = 0; j < d.coins.length; j++) {
-        var cr = d.coins[j];
-        var buyP = cr.buy_price || 0;
-        var sellP = cr.sell_price || 0;
-        // 단가 기준 수익률 재계산 (sell_price=0이면 pnl_pct 원본 사용)
-        var coinPnl = (buyP > 0 && sellP > 0) ? (sellP - buyP) / buyP * 100 : (cr.pnl_pct || 0);
+        + '<th style="text-align:right;">매수</th><th style="text-align:right;">매도</th>'
+        + '<th style="text-align:right;">수익 현황</th></tr>';
+      for (var j = 0; j < sortedClosedCoins.length; j++) {
+        var cr = sortedClosedCoins[j];
+        // DB에 저장된 pnl_pct 직접 사용 (수수료·분할매도 반영된 금액 기준 수익률)
+        var coinPnl = cr.pnl_pct || 0;
+        // 손익(원): DB의 pnl_krw 우선, 없으면 sell_krw - buy_krw 계산
+        var coinPnlKrw = (cr.pnl_krw != null) ? cr.pnl_krw
+          : ((cr.sell_krw && cr.buy_krw) ? (cr.sell_krw - cr.buy_krw) : null);
         var crc = coinPnl > 0 ? '#f87171' : (coinPnl < 0 ? '#60a5fa' : '#94a3b8');
         var coinPnlStr = coinPnl === 0 ? '0.00%' : ((coinPnl > 0 ? '+' : '') + coinPnl.toFixed(2) + '%');
-        html += '<tr><td><b>' + cr.symbol + '</b></td>'
-          + '<td style="text-align:right">' + buyP.toLocaleString('ko-KR') + '</td>'
-          + '<td style="text-align:right">' + (sellP > 0 ? sellP.toLocaleString('ko-KR') : '—') + '</td>'
-          + '<td style="text-align:right;color:' + crc + '">' + coinPnlStr + '</td>'
+        var coinKrwStr = (coinPnlKrw == null) ? '' : (coinPnlKrw === 0 ? '0원' : ((coinPnlKrw > 0 ? '+' : '') + Math.round(coinPnlKrw).toLocaleString('ko-KR') + '원'));
+        var buyKrwStr = cr.buy_krw ? cr.buy_krw.toLocaleString('ko-KR') : '—';
+        var sellKrwStr = cr.sell_krw ? cr.sell_krw.toLocaleString('ko-KR') : '—';
+        var errMark = cr.error ? ' <span style="color:#fb923c;font-size:0.65rem;">⚠</span>' : '';
+        html += '<tr><td><b>' + cr.symbol + '</b>' + errMark + '</td>'
+          + '<td style="text-align:right;color:#94a3b8;">' + buyKrwStr + '</td>'
+          + '<td style="text-align:right;color:#94a3b8;">' + sellKrwStr + '</td>'
+          + '<td style="text-align:right"><span style="font-weight:600;color:' + crc + '">' + coinPnlStr + '</span>'
+          + (coinKrwStr ? '<br><span style="font-size:0.7rem;color:' + crc + '">' + coinKrwStr + '</span>' : '')
+          + '</td>'
           + '</tr>';
       }
       html += '</table>';
