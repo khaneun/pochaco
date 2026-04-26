@@ -1311,28 +1311,26 @@ function showPfTx(idx) {
       }
       html += '</table>';
     } else {
-      // 종료됨: 매수금 / 매도금 / 수익률(금액기준) / 손익(원)
+      // 종료됨: 매수가(단가) / 매도가(단가) / 수익률 / 손익(원)
       var sortedClosedCoins = d.coins.slice().sort(function(a, b) { return (b.pnl_pct || 0) - (a.pnl_pct || 0); });
       html += '<table style="margin-top:6px;width:100%;font-size:0.8rem;">'
         + '<tr style="color:#64748b;"><th style="text-align:left;">코인</th>'
-        + '<th style="text-align:right;">매수</th><th style="text-align:right;">매도</th>'
+        + '<th style="text-align:right;">매수가</th><th style="text-align:right;">매도가</th>'
         + '<th style="text-align:right;">수익 현황</th></tr>';
       for (var j = 0; j < sortedClosedCoins.length; j++) {
         var cr = sortedClosedCoins[j];
-        // DB에 저장된 pnl_pct 직접 사용 (수수료·분할매도 반영된 금액 기준 수익률)
         var coinPnl = cr.pnl_pct || 0;
-        // 손익(원): DB의 pnl_krw 우선, 없으면 sell_krw - buy_krw 계산
         var coinPnlKrw = (cr.pnl_krw != null) ? cr.pnl_krw
           : ((cr.sell_krw && cr.buy_krw) ? (cr.sell_krw - cr.buy_krw) : null);
         var crc = coinPnl > 0 ? '#f87171' : (coinPnl < 0 ? '#60a5fa' : '#94a3b8');
         var coinPnlStr = coinPnl === 0 ? '0.00%' : ((coinPnl > 0 ? '+' : '') + coinPnl.toFixed(2) + '%');
         var coinKrwStr = (coinPnlKrw == null) ? '' : (coinPnlKrw === 0 ? '0원' : ((coinPnlKrw > 0 ? '+' : '') + Math.round(coinPnlKrw).toLocaleString('ko-KR') + '원'));
-        var buyKrwStr = cr.buy_krw ? cr.buy_krw.toLocaleString('ko-KR') : '—';
-        var sellKrwStr = cr.sell_krw ? cr.sell_krw.toLocaleString('ko-KR') : '—';
+        var buyPriceStr = cr.buy_price ? cr.buy_price.toLocaleString('ko-KR') : '—';
+        var sellPriceStr = (cr.sell_price && cr.sell_price > 0) ? cr.sell_price.toLocaleString('ko-KR') : '—';
         var errMark = cr.error ? ' <span style="color:#fb923c;font-size:0.65rem;">⚠</span>' : '';
         html += '<tr><td><b>' + cr.symbol + '</b>' + errMark + '</td>'
-          + '<td style="text-align:right;color:#94a3b8;">' + buyKrwStr + '</td>'
-          + '<td style="text-align:right;color:#94a3b8;">' + sellKrwStr + '</td>'
+          + '<td style="text-align:right;color:#94a3b8;">' + buyPriceStr + '</td>'
+          + '<td style="text-align:right;color:#94a3b8;">' + sellPriceStr + '</td>'
           + '<td style="text-align:right"><span style="font-weight:600;color:' + crc + '">' + coinPnlStr + '</span>'
           + (coinKrwStr ? '<br><span style="font-size:0.7rem;color:' + crc + '">' + coinKrwStr + '</span>' : '')
           + '</td>'

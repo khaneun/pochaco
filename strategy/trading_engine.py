@@ -997,6 +997,16 @@ class TradingEngine:
                     logger.debug(f"  {pos.symbol} 소액({krw_est:.0f}원) 스킵")
                     continue
 
+                # 잔여분이 최소주문금액 미달이면 전량 매도로 전환
+                # (잔여분을 나중에 매도하려 할 때 5,000원 미달 오류 방지)
+                remaining_krw_est = (actual_units - sell_units) * tgt_price
+                if 0 < remaining_krw_est < settings.MIN_ORDER_KRW:
+                    logger.info(
+                        f"  {pos.symbol} 잔여분 {remaining_krw_est:.0f}원 < "
+                        f"{settings.MIN_ORDER_KRW}원 → 전량 매도로 전환"
+                    )
+                    sell_units = actual_units
+
                 fill = self._limit_sell_with_retry(pos.symbol, tgt_price, sell_units)
                 if fill["status"] == "0000":
                     self._repo.save_trade(
