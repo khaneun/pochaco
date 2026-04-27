@@ -22,14 +22,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StrategyParams:
-    """전략 파라미터 묶음 — 포트폴리오 레벨 (최대 손절 -2%)"""
-    target_tp: float = 5.0       # 포트폴리오 익절% (트레일링 시작점)
+    """전략 파라미터 묶음 — 포트폴리오 레벨 (최대 손절 -2%)
+
+    ※ 분할 익절(+1.5% 30%, +3.0% 30%)이 trading_engine에서 자동 작동하므로
+      target_tp는 최종 트레일링 진입선만 의미함. 작은 수익은 분할 익절로 확정.
+    """
+    target_tp: float = 4.0       # 포트폴리오 익절% (트레일링 시작점) — 분할 익절 외 잔여분 트레일링
     target_sl: float = -1.5      # 포트폴리오 권고 손절% (최대 -2.0%)
-    tp_clamp_min: float = 5.0    # 익절 허용 최솟값
-    tp_clamp_max: float = 10.0   # 익절 허용 최댓값
+    tp_clamp_min: float = 3.5    # 익절 허용 최솟값 (분할 익절과 1.5% 이상 차이 유지)
+    tp_clamp_max: float = 6.0    # 익절 허용 최댓값 (TP 도달률 18.9% 데이터 기반 하향)
     sl_clamp_min: float = -2.0   # 손절 허용 최솟값 (하드캡)
     sl_clamp_max: float = -0.5   # 손절 허용 최댓값
-    rationale: str = "기본 파라미터 (포트폴리오: 분할매도 -1%/-1.5%/-2%, 익절 5%+ 트레일링)"
+    rationale: str = "기본 파라미터 (분할익절 +1.5%/+3%, 트레일링 +4%, 손절 -1.5%)"
     confidence: float = 0.5
 
 
@@ -112,11 +116,12 @@ class StrategyOptimizer:
         avg_pnl = eval_stats.get("avg_pnl_pct", 0.0)
 
         # repository의 suggested 기반 clamp (AI 제안의 가중평균) — 타이트 손절 전략 기준
-        repo_tp_min = eval_stats.get("tp_clamp_min", 4.0)
-        repo_tp_max = eval_stats.get("tp_clamp_max", 10.0)
-        repo_sl_min = eval_stats.get("sl_clamp_min", -2.5)   # 2차 손절 기준 (타이트)
+        # ※ 분할 익절(+1.5%/+3%) 도입 후 트레일링 TP는 보수적으로 하향
+        repo_tp_min = eval_stats.get("tp_clamp_min", 3.5)
+        repo_tp_max = eval_stats.get("tp_clamp_max", 6.0)
+        repo_sl_min = eval_stats.get("sl_clamp_min", -2.0)
         repo_sl_max = eval_stats.get("sl_clamp_max", -0.8)
-        suggested_tp = eval_stats.get("avg_suggested_tp", 5.0)
+        suggested_tp = eval_stats.get("avg_suggested_tp", 4.0)
         suggested_sl = eval_stats.get("avg_suggested_sl", -1.5)
 
         # 최근 연속 손절 카운트 + 평균 손실 크기
@@ -158,23 +163,23 @@ class StrategyOptimizer:
 
         if consecutive_losses >= 3 and avg_loss_size > 1.5:
             # 시장 악화 시 익절을 소폭 낮춰 빠른 수익 실현
-            target_tp = max(5.0, target_tp - 0.5)
-            tp_max = min(tp_max, 10.0)
+            target_tp = max(3.5, target_tp - 0.5)
+            tp_max = min(tp_max, 5.5)
         elif avg_hold > 240:
-            target_tp = max(5.0, target_tp - 1.0)
-            tp_max = min(tp_max, 9.0)
+            target_tp = max(3.5, target_tp - 1.0)
+            tp_max = min(tp_max, 5.0)
         elif avg_hold > 120:
-            target_tp = max(5.0, target_tp - 0.5)
+            target_tp = max(3.5, target_tp - 0.5)
         elif win_rate >= 0.6 and avg_pnl > 2.0:
             # 잘 되고 있으면 익절 목표 상향
-            target_tp = min(10.0, target_tp + 0.5)
-            tp_max = min(12.0, tp_max + 1.0)
+            target_tp = min(6.0, target_tp + 0.5)
+            tp_max = min(7.0, tp_max + 0.5)
 
         return StrategyParams(
-            target_tp=max(5.0, min(12.0, round(target_tp, 1))),
+            target_tp=max(3.5, min(6.0, round(target_tp, 1))),
             target_sl=max(-2.0, min(-0.5, round(target_sl, 1))),
-            tp_clamp_min=max(4.0, round(tp_min, 1)),
-            tp_clamp_max=min(12.0, round(tp_max, 1)),
+            tp_clamp_min=max(3.5, round(tp_min, 1)),
+            tp_clamp_max=min(6.0, round(tp_max, 1)),
             sl_clamp_min=max(-2.0, round(sl_min, 1)),
             sl_clamp_max=min(-0.5, round(sl_max, 1)),
             rationale=rationale,

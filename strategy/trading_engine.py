@@ -47,6 +47,15 @@ _LIMIT_SELL_WAIT_SEC = 5.0
 _TIER1_SL_PCT = -1.0    # 1차 분할 매도 진입점 (AI 평가 기반 비율)
 _FINAL_SL_PCT = -1.5    # 최대 손절 하드캡 (잔여 전량 매도)
 
+# 분할 익절 라인 — 피크 +1~3% 회귀 손실 방지 (TP 도달률 18.9% 데이터 기반)
+_TIER1_TP_PCT = 1.5     # 1차 익절 진입점 (포트폴리오 +1.5% 도달 시 30% 매도 → 수익 확정)
+_TIER2_TP_PCT = 3.0     # 2차 익절 진입점 (포트폴리오 +3.0% 도달 시 30% 추가 매도)
+_TIER_TP_RATIO = 0.30   # 익절 단계별 매도 비율 (각 30%)
+
+# 빠른 폭락 즉시 손절 — 진입 직후 -20%급 폭락 코인 보호
+_RAPID_DUMP_5MIN_PCT  = -3.0   # 진입 5분 내 -3% 이하 → 즉시 전량 매도 (회복 불가 신호)
+_RAPID_DUMP_30MIN_PCT = -5.0   # 진입 30분 내 -5% 이하 → 즉시 전량 매도
+
 
 # ================================================================== #
 #  포트폴리오 매도 상태 머신                                              #
@@ -72,6 +81,10 @@ class _PortfolioExitTracker:
     # ── 낙폭별 분할 매도 상태 ──
     tier1_sold: bool = False    # -1.0% → AI 평가 비율 매도 완료
     # -1.5% → 잔여 전량 매도 (최종 손절 하드캡)
+
+    # ── 분할 익절 상태 ──
+    tier1_tp_sold: bool = False  # +1.5% 1차 익절 완료 (30% 매도)
+    tier2_tp_sold: bool = False  # +3.0% 2차 익절 완료 (30% 추가 매도)
 
     # ── 피라미딩 추가 매수 ──
     pyramid_done: bool = False          # 이미 실행했거나 포기 결정된 경우
@@ -889,6 +902,21 @@ class TradingEngine:
             except Exception as e:
                 logger.warning(f"[trough 갱신 오류] {e}")
 
+        # ── 0. 빠른 폭락 즉시 손절 (최우선) ──
+        # 진입 직후 폭락 코인은 회복 가능성 낮음 → 추가 하락 방지
+        if (holding_minutes < 5 and pnl_pct <= _RAPID_DUMP_5MIN_PCT) or \
+           (holding_minutes < 30 and pnl_pct <= _RAPID_DUMP_30MIN_PCT):
+            logger.warning(
+                f"[빠른 폭락 손절] '{portfolio.name}' {holding_minutes:.1f}분만에 "
+                f"{pnl_pct:+.2f}% — 즉시 전량 매도"
+            )
+            self._execute_portfolio_sell(
+                portfolio, positions, pnl_pct, coin_details,
+                f"빠른 폭락 손절 ({holding_minutes:.1f}분, {pnl_pct:+.2f}%)",
+                target_prices=target_prices,
+            )
+            return
+
         # ── 익절 돌파 → 트레일링 모드 ──
         if pnl_pct >= portfolio.take_profit_pct:
             tracker.phase = _ExitPhase.TRAILING_TP
@@ -907,6 +935,33 @@ class TradingEngine:
                     )
                 except Exception:
                     pass
+
+        # ── 2차 분할 익절: +3.0% 도달 (트레일링 진입선이 더 높을 때만 동작) ──
+        elif not tracker.tier2_tp_sold and pnl_pct >= _TIER2_TP_PCT:
+            logger.info(
+                f"[2차 분할 익절] '{portfolio.name}' {pnl_pct:+.2f}% >= +{_TIER2_TP_PCT}% "
+                f"→ {_TIER_TP_RATIO:.0%} 매도 (수익 확정)"
+            )
+            self._execute_portfolio_partial_sell(
+                portfolio, positions, ratio=_TIER_TP_RATIO,
+                reason=f"2차 분할 익절 +{_TIER2_TP_PCT}% ({pnl_pct:+.2f}%)",
+                target_prices=target_prices,
+            )
+            tracker.tier2_tp_sold = True
+            tracker.tier1_tp_sold = True  # 1차 단계도 자동 통과 처리
+
+        # ── 1차 분할 익절: +1.5% 도달 → 수익 확정 (피크 회귀 방지) ──
+        elif not tracker.tier1_tp_sold and pnl_pct >= _TIER1_TP_PCT:
+            logger.info(
+                f"[1차 분할 익절] '{portfolio.name}' {pnl_pct:+.2f}% >= +{_TIER1_TP_PCT}% "
+                f"→ {_TIER_TP_RATIO:.0%} 매도 (수익 확정)"
+            )
+            self._execute_portfolio_partial_sell(
+                portfolio, positions, ratio=_TIER_TP_RATIO,
+                reason=f"1차 분할 익절 +{_TIER1_TP_PCT}% ({pnl_pct:+.2f}%)",
+                target_prices=target_prices,
+            )
+            tracker.tier1_tp_sold = True
 
         # ── 최종 손절: -1.5% 하드캡 → 잔여 전량 매도 ──
         elif pnl_pct <= _FINAL_SL_PCT:
