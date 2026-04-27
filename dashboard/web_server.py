@@ -137,6 +137,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
 
         # ── 거래소 실제 보유 코인 잔고 (available + locked 합산) ──
         pf_symbols: set[str] = set()
+        pf_pos_units: dict[str, float] = {}
         holdings = []
         actual_coin_units: dict[str, float] = {}  # sym → total 수량 (available+locked)
         balance_fetched = False
@@ -161,6 +162,7 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
         if pf:
             positions = repo.get_portfolio_positions(pf.id)
             pf_symbols = {p.symbol for p in positions}
+            pf_pos_units: dict[str, float] = {p.symbol: p.units for p in positions}
             total_buy = 0.0
             total_current = 0.0   # P&L 계산용 (실현 매도금 포함)
             total_coin_value = 0.0  # 총 자산 계산용 (미실현 코인 평가액만)
@@ -257,8 +259,24 @@ def _build_json_status(client: "BaseExchangeClient", coordinator: "AgentCoordina
             }
 
         # holdings — 포트폴리오 외 보유 코인
+        # 포트폴리오 심볼이라도 pos.units 초과분(미청산 잔여 등)은 여기서 자산에 포함
         for sym, amt in actual_coin_units.items():
             if sym in pf_symbols:
+                excess = amt - pf_pos_units.get(sym, 0.0)
+                if excess <= 0:
+                    continue
+                try:
+                    px = client.get_current_price(sym)
+                    kv = excess * px
+                    if kv >= 100:
+                        holdings.append({
+                            "symbol": sym, "units": round(excess, 6),
+                            "price": px, "krw_value": round(kv, 0),
+                            "note": "미청산 잔여",
+                        })
+                        total += kv
+                except Exception:
+                    pass
                 continue
             try:
                 px = client.get_current_price(sym)
@@ -766,10 +784,11 @@ def _render_html(data: dict) -> str:
     if holdings:
         h_lines = []
         for h in holdings:
+            note_str = f' <span style="color:#fb923c;font-size:0.7rem;">({h["note"]})</span>' if h.get("note") else ""
             h_lines.append(
                 f'<div class="sub" style="margin-top:2px;">'
                 f'{h["symbol"]} 평가: {h["krw_value"]:,.0f}원'
-                f' ({h["units"]:.6g}개)'
+                f' ({h["units"]:.6g}개){note_str}'
                 f'</div>'
             )
         holdings_html = "\n".join(h_lines)

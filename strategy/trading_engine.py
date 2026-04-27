@@ -254,8 +254,12 @@ class TradingEngine:
         Returns:
             {"status", "order_uuid", "filled_price", "filled_units",
              "filled_krw", "method"}
+            부분 체결 + 시장가 혼합 시 filled_units/filled_krw는 합산 값
         """
         remaining = units
+        total_filled_units = 0.0
+        total_filled_krw = 0.0
+        last_uuid = ""
 
         for attempt, multiplier in enumerate(_LIMIT_SELL_PRICE_ADJ, 1):
             limit_price = self._floor_to_tick(target_price * multiplier)
@@ -291,12 +295,16 @@ class TradingEngine:
                     f"@{order_info['avg_price']:,.0f}원 "
                     f"({order_info['executed_funds']:,.0f}원)"
                 )
+                total_filled_units += order_info["executed_volume"]
+                total_filled_krw += order_info["executed_funds"]
+                last_uuid = order_uuid
+                avg_price = total_filled_krw / total_filled_units if total_filled_units > 0 else target_price
                 return {
                     "status": "0000",
-                    "order_uuid": order_uuid,
-                    "filled_price": order_info["avg_price"],
-                    "filled_units": order_info["executed_volume"],
-                    "filled_krw": order_info["executed_funds"],
+                    "order_uuid": last_uuid,
+                    "filled_price": avg_price,
+                    "filled_units": total_filled_units,
+                    "filled_krw": total_filled_krw,
                     "method": f"limit_{attempt}",
                 }
 
@@ -305,18 +313,23 @@ class TradingEngine:
             self._client.cancel_order("ask", order_uuid, symbol)
             time.sleep(0.3)
 
-            # 부분 체결 확인
+            # 부분 체결 확인 — 부분 체결량 누적 (잔여분 매도 실패 시에도 기록 보존)
             order_info = self._client.get_order_by_uuid(order_uuid)
             if order_info and order_info.get("executed_volume", 0) > 0:
                 filled_vol = order_info["executed_volume"]
+                partial_krw = order_info["executed_funds"]
+                total_filled_units += filled_vol
+                total_filled_krw += partial_krw
+                last_uuid = order_uuid
                 remaining -= filled_vol
                 if remaining <= 0:
+                    avg_price = total_filled_krw / total_filled_units if total_filled_units > 0 else target_price
                     return {
                         "status": "0000",
-                        "order_uuid": order_uuid,
-                        "filled_price": order_info["avg_price"],
-                        "filled_units": filled_vol,
-                        "filled_krw": order_info["executed_funds"],
+                        "order_uuid": last_uuid,
+                        "filled_price": avg_price,
+                        "filled_units": total_filled_units,
+                        "filled_krw": total_filled_krw,
                         "method": f"limit_partial_{attempt}",
                     }
                 logger.info(
@@ -340,8 +353,26 @@ class TradingEngine:
                 order_uuid, filled_price, filled_krw
             )
 
+        market_status = market_result.get("status", "9999")
+        if market_status == "0000":
+            total_filled_units += remaining
+            total_filled_krw += filled_krw
+            last_uuid = order_uuid or last_uuid
+
+        # 부분 체결이라도 있으면 성공으로 처리 — save_trade 누락 방지
+        if total_filled_units > 0:
+            avg_price = total_filled_krw / total_filled_units if total_filled_units > 0 else filled_price
+            return {
+                "status": "0000",
+                "order_uuid": last_uuid or order_uuid,
+                "filled_price": avg_price,
+                "filled_units": total_filled_units,
+                "filled_krw": total_filled_krw,
+                "method": "market_fallback" if not last_uuid else "partial+market",
+            }
+
         return {
-            "status": market_result.get("status", "9999"),
+            "status": market_status,
             "order_uuid": order_uuid,
             "filled_price": filled_price,
             "filled_units": remaining,
