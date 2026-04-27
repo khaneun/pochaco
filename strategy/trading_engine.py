@@ -1099,6 +1099,7 @@ class TradingEngine:
 
         total_sell_krw = 0.0
         coin_results = []
+        sell_failed_symbols: list[str] = []  # 매도 완전 실패 코인 추적
 
         # 직전 감시 루프에서 계산된 가격 — 목표가 소스
         detail_price_map: dict[str, float] = {
@@ -1167,11 +1168,11 @@ class TradingEngine:
                         f"[{fill['method']}]"
                     )
                 else:
-                    # 매도 실패 — 실제로 받은 금액 없으므로 total_sell_krw에 가산하지 않음
-                    # (get_portfolio_sell_total이 실제 Trade 합계만 집계하므로 일관성 유지)
-                    logger.warning(f"  {pos.symbol} 매도 실패 — 손익 집계에서 제외")
-                    filled_price = 0.0
-                    total_sell_krw += 0.0
+                    logger.error(
+                        f"  {pos.symbol} 매도 완전 실패 — 포지션 유지 (다음 루프 재시도)"
+                    )
+                    sell_failed_symbols.append(pos.symbol)
+                    continue  # coin_results 추가·close_position·sleep 모두 스킵
 
                 # 분할 매도 포함 코인 전체 손익 — pos.buy_krw는 잔여분 기준이므로 원매수금 조회
                 # ※ get_coin_sell_total은 방금 save_trade로 저장된 현재 매도 포함이므로
@@ -1197,27 +1198,26 @@ class TradingEngine:
                 self._repo.close_position(pos.id)
                 time.sleep(_BUY_INTERVAL_SEC)
             except Exception as e:
-                logger.error(f"  {pos.symbol} 매도 오류: {e}")
-                # 예외 발생 코인도 coins_summary에 기록 (누락 방지)
+                logger.error(f"  {pos.symbol} 매도 오류: {e}", exc_info=True)
+                sell_failed_symbols.append(pos.symbol)
+                # close_position 호출 없음 — 포지션 유지 (다음 루프 재시도)
+
+        # 매도 완전 실패 코인 있으면 포트폴리오 감시 유지
+        if sell_failed_symbols:
+            logger.error(
+                f"[포트폴리오 매도 부분 실패] '{portfolio.name}' 미매도={sell_failed_symbols} "
+                f"— 포트폴리오 감시 유지 (수동 확인 필요)"
+            )
+            if self._notifier:
                 try:
-                    _orig_buy = self._repo.get_coin_buy_total(portfolio.id, pos.symbol) or pos.buy_krw
-                    _coin_sell = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
-                    _cpnl = (_coin_sell - _orig_buy) / _orig_buy * 100 if _orig_buy > 0 else 0.0
-                    coin_results.append({
-                        "symbol": pos.symbol,
-                        "buy_price": pos.buy_price,
-                        "buy_krw": round(_orig_buy, 0),
-                        "sell_price": 0.0,
-                        "sell_krw": round(_coin_sell, 0),
-                        "pnl_pct": round(_cpnl, 2),
-                        "pnl_krw": round(_coin_sell - _orig_buy, 0),
-                        "target_price": 0.0,
-                        "reason": pos.agent_reason or "",
-                        "error": True,
-                    })
+                    self._notifier.send(
+                        f"🚨 <b>매도 실패</b> '{portfolio.name}'\n"
+                        f"미매도 코인: {', '.join(sell_failed_symbols)}\n"
+                        f"포트폴리오 감시 유지 중 — 수동 확인 필요"
+                    )
                 except Exception:
                     pass
-                self._repo.close_position(pos.id)
+            return
 
         # 포트폴리오 종료
         self._repo.close_portfolio(portfolio.id)
