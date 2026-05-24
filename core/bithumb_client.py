@@ -227,6 +227,16 @@ class BithumbClient(BaseExchangeClient):
                 exec_funds = sum(float(t.get("funds", 0)) for t in trades)
                 if exec_funds > 0 and exec_vol > 0:
                     avg_price = exec_funds / exec_vol
+            # 체결 수수료 파싱 (v4.4) — paid_fee 또는 trades[].fee 합산
+            paid_fee = 0.0
+            try:
+                pf = raw.get("paid_fee")
+                if pf is not None:
+                    paid_fee = float(pf)
+                elif trades:
+                    paid_fee = sum(float(t.get("fee", 0) or 0) for t in trades)
+            except (ValueError, TypeError):
+                paid_fee = 0.0
             return {
                 "uuid": raw.get("uuid", uuid),
                 "side": raw.get("side", ""),
@@ -234,6 +244,7 @@ class BithumbClient(BaseExchangeClient):
                 "avg_price": avg_price,
                 "executed_volume": exec_vol,
                 "executed_funds": exec_funds,
+                "paid_fee": paid_fee,
                 "created_at": raw.get("created_at", ""),
                 "trades": trades,
             }

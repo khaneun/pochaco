@@ -2,6 +2,98 @@
 
 ---
 
+## v4.4.0 (2026-05-15)
+
+### 출혈 방지 패키지 — 손실 누적 9개 영역 동시 보완
+
+#### 배경
+최근 10일(5/6~5/15) 양 시스템 데이터 분석:
+- pochaco(빗썸): 승률 25%, 손절 13/20건, 일별 -5.74%, 5/14 시점 -8,296원
+- kuromi(업비트): 승률 54%, 흑자(+6,050원)지만 같은 패턴 손실 다수
+- 공통 문제: 반복 손실 코인 매수(WLD 14회/AKT 13회), 타임아웃 평균 -0.10%, MetaEvaluator 피드백 무시(buy_strategist 5.6점 반복)
+
+#### 핵심 변경
+
+**A. 즉시 출혈 차단**
+- **A1. 블랙리스트 재설계 (`cooldown.py`)**: `strategy_evaluations.coins_summary` JSON 기반으로 코인별 손익 정확 집계 (기존 `note` 문자열 검색은 timeout/조기청산 누락)
+  - 7일 내 손실 우세 3회 이상 → 5일 차단
+  - 손실 2회 + 폭락(-2%↓) 1회 이상 → 3일 차단
+  - 익절 발생 시 손실 카운트 감점(회복 신호)
+- **A2. 타임아웃 12h → 6h (`trading_engine.py`)**: `_MAX_HOLD_MINUTES = 360`
+  - 3시간 시점 peak < +1% 이면 무수익 조기청산 즉시 실행 (자본 회전 우선)
+- **A3. 하락장 진입 스위치 (`agent_coordinator.py`)**: market_analyst 점수 30 미만 + 직전 2건 손절 시 보류
+- **A4. 피드백 주입 검증 (`base_agent.py`)**: 30분 간격 INFO 로그로 feedback/reflection 실제 system_context 포함 확인
+
+**B. 전략 강화**
+- **B5. 거래소별 임계값 (`coin_selector.py`)**: 빗썸 최소 거래대금 100억 → 300억 (저유동성 코인 차단 강화)
+- **B6. 포지션 크기 표준화 (`trading_engine.py`)**: 투자비율 0.55~0.75 클램프, 단일코인 ≤ 총자산 8%
+- **B7. 익절 후 6시간 쿨다운 (`cooldown.py`)**: take_profit 30분 → 6시간 (ONDO/B3 같은 반복 매매 패턴 차단)
+
+**C. 운영/관측 개선**
+- **C8. 수수료 DB 기록 (`bithumb_client.py` / `upbit_client.py` / `trading_engine.py`)**: `get_order_by_uuid`에 `paid_fee` 파싱 추가, 모든 매수/매도 save_trade에 fee 전달
+- **C9. 거래 빈도 제한 (`trading_engine.py` + `repository.py`)**: 직전 청산 후 60분 미경과 시 신규 진입 스킵, `get_last_closed_portfolio_at()` 추가
+
+#### 효과 예측
+- WLD/SUI/AKT 같은 반복 손실 코인 자동 차단
+- 타임아웃 평균 -0.10% 케이스 → 3시간 조기청산으로 자본 회전 회복
+- 노이즈 진입 1시간당 1건 제한 → 손절 누적 속도 둔화
+- 실제 수수료 추적 가능 (이전: trades.fee=0 누적)
+
+---
+
+## v4.2.0 (2026-04-29)
+
+### 지속 손실 차단 — 합의 메커니즘 + 분할 손절 폐지 + 약세장 진입 차단
+
+#### 배경
+2일간 양 시스템(pochaco/kuromi) 모두 누적 손실. 데이터 분석으로 확인된 핵심 결함:
+- **AssetManager가 7연패 후 "투자 보류" 권고했음에도** InvestmentStrategist가 매번 opportunity_score=0.8 반환 → 합의 메커니즘이 60% 비율로 강제 진행
+- **분할 손절(-1.0%)이 잔여분 -1.5% 손절로 이어지는 패턴 반복** → 회복 가능성 차단
+- **AI 미선정 67%** — buy_strategist가 코인 선정 못해 백업이 떠받침
+- **반성문은 잘 쓰이나 행동 변화 없음** — directive가 추상적("RSI 70 초과 배제" 같은 base 룰 반복)
+
+#### 핵심 변경
+
+**A. 합의 메커니즘 안전장치 (`agent_coordinator.py`)**
+- ① **데이터 서킷 브레이커**: 최근 5건 중 4건 이상 손실 → 강제 보류 (LLM 무시)
+- ② **시장 차단**: `recommended_exposure ≤ 0.3` 또는 `risk=high+bearish` → 강제 보류
+- ③ **운용가 강력 보류 우선**: AssetManager `invest_ratio≤0.4` 시 InvestmentStrategist 의견 무시
+- ④ **소극 투자 임계 상향**: 운용가 반대일 때 `opportunity_score 0.7→0.85` + `low risk` 동시 충족 필요
+
+**B. 분할 손절 폐지 (`trading_engine.py`)**
+- `_TIER1_SL_PCT = None` — -1.0% 분할 매도 비활성. 단일 -1.5% 손절만 유지
+- 분할 익절(+1.5%/+3%)은 그대로 (수익 방어 역할)
+- 빠른 폭락 손절(5분 -3%/30분 -5%) 그대로 유지
+
+**C. base_prompt 데이터 강제 룰 추가**
+- `market_analyst`: 강제 룰 ①~⑩ (BTC 24h≤-1%, RSI≤40 50%↑, MACD 하락 60%↑ 등 → recommended_exposure 강제 하향)
+- `investment_strategist`: 강제 룰 ①~⑤ (5건 중 4건 손실, 평균≤-1%+승률≤30%, 연속 3건 손절 등 → should_invest=False 강제)
+- `buy_strategist`: 직전 손절 코인 절대 선정 금지, 약세 시장 보류, 24h≤-1.5% 차단
+- `sell_strategist`: 분할 손절 폐지 메커니즘 반영
+
+**D. 손실 가중 쿨다운 (`cooldown.py`)**
+- `stop_loss` 쿨다운 10분 → 12시간 강화
+- DB 기반 손실 블랙리스트:
+  - 7일 내 3회 이상 손실 → 7일 차단
+  - 7일 누적 -10,000원 이상 → 14일 차단
+- 매 매수 사이클에서 자동 갱신
+
+**E. 메타 평가 데이터 강화 (`meta_evaluator.py`)**
+- 코인별 손익 집계 데이터를 task_prompt에 주입
+- 손실 빈발 코인 5개 자동 추출 → directive에 회피 명령 강제 ("MERL 매수 금지" 등)
+- 추상 표현("현재 방향 유지", "데이터 수집") 명시적 금지
+
+**F. 신규/저유동성 차단 (`coin_selector.py`)**
+- `_MIN_VOLUME_KRW`: 50억 → 100억
+
+#### 효과 예측
+- AssetManager 강력 보류 권고 무시 차단 → 약세장 진입 0회 목표
+- 분할 손절 → -1.5% 단일 손절로 회복 가능성 확보
+- 손실 빈발 코인(MERL/KAT/SOLV) 7~14일 자동 차단
+- directive 구체화 → Agent 학습 사이클 가동
+
+---
+
 ## v4.1.0 (2026-04-12)
 
 ### 기술적·파생 분석 고도화 — RSI/MACD/OBV/BB + Binance Futures 연동

@@ -1,12 +1,15 @@
-"""핵심 매매 루프 엔진 (v4.0 — 포트폴리오 기반)
+"""핵심 매매 루프 엔진 (v4.2 — 분할 손절 폐지 + 합의 안전장치 + 약세 진입 차단)
 
 기동 시점부터 아래 사이클을 무한 반복합니다:
-  1. CoinSelector 사전 필터링 → AI 8개 코인 포트폴리오 선정
-  2. 가용 KRW를 8등분하여 각 코인 매수
-  3. 포트폴리오 종합 P&L 기반 스마트 매도 감시
-     - 낙폭별 분할 매도: -1.0% → AI 평가 기반 비율(33~67%), -1.5% → 잔여 전량
-     - 트레일링 익절: TP 도달 시 고점 추적 (0.3% 하락 시 실현)
-  4. 매도 완료 → 성과 평가 → 1번으로
+  1. CoinSelector 사전 필터링 + 손실 블랙리스트 → AI 8개 코인 포트폴리오 선정
+  2. 합의 메커니즘 + 데이터 서킷 브레이커(연속 손실 차단) 통과 시 매수
+  3. 가용 KRW를 8등분하여 각 코인 매수
+  4. 포트폴리오 종합 P&L 기반 스마트 매도 감시
+     - 분할 익절: +1.5% → 30% 매도, +3.0% → 추가 30% 매도
+     - 단일 손절: -1.5% 잔여 전량 (분할 손절 폐지 — 회복 방해)
+     - 빠른 폭락: 5분 -3% / 30분 -5% 즉시 전량
+     - 트레일링 익절: TP 도달 시 고점 추적
+  5. 매도 완료 → 손실 코인 쿨다운 등록 → 성과 평가 → 1번으로
 """
 import json
 import logging
@@ -32,25 +35,43 @@ logger = logging.getLogger(__name__)
 
 # 보유 중 전략 조정 주기 (초) — 30분마다
 _ADJUST_INTERVAL_SEC = 30 * 60
-# 최대 보유 시간 (분) — 초과 시 강제 매도
-_MAX_HOLD_MINUTES = 720  # 12시간
+# 최대 보유 시간 (분) — 초과 시 강제 매도 (v4.4: 12h → 6h)
+# 분석 결과: 12h 타임아웃 평균 -0.10% (pochaco) — 자본 회전 손해. 6h로 단축.
+_MAX_HOLD_MINUTES = 360  # 6시간
+# 조기 무수익 강제 청산: 보유 _EARLY_CHECK_MIN 경과 후 peak 수익률이 임계 미만이면 즉시 종료
+_EARLY_CHECK_MIN = 180         # 3시간
+_EARLY_PEAK_THRESHOLD = 1.0    # peak < +1.0% 이면 무수익 조기 청산
 # 코인 매수 간격 (초) — API 레이트 리밋 방지
 _BUY_INTERVAL_SEC = 0.5
 # 포트폴리오 최소 코인 수 (이 이하면 생성 실패)
 _MIN_PORTFOLIO_COINS = 3
 # 투자 보류 시 대기 시간 (분) — 자산 운용가가 보류 결정 후 재평가까지 대기
 _HOLD_WAIT_MINUTES = 30
+# 신규 포트폴리오 최소 진입 간격 (분) — 노이즈 매매 방지 (v4.4)
+# kuromi 5/10에 65건 거래 같은 과다 진입 차단. 직전 청산으로부터 N분 미경과 시 스킵.
+_NEW_ENTRY_MIN_INTERVAL_MIN = 60
+
+# 포지션 크기 표준화 (v4.4)
+# pochaco는 91,915원 단발 진입으로 -1.5% = -1,400원 손실 큰 한방. 분산 강제.
+_INVEST_RATIO_BASE = 0.65          # 베이스라인 투자 비율
+_INVEST_RATIO_BAND = 0.10          # ±10% 클램프 (실제 범위 0.55 ~ 0.75)
+_MAX_PER_COIN_PCT  = 0.08          # 단일 코인 진입금 상한 = 총자산의 8%
 # 지정가 매도: 시도별 가격 조정 배율 (1→0.998→0.995), 실패 시 시장가
 _LIMIT_SELL_PRICE_ADJ = [1.0, 0.998, 0.995]
 _LIMIT_SELL_WAIT_SEC = 5.0
-# 분할 매도 손절 라인
-_TIER1_SL_PCT = -1.0    # 1차 분할 매도 진입점 (AI 평가 기반 비율)
-_FINAL_SL_PCT = -1.5    # 최대 손절 하드캡 (잔여 전량 매도)
+# 분할 매도 손절 라인 — v4.2에서 분할 손절 폐지 (손실 회복 방해 + 잔여분 -1.5% 다시 손절 패턴 반복)
+# _TIER1_SL_PCT는 보존하되 사용처에서 비활성화 (None이면 분할 매도 스킵)
+_TIER1_SL_PCT: float | None = None    # 분할 손절 비활성 — 단일 -1.5% 손절만 유지
+_FINAL_SL_PCT = -1.5    # 최대 손절 하드캡 (전량 매도)
 
-# 분할 익절 라인 — 피크 +1~3% 회귀 손실 방지 (TP 도달률 18.9% 데이터 기반)
-_TIER1_TP_PCT = 1.5     # 1차 익절 진입점 (포트폴리오 +1.5% 도달 시 30% 매도 → 수익 확정)
-_TIER2_TP_PCT = 3.0     # 2차 익절 진입점 (포트폴리오 +3.0% 도달 시 30% 추가 매도)
-_TIER_TP_RATIO = 0.30   # 익절 단계별 매도 비율 (각 30%)
+# 분할 익절 라인 — v4.3: timeout 비율 30%·평균 PnL 0% 데이터 기반 빠른 확정 우선
+# 1차 진입점 +1.0% / 비율 50% — 작은 수익 절반 확정으로 EV 음수 보정
+# 2차 진입점 +2.5% / 비율 30% — 추가 확정, 잔여 20% trailing
+_TIER1_TP_PCT = 1.0       # 1차 익절 진입점 (이전 +1.5% → +1.0%, 도달률 ↑)
+_TIER2_TP_PCT = 2.5       # 2차 익절 진입점 (이전 +3.0% → +2.5%)
+_TIER1_TP_RATIO = 0.50    # 1차 매도 비율 (이전 30% → 50%, 빠른 확정)
+_TIER2_TP_RATIO = 0.30    # 2차 매도 비율 (유지)
+_TIER_TP_RATIO = _TIER1_TP_RATIO   # 하위 호환 (구 코드가 단일 비율 참조 시)
 
 # 빠른 폭락 즉시 손절 — 진입 직후 -20%급 폭락 코인 보호
 _RAPID_DUMP_5MIN_PCT  = -3.0   # 진입 5분 내 -3% 이하 → 즉시 전량 매도 (회복 불가 신호)
@@ -145,6 +166,15 @@ class TradingEngine:
         # 시작 총자산 계산
         self.daily_start_krw = self._calc_total_assets()
 
+        # 블랙리스트 사전 빌드 — 보유 모드로 진입해 매수 사이클이 한 번도
+        # 돌지 않더라도 대시보드에 손실 차단 코인이 즉시 노출되도록 시작 시
+        # 1회 강제 갱신한다. (v4.3: 분석 기간 7→3일)
+        try:
+            added = cooldown_registry.rebuild_loss_blacklist(self._repo, days=7)
+            logger.info(f"[블랙리스트 사전 빌드] {added}개 코인 등록")
+        except Exception as e:
+            logger.debug(f"[블랙리스트 사전 빌드 스킵] {e}")
+
         # StrategyOptimizer 초기화
         if self._optimizer:
             try:
@@ -166,7 +196,13 @@ class TradingEngine:
                 portfolio = self._repo.get_open_portfolio()
 
                 if portfolio is None:
-                    self._select_and_buy_portfolio()
+                    if settings.ENTRY_ENABLED:
+                        self._select_and_buy_portfolio()
+                    else:
+                        logger.info(
+                            "[진입 중단] ENTRY_ENABLED=false — 신규 포트폴리오 "
+                            "진입 스킵 (보유 포지션 청산 감시는 계속)"
+                        )
                 else:
                     self._check_portfolio_exit(portfolio)
 
@@ -272,6 +308,7 @@ class TradingEngine:
         remaining = units
         total_filled_units = 0.0
         total_filled_krw = 0.0
+        total_filled_fee = 0.0     # 누적 수수료 (v4.4)
         last_uuid = ""
 
         for attempt, multiplier in enumerate(_LIMIT_SELL_PRICE_ADJ, 1):
@@ -310,6 +347,7 @@ class TradingEngine:
                 )
                 total_filled_units += order_info["executed_volume"]
                 total_filled_krw += order_info["executed_funds"]
+                total_filled_fee += float(order_info.get("paid_fee", 0) or 0)
                 last_uuid = order_uuid
                 avg_price = total_filled_krw / total_filled_units if total_filled_units > 0 else target_price
                 return {
@@ -318,6 +356,7 @@ class TradingEngine:
                     "filled_price": avg_price,
                     "filled_units": total_filled_units,
                     "filled_krw": total_filled_krw,
+                    "paid_fee": total_filled_fee,
                     "method": f"limit_{attempt}",
                 }
 
@@ -333,6 +372,7 @@ class TradingEngine:
                 partial_krw = order_info["executed_funds"]
                 total_filled_units += filled_vol
                 total_filled_krw += partial_krw
+                total_filled_fee += float(order_info.get("paid_fee", 0) or 0)
                 last_uuid = order_uuid
                 remaining -= filled_vol
                 if remaining <= 0:
@@ -343,6 +383,7 @@ class TradingEngine:
                         "filled_price": avg_price,
                         "filled_units": total_filled_units,
                         "filled_krw": total_filled_krw,
+                        "paid_fee": total_filled_fee,
                         "method": f"limit_partial_{attempt}",
                     }
                 logger.info(
@@ -360,9 +401,10 @@ class TradingEngine:
 
         filled_price = target_price  # 기본 fallback
         filled_krw = remaining * target_price
+        market_fee = 0.0
         if order_uuid:
             # 업비트 시장가 주문: state=wait → done 전환까지 최대 5초 폴링
-            filled_price, filled_krw = self._wait_market_fill(
+            filled_price, filled_krw, market_fee = self._wait_market_fill(
                 order_uuid, filled_price, filled_krw
             )
 
@@ -370,6 +412,7 @@ class TradingEngine:
         if market_status == "0000":
             total_filled_units += remaining
             total_filled_krw += filled_krw
+            total_filled_fee += market_fee
             last_uuid = order_uuid or last_uuid
 
         # 부분 체결이라도 있으면 성공으로 처리 — save_trade 누락 방지
@@ -381,6 +424,7 @@ class TradingEngine:
                 "filled_price": avg_price,
                 "filled_units": total_filled_units,
                 "filled_krw": total_filled_krw,
+                "paid_fee": total_filled_fee,
                 "method": "market_fallback" if not last_uuid else "partial+market",
             }
 
@@ -390,6 +434,7 @@ class TradingEngine:
             "filled_price": filled_price,
             "filled_units": remaining,
             "filled_krw": filled_krw,
+            "paid_fee": total_filled_fee,
             "method": "market_fallback",
         }
 
@@ -399,14 +444,14 @@ class TradingEngine:
     def _wait_market_fill(
         self, order_uuid: str, fallback_price: float, fallback_krw: float,
         max_wait: float = 5.0, interval: float = 1.0,
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, float]:
         """시장가 주문 체결 확인 — state=done 될 때까지 최대 max_wait초 폴링.
 
         업비트는 시장가 주문 제출 직후 state='wait'를 반환하므로
         체결 완료(state='done') 확인 없이 진행하면 DB와 실제 잔고가 불일치함.
 
         Returns:
-            (filled_price, filled_krw): 체결가/체결금액, 실패 시 fallback 값
+            (filled_price, filled_krw, paid_fee): 체결가/체결금액/수수료, 실패 시 fallback 값
         """
         elapsed = 0.0
         while elapsed < max_wait:
@@ -417,18 +462,23 @@ class TradingEngine:
                 if not info:
                     continue
                 if info.get("executed_funds", 0) > 0:
+                    fee = float(info.get("paid_fee", 0) or 0)
                     logger.debug(
                         f"  [시장가 체결 확인] {order_uuid[:8]} "
                         f"@{info.get('avg_price', 0):,.0f}원 "
-                        f"({info['executed_funds']:,.0f}원, {elapsed:.0f}초)"
+                        f"({info['executed_funds']:,.0f}원, 수수료={fee:,.0f}원, {elapsed:.0f}초)"
                     )
-                    return info.get("avg_price") or fallback_price, info["executed_funds"]
+                    return (
+                        info.get("avg_price") or fallback_price,
+                        info["executed_funds"],
+                        fee,
+                    )
             except Exception as e:
                 logger.warning(f"  [체결 확인 오류] {order_uuid[:8]}: {e}")
         logger.warning(
             f"  [시장가 체결 타임아웃] {order_uuid[:8]} {max_wait:.0f}초 후 fallback 사용"
         )
-        return fallback_price, fallback_krw
+        return fallback_price, fallback_krw, 0.0
 
     # ------------------------------------------------------------------ #
     #  미체결 주문 정리                                                     #
@@ -488,14 +538,16 @@ class TradingEngine:
                         order_data.get("uuid", "") if isinstance(order_data, dict) else ""
                     )
                     filled_price, filled_krw = current_price, krw_value
+                    sell_fee = 0.0
                     if order_uuid:
-                        filled_price, filled_krw = self._wait_market_fill(
+                        filled_price, filled_krw, sell_fee = self._wait_market_fill(
                             order_uuid, current_price, krw_value
                         )
                     self._repo.save_trade(
                         symbol=symbol, side="sell",
                         price=filled_price, units=amount,
-                        krw_amount=filled_krw, note=note,
+                        krw_amount=filled_krw, fee=sell_fee,
+                        order_id=order_uuid, note=note,
                     )
                     sold_any = True
                     logger.info(f"  {symbol} {amount}개 → {filled_krw:,.0f}원 매도 완료")
@@ -519,6 +571,22 @@ class TradingEngine:
         if self._paused:
             logger.info("[매수 스킵] 일시 중지 상태")
             return
+
+        # 진입 빈도 제한 — 직전 청산 후 _NEW_ENTRY_MIN_INTERVAL_MIN 미경과 시 스킵 (v4.4)
+        try:
+            last_closed = self._repo.get_last_closed_portfolio_at()
+            if last_closed is not None:
+                elapsed_min = (datetime.utcnow() - last_closed).total_seconds() / 60
+                if elapsed_min < _NEW_ENTRY_MIN_INTERVAL_MIN:
+                    wait_min = _NEW_ENTRY_MIN_INTERVAL_MIN - elapsed_min
+                    logger.info(
+                        f"[진입 간격 제한] 직전 청산 {elapsed_min:.0f}분 전 — "
+                        f"{wait_min:.0f}분 대기 후 재시도"
+                    )
+                    time.sleep(min(wait_min * 60, 5 * 60))
+                    return
+        except Exception as e:
+            logger.debug(f"[진입 간격 체크 스킵] {e}")
 
         krw = self._client.get_krw_balance()
         if krw < settings.MIN_ORDER_KRW:
@@ -559,7 +627,11 @@ class TradingEngine:
                 eval_stats["sl_clamp_max"] = max(
                     eval_stats.get("sl_clamp_max", -1.0), opt.sl_clamp_max)
 
-        # 쿨다운 심볼
+        # 쿨다운 심볼 (DB 기반 손실 블랙리스트도 매 사이클 갱신)
+        try:
+            cooldown_registry.rebuild_loss_blacklist(self._repo, days=7)
+        except Exception as e:
+            logger.debug(f"[블랙리스트 갱신 스킵] {e}")
         cooldown_symbols = cooldown_registry.get_cooldown_symbols()
 
         # CoinSelector: 사전 필터링
@@ -606,10 +678,33 @@ class TradingEngine:
             f"확신도={decision.confidence:.0%}"
         )
 
-        # 투자 비율
-        invest_ratio = getattr(self._agent, "last_invest_ratio", 0.95)
+        # 투자 비율 — 베이스라인 ±10% 범위로 클램프 (v4.4)
+        # AssetManager 의견을 존중하되 극단값(0.3 또는 0.95) 직격타 회피
+        raw_ratio = getattr(self._agent, "last_invest_ratio", 0.65)
+        invest_ratio = max(
+            _INVEST_RATIO_BASE - _INVEST_RATIO_BAND,
+            min(_INVEST_RATIO_BASE + _INVEST_RATIO_BAND, raw_ratio),
+        )
+        if abs(invest_ratio - raw_ratio) > 0.001:
+            logger.info(
+                f"[투자비율 클램프] {raw_ratio:.2f} → {invest_ratio:.2f} "
+                f"(baseline {_INVEST_RATIO_BASE:.0%}±{_INVEST_RATIO_BAND:.0%})"
+            )
+
+        # 단일 코인 최대 진입금 = 총자산 × _MAX_PER_COIN_PCT (v4.4)
+        total_assets = self._calc_total_assets()
+        max_per_coin = total_assets * _MAX_PER_COIN_PCT
         total_invest = krw * invest_ratio
         per_coin_amount = total_invest / len(decision.coins)
+        if per_coin_amount > max_per_coin:
+            new_total = max_per_coin * len(decision.coins)
+            logger.info(
+                f"[포지션 크기 캡] 단일코인 {per_coin_amount:,.0f}원 → {max_per_coin:,.0f}원 "
+                f"(총자산 {total_assets:,.0f} × {_MAX_PER_COIN_PCT:.0%}) "
+                f"/ 총 투입 {total_invest:,.0f} → {new_total:,.0f}원"
+            )
+            total_invest = new_total
+            per_coin_amount = max_per_coin
 
         # 포트폴리오 이름 생성
         portfolio_name = generate_portfolio_name()
@@ -679,6 +774,7 @@ class TradingEngine:
                 # 거래소 체결가 조회 — order_uuid 있으면 실제 avg_price 우선, 없으면 투입금/수량 계산
                 actual_buy_price = per_coin_amount / units  # fallback
                 actual_krw = per_coin_amount
+                buy_fee = 0.0
                 if buy_order_uuid:
                     try:
                         order_info = self._client.get_order_by_uuid(buy_order_uuid)
@@ -691,9 +787,11 @@ class TradingEngine:
                             actual_buy_price = order_info["avg_price"]
                             if order_info.get("executed_funds", 0) > 0:
                                 actual_krw = order_info["executed_funds"]
+                            buy_fee = float(order_info.get("paid_fee", 0) or 0)
                             logger.debug(
                                 f"  [체결가 확인] {coin.symbol} "
-                                f"avg={actual_buy_price:,.0f}원 실체결={actual_krw:,.0f}원"
+                                f"avg={actual_buy_price:,.0f}원 실체결={actual_krw:,.0f}원 "
+                                f"수수료={buy_fee:,.0f}원"
                             )
                     except Exception as _e:
                         logger.debug(f"  [체결가 조회 실패] {coin.symbol}: {_e} — 계산값 사용")
@@ -701,7 +799,8 @@ class TradingEngine:
                 self._repo.save_trade(
                     symbol=coin.symbol, side="buy",
                     price=actual_buy_price, units=units,
-                    krw_amount=actual_krw, note=coin.reason,
+                    krw_amount=actual_krw, fee=buy_fee, order_id=buy_order_uuid,
+                    note=coin.reason,
                     portfolio_id=portfolio.id,
                 )
                 self._repo.open_position(
@@ -859,6 +958,19 @@ class TradingEngine:
             )
             return
 
+        # 조기 무수익 청산: 3시간 경과해도 peak < +1% 면 자본 회전 우선 강제 종료 (v4.4)
+        if (
+            holding_minutes >= _EARLY_CHECK_MIN
+            and tracker.peak_pnl_pct < _EARLY_PEAK_THRESHOLD
+            and tracker.phase != _ExitPhase.TRAILING_TP
+        ):
+            self._execute_portfolio_sell(
+                portfolio, positions, pnl_pct, coin_details,
+                f"무수익 조기청산 ({holding_minutes:.0f}분, peak={tracker.peak_pnl_pct:+.2f}%<{_EARLY_PEAK_THRESHOLD}%)",
+                target_prices=target_prices,
+            )
+            return
+
         # ── 상태 머신 분기 ──
         if tracker.phase == _ExitPhase.TRAILING_TP:
             self._handle_trailing_tp(
@@ -936,28 +1048,28 @@ class TradingEngine:
                 except Exception:
                     pass
 
-        # ── 2차 분할 익절: +3.0% 도달 (트레일링 진입선이 더 높을 때만 동작) ──
+        # ── 2차 분할 익절: +2.5% 도달 (트레일링 진입선이 더 높을 때만 동작) ──
         elif not tracker.tier2_tp_sold and pnl_pct >= _TIER2_TP_PCT:
             logger.info(
                 f"[2차 분할 익절] '{portfolio.name}' {pnl_pct:+.2f}% >= +{_TIER2_TP_PCT}% "
-                f"→ {_TIER_TP_RATIO:.0%} 매도 (수익 확정)"
+                f"→ {_TIER2_TP_RATIO:.0%} 매도 (수익 확정)"
             )
             self._execute_portfolio_partial_sell(
-                portfolio, positions, ratio=_TIER_TP_RATIO,
+                portfolio, positions, ratio=_TIER2_TP_RATIO,
                 reason=f"2차 분할 익절 +{_TIER2_TP_PCT}% ({pnl_pct:+.2f}%)",
                 target_prices=target_prices,
             )
             tracker.tier2_tp_sold = True
             tracker.tier1_tp_sold = True  # 1차 단계도 자동 통과 처리
 
-        # ── 1차 분할 익절: +1.5% 도달 → 수익 확정 (피크 회귀 방지) ──
+        # ── 1차 분할 익절: +1.0% 도달 → 수익 절반 확정 (피크 회귀 방지) ──
         elif not tracker.tier1_tp_sold and pnl_pct >= _TIER1_TP_PCT:
             logger.info(
                 f"[1차 분할 익절] '{portfolio.name}' {pnl_pct:+.2f}% >= +{_TIER1_TP_PCT}% "
-                f"→ {_TIER_TP_RATIO:.0%} 매도 (수익 확정)"
+                f"→ {_TIER1_TP_RATIO:.0%} 매도 (수익 확정)"
             )
             self._execute_portfolio_partial_sell(
-                portfolio, positions, ratio=_TIER_TP_RATIO,
+                portfolio, positions, ratio=_TIER1_TP_RATIO,
                 reason=f"1차 분할 익절 +{_TIER1_TP_PCT}% ({pnl_pct:+.2f}%)",
                 target_prices=target_prices,
             )
@@ -974,9 +1086,12 @@ class TradingEngine:
                 target_prices=target_prices,
             )
 
-        # ── Tier 1: -1.0% → AI 평가 기반 비율 매도 ──
-        elif not tracker.tier1_sold and pnl_pct <= _TIER1_SL_PCT:
-            sell_ratio = 0.5  # 기본값: 50%
+        # ── Tier 1 분할 손절 비활성 (v4.2) ──
+        # 데이터 분석 결과: -1.0% 분할 손절 → 잔여분 -1.5% 최종 손절 패턴 반복 (실손실 누적)
+        # 분할 손절은 회복 가능성을 차단하므로 폐지. 단일 -1.5% 손절만 유지.
+        # _TIER1_SL_PCT가 None이 아닐 때만 작동 (긴급 복원 가능)
+        elif _TIER1_SL_PCT is not None and not tracker.tier1_sold and pnl_pct <= _TIER1_SL_PCT:
+            sell_ratio = 0.5
             sell_reason = "기본"
             if self._agent:
                 try:
@@ -1104,6 +1219,7 @@ class TradingEngine:
                         price=fill["filled_price"],
                         units=fill["filled_units"],
                         krw_amount=fill["filled_krw"],
+                        fee=fill.get("paid_fee", 0.0),
                         note=f"{reason} [{fill['method']}]",
                         order_id=fill["order_uuid"],
                         portfolio_id=portfolio.id,
@@ -1211,6 +1327,7 @@ class TradingEngine:
                         price=filled_price,
                         units=fill["filled_units"],
                         krw_amount=krw_value,
+                        fee=fill.get("paid_fee", 0.0),
                         note=f"{reason} [{fill['method']}]",
                         order_id=fill["order_uuid"],
                         portfolio_id=portfolio.id,
@@ -1555,6 +1672,7 @@ class TradingEngine:
                 # 거래소 체결가 조회 — 실체결가 우선, 없으면 계산값 fallback
                 actual_add_price = per_coin_add / add_units
                 actual_add_krw = per_coin_add
+                add_fee = 0.0
                 if pyr_order_uuid:
                     try:
                         pyr_info = self._client.get_order_by_uuid(pyr_order_uuid)
@@ -1565,13 +1683,14 @@ class TradingEngine:
                             actual_add_price = pyr_info["avg_price"]
                             if pyr_info.get("executed_funds", 0) > 0:
                                 actual_add_krw = pyr_info["executed_funds"]
+                            add_fee = float(pyr_info.get("paid_fee", 0) or 0)
                     except Exception as _e:
                         logger.debug(f"  [피라미딩 체결가 조회 실패] {pos.symbol}: {_e}")
 
                 self._repo.save_trade(
                     symbol=pos.symbol, side="buy",
                     price=actual_add_price, units=add_units,
-                    krw_amount=actual_add_krw,
+                    krw_amount=actual_add_krw, fee=add_fee, order_id=pyr_order_uuid,
                     note=f"피라미딩 추가매수 ({pnl_pct:+.2f}%)",
                     portfolio_id=portfolio.id,
                 )

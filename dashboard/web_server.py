@@ -1677,9 +1677,14 @@ def _build_experts_data(coordinator: "AgentCoordinator | None") -> dict:
                 live = coordinator.get_agent_scores()
                 agent_info["current_score"] = round(live.get(role, agent_info["current_score"]), 1)
 
-            # 특성 분석가 전용: 관리 중인 코인 목록 추가
+            # 특성 분석가 전용: 관리 중인 코인 목록 + 블랙리스트
             if role == "coin_profile_analyst" and coordinator:
                 agent_info["profiled_coins"] = coordinator.list_coin_profiles()
+                try:
+                    agent_info["blacklist"] = coordinator.get_blacklist()
+                except Exception as e:
+                    logger.warning(f"[블랙리스트 조회 실패] {e}")
+                    agent_info["blacklist"] = []
 
             agents_data.append(agent_info)
 
@@ -1761,23 +1766,70 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
         profiled_html = ""
         if role == "coin_profile_analyst":
             coins = a.get("profiled_coins", [])
+            blacklist = a.get("blacklist", []) or []
+            bl_map = {b["symbol"]: b for b in blacklist}
+
             if coins:
-                tags = "".join(
-                    f'<span onclick="showCoinProfile(\'{c}\')" '
-                    f'style="background:#0f172a; border:1px solid #334155; '
-                    f'border-radius:4px; padding:2px 7px; font-size:0.73rem; '
-                    f'color:#38bdf8; margin:2px 2px 0 0; display:inline-block; '
-                    f'cursor:pointer;" '
-                    f'onmouseover="this.style.borderColor=\'#38bdf8\'" '
-                    f'onmouseout="this.style.borderColor=\'#334155\'">'
-                    f'{c}</span>'
-                    for c in coins
-                )
+                tag_parts = []
+                for c in coins:
+                    bl = bl_map.get(c)
+                    if bl:
+                        # 블랙리스트 마킹 — 빨간 테두리 + 잔여일
+                        tag_parts.append(
+                            f'<span onclick="showCoinProfile(\'{c}\')" '
+                            f'style="background:#1f1014; border:1px solid #b91c1c; '
+                            f'border-radius:4px; padding:2px 7px; font-size:0.73rem; '
+                            f'color:#fca5a5; margin:2px 2px 0 0; display:inline-block; '
+                            f'cursor:pointer;" '
+                            f'onmouseover="this.style.borderColor=\'#f87171\'" '
+                            f'onmouseout="this.style.borderColor=\'#b91c1c\'" '
+                            f'title="블랙리스트 {bl["days_left"]:.1f}일 남음 — {bl["reason"]}">'
+                            f'⛔ {c} '
+                            f'<span style="color:#94a3b8; font-size:0.66rem;">{bl["days_left"]:.0f}d</span>'
+                            f'</span>'
+                        )
+                    else:
+                        tag_parts.append(
+                            f'<span onclick="showCoinProfile(\'{c}\')" '
+                            f'style="background:#0f172a; border:1px solid #334155; '
+                            f'border-radius:4px; padding:2px 7px; font-size:0.73rem; '
+                            f'color:#38bdf8; margin:2px 2px 0 0; display:inline-block; '
+                            f'cursor:pointer;" '
+                            f'onmouseover="this.style.borderColor=\'#38bdf8\'" '
+                            f'onmouseout="this.style.borderColor=\'#334155\'">'
+                            f'{c}</span>'
+                        )
+
+                # 프로파일 없는 블랙리스트 코인도 함께 노출 (재평가/해제 가능하도록)
+                profiled_set = set(coins)
+                for bl in blacklist:
+                    if bl["symbol"] in profiled_set:
+                        continue
+                    sym = bl["symbol"]
+                    tag_parts.append(
+                        f'<span onclick="showCoinProfile(\'{sym}\')" '
+                        f'style="background:#1f1014; border:1px solid #b91c1c; '
+                        f'border-radius:4px; padding:2px 7px; font-size:0.73rem; '
+                        f'color:#fca5a5; margin:2px 2px 0 0; display:inline-block; '
+                        f'cursor:pointer;" '
+                        f'title="블랙리스트 {bl["days_left"]:.1f}일 남음 — {bl["reason"]}">'
+                        f'⛔ {sym} '
+                        f'<span style="color:#94a3b8; font-size:0.66rem;">{bl["days_left"]:.0f}d</span>'
+                        f'</span>'
+                    )
+
+                bl_count_html = ""
+                if blacklist:
+                    bl_count_html = (
+                        f' &nbsp; <span style="color:#f87171; font-size:0.7rem;">'
+                        f'⛔ 블랙리스트 {len(blacklist)}개</span>'
+                    )
+
                 profiled_html = (
                     f'<div style="margin-top:10px; padding-top:10px; border-top:1px solid #334155;">'
                     f'<div style="font-size:0.75rem; color:#64748b; margin-bottom:6px;">'
-                    f'프로파일 관리 중 ({len(coins)}개) — 클릭하면 상세 내용 확인</div>'
-                    f'{tags}</div>'
+                    f'프로파일 관리 중 ({len(coins)}개){bl_count_html} — 클릭하면 상세 내용 확인</div>'
+                    f'{"".join(tag_parts)}</div>'
                 )
             else:
                 profiled_html = (
@@ -2164,37 +2216,147 @@ def _render_experts_page(coordinator: "AgentCoordinator | None") -> str:
 </div>
 
 <div id="coin-profile-modal" class="modal-overlay" onclick="if(event.target===this)closeCoinProfile()">
-  <div class="modal-box" style="max-width:640px;">
+  <div class="modal-box" style="max-width:680px;">
     <div class="modal-header">
       <span id="cpm-title" class="modal-title">코인 프로파일</span>
       <button class="modal-close" onclick="closeCoinProfile()">&#215;</button>
     </div>
+    <div id="cpm-blacklist-banner" style="display:none; padding:10px 14px;
+         background:#1f1014; border-bottom:1px solid #b91c1c; color:#fca5a5;
+         font-size:0.82rem;">
+    </div>
     <div id="cpm-body" class="modal-body"
          style="font-family:'Courier New',monospace; font-size:0.82rem;
-                line-height:1.6; white-space:pre-wrap; word-break:break-word;">
+                line-height:1.6; white-space:pre-wrap; word-break:break-word;
+                max-height:340px; overflow-y:auto;">
       로딩 중...
+    </div>
+    <div id="cpm-reeval-result" style="display:none; padding:10px 14px;
+         background:#0f1d2e; border-top:1px solid #1e3a5c; color:#cbd5e1;
+         font-size:0.8rem; line-height:1.5; max-height:220px; overflow-y:auto;">
+    </div>
+    <div class="modal-footer" style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
+      <button id="cpm-btn-reeval" class="mbtn mbtn-secondary"
+              style="display:none; background:#1e293b; border:1px solid #2563eb; color:#93c5fd;"
+              onclick="reevaluateCoin()">🔍 종목 재평가</button>
+      <button id="cpm-btn-release" class="mbtn mbtn-secondary"
+              style="display:none; background:#1e293b; border:1px solid #b91c1c; color:#fca5a5;"
+              onclick="releaseCoin()">⛔ 즉시 해제</button>
+      <button class="mbtn mbtn-secondary" onclick="closeCoinProfile()">닫기</button>
     </div>
   </div>
 </div>
 
 <script>
+let _currentCoinSymbol = null;
+
 function showCoinProfile(symbol) {
+  _currentCoinSymbol = symbol;
   document.getElementById('cpm-title').textContent = symbol + ' 특성 프로파일';
   document.getElementById('cpm-body').textContent = '로딩 중...';
+  document.getElementById('cpm-blacklist-banner').style.display = 'none';
+  document.getElementById('cpm-reeval-result').style.display = 'none';
+  document.getElementById('cpm-reeval-result').innerHTML = '';
+  document.getElementById('cpm-btn-reeval').style.display = 'none';
+  document.getElementById('cpm-btn-release').style.display = 'none';
   document.getElementById('coin-profile-modal').style.display = 'flex';
+
+  // 1) 프로파일 조회
   fetch('/api/coin_profile?symbol=' + encodeURIComponent(symbol))
     .then(r => r.json())
     .then(d => {
       if (d.content) {
         document.getElementById('cpm-body').textContent = d.content;
       } else {
-        document.getElementById('cpm-body').textContent = '프로파일 없음: ' + (d.error || '');
+        document.getElementById('cpm-body').textContent = '(프로파일 없음 — 매매 이력 부족)';
       }
     })
     .catch(e => { document.getElementById('cpm-body').textContent = '조회 실패: ' + e; });
+
+  // 2) 블랙리스트 여부 조회 → 배너/버튼 노출
+  fetch('/api/blacklist')
+    .then(r => r.json())
+    .then(d => {
+      const items = d.items || [];
+      const bl = items.find(b => b.symbol === symbol);
+      if (bl) {
+        const banner = document.getElementById('cpm-blacklist-banner');
+        banner.innerHTML =
+          '⛔ <b>블랙리스트 등록 중</b> &nbsp;|&nbsp; ' +
+          '잔여 ' + bl.days_left.toFixed(1) + '일 (만료 ' + bl.expires_at_kst + ')<br>' +
+          '<span style="color:#94a3b8; font-size:0.78rem;">사유: ' + bl.reason + '</span>';
+        banner.style.display = 'block';
+        document.getElementById('cpm-btn-reeval').style.display = 'inline-block';
+        document.getElementById('cpm-btn-release').style.display = 'inline-block';
+      }
+    })
+    .catch(() => {});
 }
+
 function closeCoinProfile() {
   document.getElementById('coin-profile-modal').style.display = 'none';
+  _currentCoinSymbol = null;
+}
+
+function reevaluateCoin() {
+  if (!_currentCoinSymbol) return;
+  const box = document.getElementById('cpm-reeval-result');
+  box.style.display = 'block';
+  box.innerHTML = '🤖 시장 분석가·포트폴리오 평가가에게 재평가 요청 중... (수 초 소요)';
+  const btn = document.getElementById('cpm-btn-reeval');
+  btn.disabled = true; btn.textContent = '평가 중...';
+
+  fetch('/api/coin/reevaluate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({symbol: _currentCoinSymbol}),
+  })
+    .then(r => r.json())
+    .then(d => {
+      btn.disabled = false; btn.textContent = '🔍 종목 재평가';
+      if (d.error) {
+        box.innerHTML = '❌ 평가 실패: ' + d.error;
+        return;
+      }
+      const verdictMap = {
+        'release': '<span style="color:#4ade80;">✅ 해제 권고</span>',
+        'keep':    '<span style="color:#f87171;">🚫 유지 권고</span>',
+        'uncertain': '<span style="color:#facc15;">❓ 판단 보류</span>',
+      };
+      const conf = (d.confidence || 0) * 100;
+      box.innerHTML =
+        '<div style="margin-bottom:8px;"><b>판정:</b> ' + (verdictMap[d.verdict] || d.verdict) +
+        ' <span style="color:#94a3b8;">(확신도 ' + conf.toFixed(0) + '%)</span></div>' +
+        '<div style="margin-bottom:8px;"><b>사유:</b> ' + (d.reason || '') + '</div>' +
+        '<div style="margin-top:8px; padding-top:8px; border-top:1px solid #1e3a5c; color:#94a3b8; font-size:0.75rem;">' +
+        '<b>시장 분석가:</b> ' + (d.market_view || '') + '</div>';
+    })
+    .catch(e => {
+      btn.disabled = false; btn.textContent = '🔍 종목 재평가';
+      box.innerHTML = '❌ 요청 실패: ' + e;
+    });
+}
+
+function releaseCoin() {
+  if (!_currentCoinSymbol) return;
+  if (!confirm(_currentCoinSymbol + ' 블랙리스트에서 즉시 해제하시겠습니까?')) return;
+  fetch('/api/coin/release_blacklist', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({symbol: _currentCoinSymbol}),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.success) {
+        alert(_currentCoinSymbol + ' 블랙리스트 해제 완료');
+        closeCoinProfile();
+        // 페이지 새로고침으로 목록 갱신
+        location.reload();
+      } else {
+        alert('해제 실패: ' + (d.error || '대상 없음'));
+      }
+    })
+    .catch(e => alert('요청 실패: ' + e));
 }
 </script>
 """
@@ -2508,6 +2670,15 @@ class _Handler(BaseHTTPRequestHandler):
                     body = json.dumps({"error": f"{symbol} 프로파일 없음"}).encode()
                     self._respond(404, "application/json; charset=utf-8", body)
 
+        elif self.path == "/api/blacklist":
+            try:
+                items = self.coordinator.get_blacklist() if self.coordinator else []
+                body = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
+                self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+                self._respond(500, "application/json; charset=utf-8", body)
+
         elif self.path == "/profile.png":
             img_path = _PROFILE_IMG
             if img_path.exists():
@@ -2561,6 +2732,42 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     success = self.coordinator.update_agent_prompt(role, new_prompt)
                     body = json.dumps({"success": success}, ensure_ascii=False).encode("utf-8")
+                    self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                body = json.dumps({"success": False, "error": str(e)}).encode()
+                self._respond(500, "application/json; charset=utf-8", body)
+
+        elif self.path == "/api/coin/reevaluate":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length)) if length > 0 else {}
+                symbol = (req.get("symbol") or "").upper()
+                if not self.coordinator or not symbol:
+                    body = json.dumps({"error": "coordinator/symbol 필수"}).encode()
+                    self._respond(400, "application/json; charset=utf-8", body)
+                else:
+                    result = self.coordinator.reevaluate_coin(symbol)
+                    body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                    self._respond(200, "application/json; charset=utf-8", body)
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+                self._respond(500, "application/json; charset=utf-8", body)
+
+        elif self.path == "/api/coin/release_blacklist":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length)) if length > 0 else {}
+                symbol = (req.get("symbol") or "").upper()
+                if not self.coordinator or not symbol:
+                    body = json.dumps({"success": False, "error": "coordinator/symbol 필수"}).encode()
+                    self._respond(400, "application/json; charset=utf-8", body)
+                else:
+                    removed = self.coordinator.remove_from_blacklist(symbol)
+                    body = json.dumps(
+                        {"success": removed, "symbol": symbol,
+                         "error": "" if removed else "블랙리스트에 없는 코인"},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
                     self._respond(200, "application/json; charset=utf-8", body)
             except Exception as e:
                 body = json.dumps({"success": False, "error": str(e)}).encode()

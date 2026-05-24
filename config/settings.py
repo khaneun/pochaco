@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------- #
     HEADLESS: bool = False              # True = 터미널 UI 없이 서비스로 실행
     APP_NAME: str = "pochaco"           # 서비스 식별자 (kuromi 등 다른 인스턴스 지원)
+    # 신규 진입 킬스위치 (v5.0) — false 시 신규 포트폴리오 진입 정지.
+    # 보유 포지션 청산 감시는 계속 동작. .env의 ENTRY_ENABLED=false 로 제어.
+    ENTRY_ENABLED: bool = True
 
     # ---------------------------------------------------------------- #
     #  AWS                                                              #

@@ -103,6 +103,7 @@ class MetaEvaluator(BaseSpecialistAgent):
                 "decision_logs": list,    # 최근 3시간 의사결정 기록
                 "trade_results": list,    # 최근 매매 결과
                 "current_scores": dict,   # 각 agent 현재 점수 {role: score}
+                "coin_pnl_summary": dict, # {symbol: {count, total_pnl_krw, avg_pnl_pct}} (옵션)
             }
 
         Returns:
@@ -111,12 +112,34 @@ class MetaEvaluator(BaseSpecialistAgent):
         decision_logs = context.get("decision_logs", [])
         trade_results = context.get("trade_results", [])
         current_scores = context.get("current_scores", {})
+        coin_pnl_summary = context.get("coin_pnl_summary", {})
 
         try:
             # 의사결정 기록 텍스트
             decision_logs_text = self._format_decision_logs(decision_logs)
             trade_results_text = self._format_trade_results(trade_results)
             current_scores_text = self._format_current_scores(current_scores)
+            coin_pnl_text = self._format_coin_pnl_summary(coin_pnl_summary)
+
+            # 손실 빈발 코인 추출 (directive에 명시적 회피 지시 강제)
+            loss_coins_text = ""
+            if coin_pnl_summary:
+                losers = [
+                    (sym, data) for sym, data in coin_pnl_summary.items()
+                    if data.get("total_pnl_krw", 0) < -3000
+                ]
+                losers.sort(key=lambda x: x[1].get("total_pnl_krw", 0))
+                if losers:
+                    top_losers = losers[:5]
+                    loss_coins_text = (
+                        "\n【★ 손실 빈발 코인 (반드시 directive에 회피 지시 포함) ★】\n"
+                        + "\n".join(
+                            f"  • {sym}: {d['count']}회, "
+                            f"누적 {d.get('total_pnl_krw', 0):.0f}원, "
+                            f"평균 {d.get('avg_pnl_pct', 0):+.2f}%"
+                            for sym, d in top_losers
+                        )
+                    )
 
             task_prompt = f"""최근 3시간 전문가별 의사결정 기록:
 {decision_logs_text}
@@ -124,14 +147,20 @@ class MetaEvaluator(BaseSpecialistAgent):
 최근 포트폴리오 매매 결과:
 {trade_results_text}
 
+【최근 코인별 손익 분포】
+{coin_pnl_text}{loss_coins_text}
+
 현재 점수: {current_scores_text}
 
 【평가 요청】
 5명의 전문가를 각각 평가하세요.
-★ directive가 핵심입니다. 해당 전문가의 다음 LLM 호출에 직접 주입되므로:
+★ directive 작성 강제 룰 (위반 시 평가가 본인이 감점):
   - 명령형으로 작성 ("~하세요", "~금지")
-  - 구체적 수치 포함 ("TP를 3% 이하로", "BTC 포함 필수")
-  - 데이터 근거 포함 ("최근 3건 손절이므로")
+  - 반드시 구체적 수치 포함 (예: "TP를 3% 이하로", "BTC 포함 필수")
+  - 데이터 근거 포함 (예: "최근 3건 손절이므로", "{loss_coins_text and '손실 빈발 코인 명시 회피'}")
+  - "현재 방향 유지" / "데이터 수집" / "더 잘하세요" 같은 추상 표현 금지
+  - 손실 빈발 코인이 있으면 buy_strategist directive에 회피 코인 명시 강제
+    (예: "MERL/KAT 매수 금지 — 5회 누적 -50000원 손실")
 
 각 전문가의 역할과 평가 관점:
 - market_analyst: 시장 심리 판단 정확도 → 결과와 일치했나?
@@ -281,6 +310,24 @@ JSON으로만 응답 (마크다운 코드블록 없이):
                     lines.append(f"   💡 교훈: {lesson[:100]}")
             else:
                 lines.append(f"{i}. {r}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_coin_pnl_summary(summary: dict) -> str:
+        """코인별 손익 분포 요약 (directive에 회피 코인 강제 주입용)"""
+        if not summary:
+            return "데이터 없음"
+        items = sorted(
+            summary.items(),
+            key=lambda x: x[1].get("total_pnl_krw", 0),
+        )
+        lines = []
+        for sym, d in items[:15]:
+            count = d.get("count", 0)
+            tot = d.get("total_pnl_krw", 0)
+            avg = d.get("avg_pnl_pct", 0)
+            tag = "🔴" if tot < -3000 else ("🟢" if tot > 3000 else "⚪")
+            lines.append(f"  {tag} {sym}: {count}회, 누적 {tot:+,.0f}원, 평균 {avg:+.2f}%")
         return "\n".join(lines)
 
     @staticmethod

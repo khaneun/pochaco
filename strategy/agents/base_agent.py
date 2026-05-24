@@ -35,6 +35,8 @@ class BaseSpecialistAgent(ABC):
         self._reflection_summary: str = ""  # 최근 반성문 요약 (DB → 주입)
         self._score: float = 50.0
         self._feedback_history: list[dict] = []  # 최근 피드백 히스토리
+        # 피드백 주입 검증용 — 마지막 로그 출력 시점 (epoch sec) (v4.4)
+        self._last_inject_log_ts: float = 0.0
 
     @property
     def role_name(self) -> str:
@@ -210,7 +212,21 @@ class BaseSpecialistAgent(ABC):
 
     def _call_llm(self, task_prompt: str, max_tokens: int = 512) -> str:
         """시스템 컨텍스트 + 작업 프롬프트로 LLM 호출 (429 자동 재시도 포함)"""
-        full_prompt = f"{self._build_system_context()}\n\n---\n\n{task_prompt}"
+        system_ctx = self._build_system_context()
+        full_prompt = f"{system_ctx}\n\n---\n\n{task_prompt}"
+        # 피드백 주입 검증 로그 (v4.4) — 30분에 1회씩 주입 상태 확인
+        now = time.time()
+        if (
+            (self._feedback_prompt or self._reflection_summary)
+            and now - self._last_inject_log_ts > 1800
+        ):
+            logger.info(
+                f"[{self.ROLE_NAME}] LLM 호출 — base={len(self._base_prompt)}자 "
+                f"+ feedback={len(self._feedback_prompt)}자 "
+                f"+ reflection={len(self._reflection_summary)}자 "
+                f"(score={self._score:.0f})"
+            )
+            self._last_inject_log_ts = now
         self._llm._current_agent = self.ROLE_NAME or "unknown"
         last_exc: Exception | None = None
         for attempt in range(4):  # 최대 4회 시도 (지수 백오프: 5s, 15s, 45s)

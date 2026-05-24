@@ -26,6 +26,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from config import settings
 from .market_analyzer import CoinSnapshot
 
 if TYPE_CHECKING:
@@ -33,8 +34,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 필터링 기준
-_MIN_VOLUME_KRW     = 5_000_000_000  # 50억원 — 유동성 하한
+# 필터링 기준 — 거래소별 분기 (v4.4)
+# 빗썸은 저유동성 알트코인 비중이 높아 임계값을 더 보수적으로 설정.
+# 분석 결과: pochaco(빗썸) WLD/SUI/IO 등 손실 누적 — 거래대금 임계 상향 필요.
+def _exchange_min_volume_krw() -> int:
+    if settings.EXCHANGE_PROVIDER == "bithumb":
+        return 30_000_000_000   # 300억원 (이전 100억 → 300억)
+    return 10_000_000_000       # 100억원 (업비트 유지)
+
+_MIN_VOLUME_KRW     = _exchange_min_volume_krw()
 _TOP_CANDIDATES     = 20             # AI에 전달할 최대 후보 수 (8개 포트폴리오 구성용)
 
 # 하락 추세 판정 임계값
@@ -232,10 +240,11 @@ class CoinSelector:
                 rejected += 1
                 continue
 
-            # 거래대금 필터
+            # 거래대금 필터 (거래소별 임계값)
             if s.volume_krw_24h < _MIN_VOLUME_KRW:
                 logger.debug(
-                    f"  [제외] {s.symbol}: 거래대금 {s.volume_krw_24h/1e8:.0f}억 < 50억"
+                    f"  [제외] {s.symbol}: 거래대금 {s.volume_krw_24h/1e8:.0f}억 < "
+                    f"{_MIN_VOLUME_KRW/1e8:.0f}억 ({settings.EXCHANGE_PROVIDER})"
                 )
                 rejected += 1
                 continue

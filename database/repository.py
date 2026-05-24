@@ -2,7 +2,7 @@
 import json
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Generator
 
 from sqlalchemy import func
@@ -106,6 +106,20 @@ class TradeRepository:
             pf = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
             if pf:
                 pf.total_buy_krw = total_buy_krw
+
+    def get_last_closed_portfolio_at(self) -> datetime | None:
+        """가장 최근에 청산된 포트폴리오의 closed_at (UTC) 반환.
+
+        진입 간격 제한 체크에 사용. 청산 이력이 없으면 None.
+        """
+        with self._session() as db:
+            row = (
+                db.query(Portfolio.closed_at)
+                .filter(Portfolio.is_open == False, Portfolio.closed_at.isnot(None))
+                .order_by(Portfolio.closed_at.desc())
+                .first()
+            )
+            return row[0] if row else None
 
     def update_portfolio_targets(
         self, portfolio_id: int, new_tp: float, new_sl: float,
@@ -641,19 +655,30 @@ class TradeRepository:
                 for e in evals[:5]
             ]
 
-            # ── suggested 기반 적응형 clamp 범위 ──
+            # ── suggested 기반 적응형 clamp 범위 (v4.3 — 3.0~4.5 좁은 범위) ──
             if len(evals) >= 3:
                 weights = [2.0 if i < 3 else 1.0 for i in range(len(evals))]
                 w_sum = sum(weights)
                 w_tp = sum(e.suggested_tp_pct * w for e, w in zip(evals, weights)) / w_sum
 
-                tp_clamp_min = max(4.0, round(w_tp - 1.0, 1))
-                tp_clamp_max = min(10.0, round(w_tp + 1.5, 1))
+                tp_clamp_min = max(3.0, round(w_tp - 0.5, 1))
+                tp_clamp_max = min(4.5, round(w_tp + 0.5, 1))
                 sl_clamp_min = -2.0
                 sl_clamp_max = -1.0
             else:
-                tp_clamp_min, tp_clamp_max = 4.0, 8.0
+                tp_clamp_min, tp_clamp_max = 3.0, 4.5
                 sl_clamp_min, sl_clamp_max = -2.0, -1.0
+
+            # ── 마지막 evaluation 시각 (서킷 브레이커 자동 해제용) ──
+            last_eval_at = evals[0].created_at if evals else None
+            hours_since_last_eval: float | None = None
+            if last_eval_at is not None:
+                # DB는 UTC, naive datetime이므로 tzinfo 보정
+                if last_eval_at.tzinfo is None:
+                    last_eval_at = last_eval_at.replace(tzinfo=timezone.utc)
+                hours_since_last_eval = (
+                    datetime.now(tz=timezone.utc) - last_eval_at
+                ).total_seconds() / 3600.0
 
             return {
                 "count": len(evals),
@@ -674,6 +699,8 @@ class TradeRepository:
                 "tp_clamp_max": tp_clamp_max,
                 "sl_clamp_min": sl_clamp_min,
                 "sl_clamp_max": sl_clamp_max,
+                "hours_since_last_eval": round(hours_since_last_eval, 2)
+                    if hours_since_last_eval is not None else None,
             }
 
     # ------------------------------------------------------------------ #
