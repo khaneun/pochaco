@@ -1286,8 +1286,34 @@ class TradingEngine:
                 # pos.units 기준으로 청산 (다른 포트폴리오 잔여분 혼입 방지)
                 wallet_units = self._client.get_coin_balance(pos.symbol)
                 actual_units = min(pos.units, wallet_units) if wallet_units > 0 else 0.0
-                if actual_units <= 0:
-                    # 이미 분할 매도로 전부 팔림 — Trade 테이블에서 원매수금·실제 수익 조회
+
+                # 목표 매도가 결정 (dust 판정 + 매도 주문 공용)
+                tgt_price = tgt_map.get(pos.symbol, 0)
+                if tgt_price <= 0:
+                    try:
+                        tgt_price = self._client.get_current_price(pos.symbol)
+                    except Exception:
+                        tgt_price = detail_price_map.get(pos.symbol, 0) or pos.buy_price
+
+                # dust 가드 — 수량은 있으나 평가금액 < 최소주문금액이면 빗썸이
+                # under_min_total_ask로 주문을 거부한다. 분할 매도 후 잔여분이
+                # 시세 하락으로 5,000원 미만이 되면 영원히 매도 불가 → 무한 재시도.
+                # 이 경우 매도를 시도하지 않고 dust로 간주, 포지션만 종료(잔량은 지갑 잔존).
+                is_dust = (
+                    actual_units > 0
+                    and tgt_price > 0
+                    and actual_units * tgt_price < settings.MIN_ORDER_KRW
+                )
+
+                if actual_units <= 0 or is_dust:
+                    if is_dust:
+                        logger.warning(
+                            f"  {pos.symbol} dust 잔량 {actual_units:.6f}개 "
+                            f"(평가 {actual_units * tgt_price:.0f}원 < "
+                            f"{settings.MIN_ORDER_KRW}원) — 매도 불가, 포지션 종료 "
+                            f"(잔량 지갑 잔존)"
+                        )
+                    # 이미 분할 매도로 전부 팔렸거나 dust — Trade 테이블에서 원매수금·실현수익 조회
                     # pos.buy_krw는 분할 매도 후 잔여분 비례로 줄어든 값이므로 직접 사용 불가
                     coin_sell_krw = self._repo.get_coin_sell_total(portfolio.id, pos.symbol)
                     original_buy_krw = self._repo.get_coin_buy_total(portfolio.id, pos.symbol) or pos.buy_krw
@@ -1308,14 +1334,6 @@ class TradingEngine:
                     })
                     self._repo.close_position(pos.id)
                     continue
-
-                # 목표 매도가 결정
-                tgt_price = tgt_map.get(pos.symbol, 0)
-                if tgt_price <= 0:
-                    try:
-                        tgt_price = self._client.get_current_price(pos.symbol)
-                    except Exception:
-                        tgt_price = detail_price_map.get(pos.symbol, 0) or pos.buy_price
 
                 fill = self._limit_sell_with_retry(pos.symbol, tgt_price, actual_units)
                 if fill["status"] == "0000":
