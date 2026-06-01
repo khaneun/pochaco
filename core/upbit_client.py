@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 # 업비트 public API: 초당 10req, private: 초당 8req
 # 안전 마진을 두어 0.13s 간격 유지 (~7.5 req/s)
 _REQ_INTERVAL = 0.13
+
+# KRW 마켓 목록 캐시 TTL — 상장폐지 코인 반영 (장기 무재시작 시 stale 방지)
+_MARKETS_CACHE_TTL_SEC = 3600.0
 _rate_lock = threading.Lock()
 _last_req_time: float = 0.0
 
@@ -62,6 +65,7 @@ class UpbitClient(BaseExchangeClient):
         self._session = requests.Session()
         self._session.headers.update({"Accept": "application/json"})
         self._markets_cache: list[str] | None = None  # KRW-XXX 목록 캐시
+        self._markets_cache_ts: float = 0.0            # 캐시 적재 시각 (TTL 판정)
 
     # ------------------------------------------------------------------ #
     #  인증 헬퍼 (JWT HS256 — 빗썸 v2와 동일 방식)                         #
@@ -115,8 +119,16 @@ class UpbitClient(BaseExchangeClient):
     #  내부 헬퍼                                                            #
     # ------------------------------------------------------------------ #
     def _get_krw_markets(self) -> list[str]:
-        """KRW 마켓 목록 반환 (세션 내 캐시)"""
-        if self._markets_cache is None:
+        """KRW 마켓 목록 반환 (TTL 캐시 — 상장폐지 코인 반영)
+
+        장기 무재시작 시 캐시가 stale 되어 폐지 코인이 남으면 ticker 배치 조회가
+        404로 깨지므로 _MARKETS_CACHE_TTL_SEC 주기로 갱신한다.
+        """
+        now = time.monotonic()
+        if (
+            self._markets_cache is None
+            or now - self._markets_cache_ts > _MARKETS_CACHE_TTL_SEC
+        ):
             resp = self._req_get(
                 f"{self.BASE_URL}/v1/market/all",
                 params={"isDetails": "false"},
@@ -126,6 +138,7 @@ class UpbitClient(BaseExchangeClient):
             self._markets_cache = [
                 m["market"] for m in resp.json() if m["market"].startswith("KRW-")
             ]
+            self._markets_cache_ts = now
         return self._markets_cache
 
     @staticmethod
@@ -154,12 +167,21 @@ class UpbitClient(BaseExchangeClient):
             ticker_data: dict = {}
             for i in range(0, len(markets), 100):
                 batch = markets[i:i + 100]
-                resp = self._req_get(
-                    f"{self.BASE_URL}/v1/ticker",
-                    params={"markets": ",".join(batch)},
-                    timeout=15,
-                )
-                resp.raise_for_status()
+                try:
+                    resp = self._req_get(
+                        f"{self.BASE_URL}/v1/ticker",
+                        params={"markets": ",".join(batch)},
+                        timeout=15,
+                    )
+                    resp.raise_for_status()
+                except requests.HTTPError as e:
+                    # 배치에 상장폐지 마켓이 섞이면 업비트가 404 → 배치 전체 실패.
+                    # 캐시를 무효화해 다음 조회에서 최신 마켓 목록을 재로드(폐지 코인 제거).
+                    self._markets_cache = None
+                    logger.warning(
+                        f"[upbit] ticker 배치 조회 실패 — 마켓 캐시 무효화 후 폴백: {e}"
+                    )
+                    raise
                 for t in resp.json():
                     sym = t["market"].replace("KRW-", "")
                     ticker_data[sym] = self._norm_ticker(t)
