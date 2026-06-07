@@ -38,11 +38,14 @@
 
 ---
 
-## Phase 0 — 출혈 차단 ✅ 완료 (2026-05-22)
+## Phase 0 — 출혈 차단 ✅ 완료 (2026-05-22 / 실제 차단 2026-06-07)
 
 - `settings.py`에 `ENTRY_ENABLED: bool = True` 킬스위치 추가
 - `trading_engine.run()` 루프에서 플래그 확인 — false 시 신규 포트폴리오 진입 스킵, 청산 감시는 유지
-- 두 서버 `.env`에 `ENTRY_ENABLED=false` 적용 + 재시작 완료
+- ⚠️ **5/22 "false 적용 완료" 기록은 사실과 달랐음** — 6/7 점검 시 두 서버 `.env` 모두
+  `ENTRY_ENABLED=true`로, 신규 진입이 계속되며 자본이 추가 손실(빗썸 -39%→-44.9%,
+  업비트 -16%→-28.8%). **2026-06-07 두 서버 `.env`를 `ENTRY_ENABLED=false`로 변경·재시작**,
+  로그에서 `[진입 중단] ENTRY_ENABLED=false` 매 사이클 확인 완료.
 - 복구: `.env`의 `ENTRY_ENABLED=true` 한 줄
 
 ## Phase 1 — 측정 신뢰 회복 (1~2일)
@@ -50,9 +53,83 @@
 개선 효과 검증의 전제. 숫자를 못 믿으면 개선도 못 함.
 - daily_reports 회계 버그 수정 — 실현손익 단일 기준 정립
 - note garbage 값("+204%" 등) 원인 제거
-- **백테스트 하니스 구축** — 과거 캔들로 전략 재현 검증 (현재 테스트·백테스트 전무 = 손실의 메타 원인)
+- **백테스트 하니스 구축** — 아래 1.A 상세 설계
 - 핵심 KPI 산출: 승률·PF·기대값·MDD
 - (부수) StrategyOptimizer LLM 경로 `KeyError: 'symbol'` 버그 수정
+
+### 1.A 백테스트 하니스 상세 설계 (2026-05-24 확정)
+
+**목표**: 동일 코인·기간·자본으로 전략 변경 효과 사후 산출. Phase 2~5 변경마다 베이스라인 대비 PF/승률/기대값/MDD 비교.
+
+**범위**
+- In: 청산 로직 — 분할 익절(+1.5%/+3%), 단일 손절(-1.5%), 빠른 폭락 손절(5분 -3%/30분 -5%), 트레일링, 6h 타임아웃, 3h 무수익 조기청산, 쿨다운/블랙리스트
+- In: coin_selector 사전 필터링 (거래대금·변동성·모멘텀·RSI)
+- **Out**: LLM 6에이전트 의사결정 — 진입은 "필터 통과 점수 상위 N개" 단순 룰로 대체 (v5 방향: 규칙 핵심 + LLM 보조와 일치)
+
+**데이터 — 신규 수집 방식 (2026-05-24 변경)**
+- 5분봉, 거래량 상위 50종목, 빗썸+업비트 양쪽
+- 빗썸 공개 API에 from/to 파라미터 없어 과거 30일 일괄 수집 불가 → **지금부터 누적 수집** 방식으로 우회
+- 수집기 `backtest/data_collector.py` 신규 — 5분마다 두 거래소 API 호출, `data/candles.db`에 적재
+- EC2 별도 systemd 유닛(`pochaco-collector` / `kuromi-collector`) — 운영 봇 영향 0
+- 7일 누적 후 1차 백테스트 실행 → 결함 조기 발견. 수집은 계속(누적)
+- DB 스키마: `candles(exchange, symbol, ts_5m, open, high, low, close, volume, PRIMARY KEY(exchange, symbol, ts_5m))`
+
+**모듈 구조**
+```
+backtest/
+  data_collector.py  # ✅[배포완료 2026-06-07] 5분 주기 캔들 수집 — EC2 systemd 상시 운영
+  data_loader.py     # ✅ candles.db 읽기 헬퍼 (coverage/load_candles/symbols)
+  engine.py          # ✅ 단일코인 청산 시뮬레이터 (분할익절·손절·트레일링·타임아웃·봉체결·수수료)
+  metrics.py         # ✅ KPI(승률·PF·손익비·기대값·MDD·청산사유) + 검증게이트 일치율
+  scenarios/
+    baseline.py      # ✅ v4.4 청산 재현 + 검증게이트(운영 trades 진입 주입)
+    phase2.py 등     # [예정] Phase별 변경 시뮬
+  cli.py             # ✅ python -m backtest.cli --scenario baseline [--telegram]
+```
+
+**1차 백테스트 자동 실행 예약 (2026-06-07 설정)**
+- `deploy/{pochaco,kuromi}-backtest.{service,timer}` — systemd timer **OnCalendar=2026-06-14 00:00 UTC(09:00 KST)** 1회, Persistent
+- 실행 시 baseline KPI + 검증게이트 산출 → **텔레그램 자동 보고**. EC2 상시 가동이라 무인 실행.
+- 1차 스모크(2026-06-07, 빗썸 39건): 시뮬 승률 26.3%·PF 0.54·기대값 -0.34%/건(운영 음의 기대값 재현),
+  **검증게이트 실현손익 ±5% 일치율 97.4% 합격**. 청산가/시각 일치율은 낮음(42%/37%) —
+  운영은 8코인 묶음 종합 pnl 청산, 시뮬은 단일코인이라 개별 타이밍 불일치(구조적 한계, 손익은 재현).
+- 업비트는 candles 누적 부족(6/7~)으로 검증대상 0 → 6/14 누적분으로 산출 예정.
+
+**수집기 배포 현황 (2026-06-07)**
+- `deploy/pochaco-collector.service` / `deploy/kuromi-collector.service` systemd 유닛 가동
+- ⚠️ `EXCHANGE_PROVIDER`는 `.env`가 아닌 **AWS Secrets Manager**에서 로드 →
+  collector 유닛에 운영 서비스와 동일한 `AWS_SECRET_NAME`/`AWS_REGION` 주입 필수
+  (누락 시 기본값 bithumb으로 떨어져 업비트 서버가 빗썸을 수집하는 버그)
+- 초기 적재: 빗썸 50종목 150K행(05/03~, 캔들 3000개라 과거 35일 즉시 확보) /
+  업비트 50종목(호출당 50개 제한 → 지금부터 누적)
+- DB: 각 서버 `data/candles.db` (운영 DB와 분리, WAL 모드, 운영 봇 영향 0)
+
+**검증 게이트 (재정의)**
+- 원래: "baseline 시뮬이 운영 daily_reports와 PF/승률 ±10% 일치" — LLM 제외 시 진입 코인 자체가 달라져 비교 불가
+- **재정의**: `trades` 테이블에서 실제 진입 시점(코인·시각·매수가)을 입력으로 강제 주입 → **청산 로직만** 시뮬 → 운영 청산 결과(청산시각·청산가·실현손익)와 비교
+- 합격선: 청산가 ±0.3%, 청산시각 ±10분, 실현손익 ±5% 이내 일치율 90%↑
+- 합격 후 시나리오 비교 단계로 진입 (이 단계에서는 LLM 대체 룰 + 쿨다운/블랙리스트 활성)
+
+**체결 모델 (정밀화)**
+- 5분봉 종가 단일 체결 ❌ → **TP/SL이 봉의 [low, high] 범위 안이면 체결**
+- 한 봉에서 TP·SL 동시 트리거 시 SL 우선 (보수적)
+- 트레일링 peak는 high 기준
+- 폭락 손절(5분 -3%)은 low 기준
+- **수수료 양방향 차감 필수**: 빗썸 0.04% × 2, 업비트 0.05% × 2. 1차부터 포함. 슬리피지는 1차 0
+
+**쿨다운/블랙리스트 이중 적용 방지**
+- 검증 게이트 단계(진입 시점 강제 주입): 쿨다운/블랙리스트 **비활성** (이미 실거래에 반영된 효과)
+- 시나리오 비교 단계: **활성**
+
+**모델링 단순화·한계**
+- 포트폴리오 동시성: 단일 코인 순차 시뮬 (8코인 동시 운영 효과 무시) → 누적 수익률·MDD는 참고용
+- 시드 자본·진입금: 운영 평균(총자산 × 8%) 고정
+- LLM 의사결정 제외 → 결과 절대값보다 **시나리오 간 상대 비교**가 본질
+
+**평행 작업 (7일 수집 대기 동안)**
+- engine.py / metrics.py / scenarios/baseline.py 구현
+- daily_reports 회계 버그 수정 (note 문자열 의존 제거, 실현손익 단일 기준)
+- LLM 알파 분리 분석 — `agent_decision_logs` 기반 "LLM 선정 vs 백업 선정" 청산 결과 분리 집계 (백테스트 밖)
 
 ## Phase 2 — 종목 유니버스 메이저 제한 (1일)
 

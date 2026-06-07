@@ -1,0 +1,11 @@
+[Unit]
+Description=pochaco 백테스트 매일 실행 (6/14 1차 이후 매일 00:00 UTC = 09:00 KST)
+
+[Timer]
+# 매일 09:00 KST 실행. 단 service의 ExecCondition이 6/14 이전 실행은 스킵
+# (캔들 7일 누적 후 6/14 1차부터 의미 있는 결과)
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
