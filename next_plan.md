@@ -88,7 +88,8 @@ backtest/
 ```
 
 **1차 백테스트 자동 실행 예약 (2026-06-07 설정)**
-- `deploy/{pochaco,kuromi}-backtest.{service,timer}` — systemd timer **OnCalendar=2026-06-14 00:00 UTC(09:00 KST)** 1회, Persistent
+- `deploy/{pochaco,kuromi}-backtest.{service,timer}` — systemd timer **매일 00:00 UTC(09:00 KST)**, Persistent.
+  단 service의 `ExecCondition`(date ≥ 20260614)으로 **6/14 이전 실행은 스킵** → 6/14 1차부터 매일 실행.
 - 실행 시 baseline KPI + 검증게이트 산출 → **텔레그램 자동 보고**. EC2 상시 가동이라 무인 실행.
 - 1차 스모크(2026-06-07, 빗썸 39건): 시뮬 승률 26.3%·PF 0.54·기대값 -0.34%/건(운영 음의 기대값 재현),
   **검증게이트 실현손익 ±5% 일치율 97.4% 합격**. 청산가/시각 일치율은 낮음(42%/37%) —
