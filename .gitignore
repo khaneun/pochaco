@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# 로컬 전용 DB·캔들 (candles.db 등)
+data/

@@ -14,11 +14,13 @@ import os
 import sys
 
 from config import settings
-from backtest import data_loader
-from backtest.metrics import MatchStat, compute_kpi
-from backtest.scenarios import baseline
+from backtest import data_loader, rule_engine
+from backtest.metrics import KPI, MatchStat, compute_kpi
+from backtest.scenarios import baseline, phase2, rule_baseline
 
 logger = logging.getLogger(__name__)
+
+_RULE_SCENARIOS = {"rule_baseline": rule_baseline, "phase2": phase2}
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -101,9 +103,60 @@ def run_baseline(op_db: str, candles_db: str, exchange: str) -> str:
     return "\n".join(lines)
 
 
+def run_rule(candles_db: str, exchange: str, scenario: str) -> tuple[str, KPI]:
+    """룰 진입 시나리오 1개 실행 → (보고텍스트, KPI)."""
+    cfg = _RULE_SCENARIOS[scenario].config(exchange)
+    entries = rule_engine.run(exchange, cfg, candles_db)
+    pnls = [e.sim.realized_pnl_pct for e in entries if e.sim.closed]
+    reasons = [e.sim.reason for e in entries if e.sim.closed]
+    kpi = compute_kpi(pnls, reasons)
+
+    cov = data_loader.coverage(candles_db).get(exchange, {})
+    n_uni = "?"
+    wl = cfg.whitelist
+    uni_desc = f"메이저 {len(wl)}종 화이트리스트" if wl else "풀 유니버스"
+    lines = [
+        f"📊 <b>백테스트 {scenario} — {exchange}</b>",
+        f"candles: {cov.get('symbols', 0)}종목 {cov.get('rows', 0):,}행 | {uni_desc}",
+        f"룰 진입(청산완료): {len(pnls)}건 / 총 {len(entries)}건",
+        "",
+        "<b>[시뮬 KPI]</b>",
+    ]
+    lines += ["  " + ln for ln in kpi.as_lines()]
+    if kpi.reason_dist:
+        rd = " / ".join(f"{k} {v}" for k, v in kpi.reason_dist.items())
+        lines.append(f"  청산사유: {rd}")
+    return "\n".join(lines), kpi
+
+
+def run_compare(candles_db: str, exchange: str) -> str:
+    """rule_baseline vs phase2 — KPI 나란히 + 개선폭."""
+    rep_b, kb = run_rule(candles_db, exchange, "rule_baseline")
+    rep_p, kp = run_rule(candles_db, exchange, "phase2")
+
+    def d(a: float, b: float) -> str:
+        return f"{b - a:+.2f}"
+
+    lines = [
+        f"⚖️ <b>시나리오 비교 — {exchange}</b>",
+        "",
+        rep_b, "",
+        rep_p, "",
+        "<b>[개선폭 phase2 − baseline]</b>",
+        f"  PF: {kb.profit_factor:.2f} → {kp.profit_factor:.2f} ({d(kb.profit_factor, kp.profit_factor)})",
+        f"  손익비: {kb.rr_ratio:.2f} → {kp.rr_ratio:.2f} ({d(kb.rr_ratio, kp.rr_ratio)})",
+        f"  기대값: {kb.expectancy_pct:+.3f} → {kp.expectancy_pct:+.3f} "
+        f"({d(kb.expectancy_pct, kp.expectancy_pct)})%p/건",
+        f"  승률: {kb.win_rate:.1f}% → {kp.win_rate:.1f}% ({d(kb.win_rate, kp.win_rate)})",
+        f"  누적: {kb.sum_pnl_pct:+.1f} → {kp.sum_pnl_pct:+.1f} ({d(kb.sum_pnl_pct, kp.sum_pnl_pct)})%p",
+    ]
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="백테스트 실행")
-    parser.add_argument("--scenario", default="baseline", choices=["baseline"])
+    parser.add_argument("--scenario", default="baseline",
+                        choices=["baseline", "rule_baseline", "phase2", "compare"])
     parser.add_argument("--op-db", default=None, help="운영 DB 경로")
     parser.add_argument("--candles", default=data_loader._DB_PATH, help="candles.db 경로")
     parser.add_argument("--exchange", default=None, help="bithumb|upbit (기본: settings)")
@@ -117,19 +170,25 @@ def main() -> None:
     )
 
     exchange = args.exchange or settings.EXCHANGE_PROVIDER
-    op_db = args.op_db or _default_op_db()
 
-    if not os.path.exists(op_db):
-        logger.error(f"운영 DB 없음: {op_db}")
-        sys.exit(1)
     if not os.path.exists(args.candles):
         logger.error(f"candles.db 없음: {args.candles}")
         sys.exit(1)
 
     logger.info(f"=== 백테스트 시작 === scenario={args.scenario} "
-                f"exchange={exchange} op_db={op_db} candles={args.candles}")
+                f"exchange={exchange} candles={args.candles}")
 
-    report = run_baseline(op_db, args.candles, exchange)
+    if args.scenario == "baseline":
+        op_db = args.op_db or _default_op_db()
+        if not os.path.exists(op_db):
+            logger.error(f"운영 DB 없음: {op_db}")
+            sys.exit(1)
+        report = run_baseline(op_db, args.candles, exchange)
+    elif args.scenario == "compare":
+        report = run_compare(args.candles, exchange)
+    else:  # rule_baseline | phase2
+        report, _ = run_rule(args.candles, exchange, args.scenario)
+
     print("\n" + report.replace("<b>", "").replace("</b>", "") + "\n")
 
     if args.telegram:
