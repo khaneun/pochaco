@@ -1,0 +1,20 @@
+[Unit]
+Description=pochaco 오더북 스냅샷 수집기 (Bithumb 호가 60s 누적)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/pochaco
+# EXCHANGE_PROVIDER 등 설정은 AWS Secrets Manager에서 로드 (운영 서비스와 동일)
+Environment="AWS_SECRET_NAME=pochaco/production"
+Environment="AWS_REGION=ap-northeast-2"
+ExecStart=/opt/pochaco/.venv/bin/python -m backtest.orderbook_collector
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
