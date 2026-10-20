@@ -41,8 +41,10 @@ dashboard/
   web_server.py          # HTTP 웹 대시보드 (종합 + 전문가 실적표 2페이지)
                          # API: /api/status, /api/experts, /api/liquidate
                          #      /api/agent/prompt, /api/agent/chat, /api/agent/update_prompt
+ops/disk_guard.py        # 디스크 가드 — 보관기간·용량 버퍼 정리 (<app>-diskguard.timer 매시)
 deploy/
   deploy.sh              # EC2 rsync 배포 스크립트 (venv 재생성 포함)
+  systemd/               # drop-in (봇 OOM 보호·수집기/백테스트 메모리 상한·journald 상한)
   setup_ec2.sh           # EC2 초기 설정
   pochaco.service        # systemd 유닛 파일
 ```
@@ -224,7 +226,10 @@ is_on_cooldown(symbol) -> bool
 | **최대 보유 시간** | **6시간** (v4.4: 12h → 6h) |
 | **3시간 무수익 조기청산** | peak < +1.0% 시 즉시 종료 |
 | **신규 진입 최소 간격** | 60분 (v4.4) |
-| **단일코인 진입금 상한** | 총자산 × 8% (v4.4) |
+| **단일코인 진입금 상한** | 총자산 × `ENTRY_PER_COIN_PCT` (기본 8%, v5.1 설정화) |
+| **포트폴리오 코인 수** | `ENTRY_PORTFOLIO_SIZE` (기본 5, 확신도 상위) |
+| **1h RSI 진입 상한** | `ENTRY_RSI_MAX` (기본 75) |
+| **드로다운 진입 정지** | `ENTRY_DRAWDOWN_STOP_PCT` (기본 0=off) |
 | **투자비율 클램프** | 0.55 ~ 0.75 (v4.4) |
 
 ## 쿨다운/블랙리스트 (cooldown.py) — v4.4

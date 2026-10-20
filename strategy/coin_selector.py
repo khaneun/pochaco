@@ -261,7 +261,11 @@ class CoinSelector:
             # ── 기술 지표 필터 ──
 
             # RSI 과매수 필터: 코인별 임계값 우선, 없으면 기본값 _RSI_OVERBOUGHT
-            rsi_limit = (rsi_thresholds or {}).get(s.symbol, _RSI_OVERBOUGHT)
+            # v5.1: settings.ENTRY_RSI_MAX 상한 — 백테스트상 RSI 60+ 구간 EV 붕괴(양 거래소)
+            rsi_limit = min(
+                (rsi_thresholds or {}).get(s.symbol, _RSI_OVERBOUGHT),
+                settings.ENTRY_RSI_MAX,
+            )
             if ti.rsi_14 >= rsi_limit:
                 src = "프로파일" if (rsi_thresholds or {}).get(s.symbol) else "기본값"
                 logger.debug(

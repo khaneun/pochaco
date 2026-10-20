@@ -10,6 +10,7 @@ import signal
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _APP_DIR = Path(__file__).parent
@@ -40,7 +41,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(settings.LOG_FILE, encoding="utf-8"),
+        # 50MB × 5개 회전 — 단일 파일 무한 증가로 디스크 잠식 방지 (v5.1)
+        RotatingFileHandler(
+            settings.LOG_FILE, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8",
+        ),
     ],
 )
 logger = logging.getLogger(__name__)
