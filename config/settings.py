@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     # 신규 진입 킬스위치 (v5.0) — false 시 신규 포트폴리오 진입 정지.
     # 보유 포지션 청산 감시는 계속 동작. .env의 ENTRY_ENABLED=false 로 제어.
     ENTRY_ENABLED: bool = True
+    # 재진입 리스크 가드 (v5.1) — 백테스트상 EV>0 알파 미확보 상태의 노출 제한.
+    # 빈도·동시보유 축소는 건당 EV는 그대로지만 총손실을 비례 축소(7/22 측정).
+    ENTRY_PORTFOLIO_SIZE: int = 5          # 포트폴리오당 최대 코인 수 (AI 확신도 상위 N개)
+    ENTRY_PER_COIN_PCT: float = 0.08       # 단일 코인 진입금 상한 (총자산 비율)
+    ENTRY_RSI_MAX: float = 75.0            # 1h RSI 상한 — 코인별 프로파일 임계값보다 우선
+    ENTRY_DRAWDOWN_STOP_PCT: float = 0.0   # 기준자산 대비 손실 % 도달 시 신규 진입 자동 정지 (0=비활성)
+    ENTRY_BASELINE_KRW: float = 0.0        # 드로다운 기준 총자산 (0이면 기동 시 총자산)
 
     # ---------------------------------------------------------------- #
     #  AWS                                                              #

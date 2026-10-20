@@ -55,7 +55,7 @@ _NEW_ENTRY_MIN_INTERVAL_MIN = 60
 # pochaco는 91,915원 단발 진입으로 -1.5% = -1,400원 손실 큰 한방. 분산 강제.
 _INVEST_RATIO_BASE = 0.65          # 베이스라인 투자 비율
 _INVEST_RATIO_BAND = 0.10          # ±10% 클램프 (실제 범위 0.55 ~ 0.75)
-_MAX_PER_COIN_PCT  = 0.08          # 단일 코인 진입금 상한 = 총자산의 8%
+# 단일 코인 진입금 상한·포트폴리오 코인 수·드로다운 정지는 settings.ENTRY_* (v5.1)
 # 지정가 매도: 시도별 가격 조정 배율 (1→0.998→0.995), 실패 시 시장가
 _LIMIT_SELL_PRICE_ADJ = [1.0, 0.998, 0.995]
 _LIMIT_SELL_WAIT_SEC = 5.0
@@ -139,6 +139,8 @@ class TradingEngine:
         self._last_adjustment: dict | None = None
         self._last_reconcile_time: float = 0.0
         self.daily_start_krw: float = 0.0
+        self._entry_baseline_krw: float = 0.0   # 드로다운 정지 기준 총자산 (v5.1)
+        self._drawdown_halted: bool = False     # 드로다운 정지 발동 여부 (재기동 전까지 유지)
 
     # ------------------------------------------------------------------ #
     #  퍼블릭 인터페이스                                                    #
@@ -165,6 +167,12 @@ class TradingEngine:
 
         # 시작 총자산 계산
         self.daily_start_krw = self._calc_total_assets()
+        self._entry_baseline_krw = settings.ENTRY_BASELINE_KRW or self.daily_start_krw
+        if settings.ENTRY_DRAWDOWN_STOP_PCT > 0:
+            logger.info(
+                f"[드로다운 가드] 기준 {self._entry_baseline_krw:,.0f}원 / "
+                f"-{settings.ENTRY_DRAWDOWN_STOP_PCT:.1f}% 도달 시 신규 진입 정지"
+            )
 
         # 블랙리스트 사전 빌드 — 보유 모드로 진입해 매수 사이클이 한 번도
         # 돌지 않더라도 대시보드에 손실 차단 코인이 즉시 노출되도록 시작 시
@@ -268,6 +276,43 @@ class TradingEngine:
                 except Exception:
                     total += pos.buy_krw
         return total
+
+    def _check_drawdown_halt(self) -> bool:
+        """기준자산 대비 누적 손실이 임계 도달 시 신규 진입 정지 (v5.1).
+
+        한 번 발동하면 재기동 전까지 유지 — 재개는 운영자 판단(.env 조정 후 재시작).
+        보유 포지션 청산 감시에는 영향 없음 (포트폴리오 미보유 시에만 호출).
+
+        Returns:
+            True면 이번 진입 스킵
+        """
+        stop_pct = settings.ENTRY_DRAWDOWN_STOP_PCT
+        if stop_pct <= 0 or self._entry_baseline_krw <= 0:
+            return False
+        if self._drawdown_halted:
+            logger.info("[드로다운 정지] 신규 진입 정지 유지 중 — 재개는 .env 조정 후 재시작")
+            time.sleep(5 * 60)
+            return True
+
+        total = self._calc_total_assets()
+        if total <= 0:
+            return False  # 잔고 조회 실패 — 오발동 방지
+        dd_pct = (total - self._entry_baseline_krw) / self._entry_baseline_krw * 100
+        if dd_pct > -stop_pct:
+            return False
+
+        self._drawdown_halted = True
+        msg = (
+            f"[드로다운 정지] 총자산 {total:,.0f}원 (기준 {self._entry_baseline_krw:,.0f}원 "
+            f"대비 {dd_pct:+.2f}% ≤ -{stop_pct:.1f}%) — 신규 진입 자동 정지"
+        )
+        logger.warning(msg)
+        if self._notifier:
+            try:
+                self._notifier.send(f"🛑 <b>중요 알람</b> — {msg}")
+            except Exception as e:
+                logger.warning(f"알림 발송 실패: {e}")
+        return True
 
     # ------------------------------------------------------------------ #
     #  지정가 매도 (retry + market fallback)                                #
@@ -572,6 +617,9 @@ class TradingEngine:
             logger.info("[매수 스킵] 일시 중지 상태")
             return
 
+        if self._check_drawdown_halt():
+            return
+
         # 진입 빈도 제한 — 직전 청산 후 _NEW_ENTRY_MIN_INTERVAL_MIN 미경과 시 스킵 (v4.4)
         try:
             last_closed = self._repo.get_last_closed_portfolio_at()
@@ -638,13 +686,15 @@ class TradingEngine:
         filtered, coin_scores = self._selector.filter_and_rank(
             snapshots, target_tp=target_tp, cooldown_symbols=cooldown_symbols
         )
-        if len(filtered) < _MIN_PORTFOLIO_COINS:
+        # v5.1: 필터 미통과 전체 목록 폴백 폐지 — 과매수·하락 코인 진입이 손실 주범(백테스트)
+        min_coins = min(_MIN_PORTFOLIO_COINS, settings.ENTRY_PORTFOLIO_SIZE)
+        if len(filtered) < min_coins:
             logger.warning(
                 f"[CoinSelector] 후보 {len(filtered)}개 부족 "
-                f"(최소 {_MIN_PORTFOLIO_COINS}개) — 전체 목록으로 폴백"
+                f"(최소 {min_coins}개) — 이번 사이클 스킵, 5분 후 재시도"
             )
-            filtered = snapshots
-            coin_scores = []
+            time.sleep(5 * 60)
+            return
 
         # AI 포트폴리오 선정
         try:
@@ -671,6 +721,16 @@ class TradingEngine:
             time.sleep(5 * 60)
             return
 
+        # 포트폴리오 코인 수 상한 — AI 확신도 상위 N개만 유지 (v5.1)
+        max_coins = settings.ENTRY_PORTFOLIO_SIZE
+        if len(decision.coins) > max_coins:
+            ranked = sorted(decision.coins, key=lambda c: c.confidence, reverse=True)
+            decision.coins = ranked[:max_coins]
+            logger.info(
+                f"[코인 수 상한] {len(ranked)}개 → {max_coins}개 "
+                f"(제외: {', '.join(c.symbol for c in ranked[max_coins:])})"
+            )
+
         symbols_str = ", ".join(c.symbol for c in decision.coins)
         logger.info(
             f"[포트폴리오 선정] [{symbols_str}] "
@@ -691,16 +751,17 @@ class TradingEngine:
                 f"(baseline {_INVEST_RATIO_BASE:.0%}±{_INVEST_RATIO_BAND:.0%})"
             )
 
-        # 단일 코인 최대 진입금 = 총자산 × _MAX_PER_COIN_PCT (v4.4)
+        # 단일 코인 최대 진입금 = 총자산 × ENTRY_PER_COIN_PCT (v4.4, v5.1 설정화)
+        per_coin_pct = settings.ENTRY_PER_COIN_PCT
         total_assets = self._calc_total_assets()
-        max_per_coin = total_assets * _MAX_PER_COIN_PCT
+        max_per_coin = total_assets * per_coin_pct
         total_invest = krw * invest_ratio
         per_coin_amount = total_invest / len(decision.coins)
         if per_coin_amount > max_per_coin:
             new_total = max_per_coin * len(decision.coins)
             logger.info(
                 f"[포지션 크기 캡] 단일코인 {per_coin_amount:,.0f}원 → {max_per_coin:,.0f}원 "
-                f"(총자산 {total_assets:,.0f} × {_MAX_PER_COIN_PCT:.0%}) "
+                f"(총자산 {total_assets:,.0f} × {per_coin_pct:.0%}) "
                 f"/ 총 투입 {total_invest:,.0f} → {new_total:,.0f}원"
             )
             total_invest = new_total

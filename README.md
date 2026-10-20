@@ -335,6 +335,21 @@ sudo systemctl restart pochaco
 sudo systemctl stop pochaco
 ```
 
+### 운영 가드 (v5.1)
+
+| 항목 | 설정 | 위치 |
+|------|------|------|
+| 디스크 가드 | 매시 실행 — 오더북 60일·캔들 365일 보관, journal 300M, 사용률 80%↑ 공격적 정리(오더북 절반·docker prune·apt clean), 90%↑ 텔레그램 경보 | `ops/disk_guard.py`, `deploy/<app>-diskguard.{service,timer}` |
+| journald 상한 | `SystemMaxUse=300M`, 1개월 | `deploy/systemd/journald-size.conf` → `/etc/systemd/journald.conf.d/` |
+| 봇 OOM 보호 | `OOMScoreAdjust=-500` | `deploy/systemd/bot-guard.conf` → `<app>.service.d/` |
+| 수집기 상한 | `MemoryMax=200M` | `deploy/systemd/collector-guard.conf` → `<app>-{collector,obcollector}.service.d/` |
+| 백테스트 격리 | `MemoryMax=600M`, 최우선 OOM 대상 (pochaco 1GB는 타이머 비활성 — 로컬 실행) | `deploy/systemd/backtest-guard.conf` |
+
+```bash
+sudo systemctl start <app>-diskguard      # 수동 1회 실행
+journalctl -u <app>-diskguard -n 30       # 정리 결과
+```
+
 ### 보안 그룹 (최소 오픈 포트)
 
 | 포트 | 프로토콜 | 용도 |
@@ -411,7 +426,13 @@ DATABASE_URL=postgresql+psycopg2://user:password@host:5432/pochaco
 | `AWS_SECRET_NAME` | Secrets Manager 시크릿 이름 | `""` |
 | `AWS_REGION` | AWS 리전 | `ap-northeast-2` |
 | `LOG_LEVEL` | 로그 레벨 | `INFO` |
-| `LOG_FILE` | 로그 파일 경로 | `/opt/pochaco/logs/pochaco.log` |
+| `LOG_FILE` | 로그 파일 경로 (50MB×5 회전) | `/opt/pochaco/logs/pochaco.log` |
+| `ENTRY_ENABLED` | 신규 진입 킬스위치 | `true` |
+| `ENTRY_PORTFOLIO_SIZE` | 포트폴리오당 최대 코인 수 (확신도 상위) | `5` |
+| `ENTRY_PER_COIN_PCT` | 단일 코인 진입금 상한 (총자산 비율) | `0.08` |
+| `ENTRY_RSI_MAX` | 1h RSI 진입 상한 | `75` |
+| `ENTRY_DRAWDOWN_STOP_PCT` | 기준자산 대비 손실 % 도달 시 진입 자동 정지 (0=off) | `0` |
+| `ENTRY_BASELINE_KRW` | 드로다운 기준 총자산 (0=기동 시) | `0` |
 
 ---
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=kuromi 디스크 가드 (보관기간·용량 버퍼 정리)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/kuromi
+Environment="AWS_SECRET_NAME=kuromi/prod"
+Environment="AWS_REGION=ap-northeast-2"
+ExecStart=/opt/kuromi/.venv/bin/python -m ops.disk_guard --app kuromi --data-dir /opt/kuromi/data
+MemoryMax=200M
+Nice=19
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal

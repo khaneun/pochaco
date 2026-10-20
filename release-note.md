@@ -2,6 +2,32 @@
 
 ---
 
+## v5.1.0 (2026-10-20)
+
+### feat: 리스크 제한 재진입 + 운영 가드 (디스크·OOM 재발 방지)
+
+#### 배경
+- 10/20 장애: pochaco(1GB) 백테스트 OOM 크래시루프로 호스트 먹통, kuromi 디스크 100%
+  (구 도커 이미지 13GB) → 오더북 수집 58일 중단·봇 DB `disk I/O error`.
+- 백테스트로 규칙기반 진입·청산·빈도 어느 조합도 EV>0 미달 확정(7/22) 상태에서 재진입 결정
+  → **알파가 아니라 노출을 통제**하는 방향. 측정상 유일하게 일관된 사실 두 가지를 반영:
+  ① 동시보유·빈도 축소는 건당 EV 불변이나 총손실 비례 축소, ② 1h RSI 60+ 구간 EV 붕괴.
+
+#### 매매 (settings `ENTRY_*`, 기본값은 기존 동작 유지)
+- `ENTRY_PORTFOLIO_SIZE` — AI 선정 코인 중 확신도 상위 N개만 매수
+- `ENTRY_PER_COIN_PCT` — 단일 코인 진입금 상한 (기존 상수 `_MAX_PER_COIN_PCT` 설정화)
+- `ENTRY_RSI_MAX` — 1h RSI 상한, 코인별 프로파일 임계값보다 우선
+- `ENTRY_DRAWDOWN_STOP_PCT` / `ENTRY_BASELINE_KRW` — 기준자산 대비 손실 도달 시 신규 진입
+  자동 정지 + 텔레그램 알림 (재기동 전까지 유지, 보유분 청산 감시는 계속)
+- CoinSelector 후보 부족 시 **필터 미통과 전체 목록 폴백 폐지** → 사이클 스킵
+
+#### 운영
+- `ops/disk_guard.py` + `<app>-diskguard.timer` (매시) — 보관기간·용량 버퍼 기반 정리
+- journald 300M 상한, 앱 로그 `RotatingFileHandler` 50MB×5
+- systemd drop-in: 봇 OOMScoreAdjust=-500, 수집기 MemoryMax=200M, 백테스트 MemoryMax=600M
+
+---
+
 ## v5 Phase2 (2026-06-15)
 
 ### feat: 룰 기반 진입 엔진 + 시나리오 비교 (메이저 유니버스 제한)
